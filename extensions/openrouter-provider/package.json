@@ -1,0 +1,23 @@
+{
+  "name": "pi-extension-openrouter-provider",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "clean": "echo 'nothing to clean'",
+    "build": "echo 'nothing to build'",
+    "check": "echo 'nothing to check'"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "@mariozechner/pi-coding-agent": "^0.67.67",
+    "pi-extension-envvars": "file:../envvars"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0"
+  }
+}
