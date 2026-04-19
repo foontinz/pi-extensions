@@ -6,6 +6,7 @@ A small monorepo containing Pi extensions:
 - `extensions/openrouter-provider`
 - `extensions/warp-grep`
 - `extensions/fast-mode`
+- `extensions/extension-manager`
 
 ## Workspace usage
 
@@ -19,6 +20,18 @@ npm run check
 ## CI
 
 GitHub Actions runs workspace typechecking on every push to `main` and on pull requests.
+
+## Extension manager extension
+
+`extensions/extension-manager` adds an `/extensions-ui` command that opens an interactive toggle UI for local extensions.
+
+Current scope:
+- auto-discovered extensions in `~/.pi/agent/extensions` and `.pi/extensions`
+- explicit local extension paths from `settings.json`
+
+Behavior:
+- writes exact-path disable entries to the appropriate `settings.json`
+- prompts for `/reload` after changes
 
 ## Fast mode extension
 
