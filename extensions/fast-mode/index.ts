@@ -4,7 +4,6 @@ import { dirname, join } from "node:path";
 import type { Model } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
 
-const STATUS_ID = "fast-mode";
 const PREFS_PATH = join(homedir(), ".pi", "agent", "fast-mode.json");
 
 type SupportedMode =
@@ -41,13 +40,7 @@ export default function (pi: ExtensionAPI) {
 	let prefs: FastModePrefs = { ...DEFAULT_PREFS, perModel: {} };
 
 	const refreshStatus = (ctx: ExtensionContext | ExtensionCommandContext) => {
-		const supported = getSupportedMode(ctx.model);
-		if (!supported) {
-			ctx.ui.setStatus(STATUS_ID, undefined);
-			return;
-		}
-		const enabled = isFastEnabled(prefs, ctx.model);
-		ctx.ui.setStatus(STATUS_ID, enabled ? `↯ fast ${ctx.model!.id}` : `fast off ${ctx.model!.id}`);
+		ctx.ui.setStatus("fast-mode", undefined);
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
