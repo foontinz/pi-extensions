@@ -18,7 +18,7 @@ type SupportedMode =
 		provider: "openai-codex";
 		id: "gpt-5.4";
 		enabledTier: "priority";
-		disabledTier: "default";
+		disabledTier?: undefined;
 	};
 
 interface FastModePrefs {
@@ -34,7 +34,7 @@ const DEFAULT_PREFS: FastModePrefs = {
 const SUPPORTED_MODELS: SupportedMode[] = [
 	{ provider: "anthropic", id: "claude-opus-4-6", enabledTier: "auto", disabledTier: "standard_only" },
 	{ provider: "anthropic", id: "claude-opus-4-7", enabledTier: "auto", disabledTier: "standard_only" },
-	{ provider: "openai-codex", id: "gpt-5.4", enabledTier: "priority", disabledTier: "default" },
+	{ provider: "openai-codex", id: "gpt-5.4", enabledTier: "priority" },
 ];
 
 export default function (pi: ExtensionAPI) {
@@ -66,7 +66,15 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const payload = { ...event.payload };
-		payload.service_tier = isFastEnabled(prefs, ctx.model) ? supported.enabledTier : supported.disabledTier;
+		const enabled = isFastEnabled(prefs, ctx.model);
+		if (enabled) {
+			payload.service_tier = supported.enabledTier;
+		} else {
+			delete payload.service_tier;
+			if (supported.disabledTier !== undefined) {
+				payload.service_tier = supported.disabledTier;
+			}
+		}
 		return payload;
 	});
 
@@ -95,10 +103,14 @@ export default function (pi: ExtensionAPI) {
 			};
 			await savePrefs(prefs);
 			refreshStatus(ctx);
+			const disabledMessage =
+				supported.disabledTier !== undefined
+					? `service_tier=${supported.disabledTier}`
+					: "the provider default service tier (field omitted)";
 			ctx.ui.notify(
 				next
 					? `Fast mode ON for ${key}. Requests will use service_tier=${supported.enabledTier}.`
-					: `Fast mode OFF for ${key}. Requests will use service_tier=${supported.disabledTier}.`,
+					: `Fast mode OFF for ${key}. Requests will use ${disabledMessage}.`,
 				"info",
 			);
 		},
