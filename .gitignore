@@ -13,6 +13,8 @@ node_modules/
 auth.json
 settings.json
 fast-mode.json
+mcp.json
+mcp-cache.json
 sessions/
 bin/
 .run-*
