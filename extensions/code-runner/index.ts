@@ -112,11 +112,12 @@ function registerTools(pi: ExtensionAPI): void {
     description:
       "Discover the best available code handles/SDKs for a goal. Use this before exec_code when you need to know which pre-registered APIs, clients, or utilities exist in the current environment.",
     promptSnippet:
-      "Find the best matching available code handles and docs for a programming goal before writing code.",
+      "Discover available code handles and docs for a programming goal before writing code.",
     promptGuidelines: [
-      "Use search_spec before exec_code when you are not sure which handles are available.",
+      "Use search_spec before exec_code when you need to call an API, fetch web content, process data, or run computations.",
       "Pass the user's goal in plain language, e.g. 'search the web with exa' or 'query GitHub repos'.",
       "After reading search_spec output, write code for exec_code using the matched handle names exactly.",
+      "When the user asks about capabilities that could involve external APIs or data processing, check search_spec first to see what's available.",
     ],
     parameters: Type.Object({
       goal: Type.String({
