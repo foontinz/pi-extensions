@@ -8,7 +8,6 @@ Included extensions:
 - `extensions/exa-search` — registers the `exa` handle (web search, URL fetching, cited answers)
 - `extensions/envvars` — macOS Keychain-backed env var management (`/envvars`)
 - `extensions/openrouter-provider` — OpenRouter model provider
-- `extensions/warp-grep` — semantic code search via Morph SDK
 - `extensions/fast-mode` — per-model request acceleration toggle
 - `extensions/extension-manager` — interactive extension toggle UI
 
