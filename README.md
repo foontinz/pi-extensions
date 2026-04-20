@@ -81,4 +81,4 @@ GitHub Actions runs workspace typechecking on every push to `main` and on pull r
 
 - Environment files (`.env`, `.env.*`, `.envrc`) are gitignored.
 - Extensions needing API keys should use the `extensions/envvars` hooks API (`registerManagedEnvVar()` + `installEnvVarStatus()`) so `/envvars` discovery stays consistent.
-- Temp execution dirs (`.run-*`) and the handle registry (`.handle-registry.json`) are gitignored.
+- Temp execution dirs (`.run-*`) and registry/state files like `.handle-registry.json` and `.envvar-registry.json` are gitignored.
