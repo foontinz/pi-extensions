@@ -1,6 +1,8 @@
 # pi-extensions
 
-A small monorepo containing Pi extensions:
+A Pi extensions workspace rooted at `~/.pi/agent`, so extensions live in the native `extensions/` directory and are auto-discovered by pi without extra path configuration.
+
+Included extensions:
 
 - `extensions/envvars`
 - `extensions/openrouter-provider`
@@ -10,7 +12,7 @@ A small monorepo containing Pi extensions:
 
 ## Workspace usage
 
-This repo uses npm workspaces rooted at `extensions/*`.
+This repo uses npm workspaces rooted at `extensions/*`, directly under `~/.pi/agent`.
 
 ```bash
 npm ci

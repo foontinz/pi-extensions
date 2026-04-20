@@ -7,3 +7,11 @@ node_modules/
 .envrc
 .DS_Store
 *.log
+
+# Local pi agent state
+.auth.json
+auth.json
+settings.json
+fast-mode.json
+sessions/
+bin/
