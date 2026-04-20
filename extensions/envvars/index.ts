@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { listRegisteredEnvVars, registerManagedEnvVar } from "./hooks";
+import { clearManagedEnvVarRegistrations, listRegisteredEnvVars } from "./hooks";
 import {
 	clearStoredEnvVar,
 	getEnvVar,
@@ -10,13 +10,16 @@ import {
 	validateEnvVarName,
 } from "./store";
 
-registerManagedEnvVar({ name: "MORPH_API_KEY", label: "WarpGrep key" });
-registerManagedEnvVar({ name: "OPENROUTER_API_KEY", label: "OpenRouter key" });
+clearManagedEnvVarRegistrations();
 
 export default function (pi: ExtensionAPI) {
+	const getRegisteredNames = (): string[] => listRegisteredEnvVars().map((item) => item.name);
+
+	const getStoredNames = async (): Promise<string[]> => listStoredEnvVars().catch(() => [] as string[]);
+
 	const getKnownNames = async () => {
-		const stored = await listStoredEnvVars().catch(() => []);
-		const registered = listRegisteredEnvVars().map((item) => item.name);
+		const stored = await getStoredNames();
+		const registered = getRegisteredNames();
 		return Array.from(new Set([...registered, ...stored])).sort();
 	};
 
@@ -43,20 +46,34 @@ export default function (pi: ExtensionAPI) {
 			const action = actionRaw || "list";
 
 			if (action === "list") {
-				const stored = await listStoredEnvVars();
-				const names = await getKnownNames();
-				if (names.length === 0) {
-					ctx.ui.notify("No stored env vars", "info");
+				const stored = await getStoredNames();
+				const registered = getRegisteredNames();
+				const staleStored = stored.filter((name) => !registered.includes(name));
+				if (registered.length === 0 && staleStored.length === 0) {
+					ctx.ui.notify("No managed env vars", "info");
 					return;
 				}
 
 				const lines: string[] = [];
-				for (const name of names) {
-					const hasEnv = Boolean(process.env[name]);
-					const hasStored = stored.includes(name);
-					const source = hasEnv ? "env" : hasStored ? "keychain" : "known";
-					lines.push(`${name} (${source})`);
+				if (registered.length > 0) {
+					lines.push("Registered env vars:");
+					for (const name of registered) {
+						const hasEnv = Boolean(process.env[name]);
+						const hasStored = stored.includes(name);
+						const source = hasEnv ? "env" : hasStored ? "keychain" : "known";
+						lines.push(`- ${name} (${source})`);
+					}
 				}
+
+				if (staleStored.length > 0) {
+					if (lines.length > 0) lines.push("");
+					lines.push("Unregistered stored env vars:");
+					for (const name of staleStored) {
+						lines.push(`- ${name} (keychain, unregistered)`);
+					}
+					lines.push("Clear these with /envvars clear NAME if they are no longer needed.");
+				}
+
 				ctx.ui.notify(lines.join("\n"), "info");
 				return;
 			}

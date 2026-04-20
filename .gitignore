@@ -17,4 +17,5 @@ sessions/
 bin/
 .run-*
 .handle-registry.json
+.envvar-registry.json
 .debug-hooks.log

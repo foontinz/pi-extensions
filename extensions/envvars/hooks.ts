@@ -1,3 +1,5 @@
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { getEnvVar, validateEnvVarName } from "./store";
 
@@ -17,28 +19,39 @@ export interface EnvVarStatusOptions {
 	showWhenPresent?: boolean;
 }
 
-const registry = new Map<string, ManagedEnvVar>();
+interface RegistryFileShape {
+	pid: number;
+	vars: ManagedEnvVar[];
+}
+
+const REGISTRY_FILE = join(dirname(fileURLToPathCompat(import.meta.url)), ".envvar-registry.json");
 
 export function registerManagedEnvVar(config: string | ManagedEnvVar): ManagedEnvVar {
 	const normalized = typeof config === "string" ? { name: config } : config;
 	const name = normalized.name.toUpperCase();
 	validateEnvVarName(name);
 
+	const registry = readRegistry();
 	const merged = {
 		...registry.get(name),
 		...normalized,
 		name,
 	};
 	registry.set(name, merged);
+	writeRegistryAtomic(registry);
 	return merged;
 }
 
 export function listRegisteredEnvVars(): ManagedEnvVar[] {
-	return [...registry.values()].sort((a, b) => a.name.localeCompare(b.name));
+	return [...readRegistry().values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 export function getRegisteredEnvVar(name: string): ManagedEnvVar | undefined {
-	return registry.get(name.toUpperCase());
+	return readRegistry().get(name.toUpperCase());
+}
+
+export function clearManagedEnvVarRegistrations(): void {
+	writeRegistryAtomic(new Map());
 }
 
 export async function getEnvVarSource(name: string): Promise<EnvVarSource> {
@@ -82,4 +95,33 @@ export function installEnvVarStatus(pi: ExtensionAPI, options: EnvVarStatusOptio
 		if (!lastCtx) return;
 		await refresh(lastCtx);
 	});
+}
+
+function readRegistry(): Map<string, ManagedEnvVar> {
+	try {
+		const data = readFileSync(REGISTRY_FILE, "utf8");
+		const parsed = JSON.parse(data) as RegistryFileShape;
+		if (!parsed || parsed.pid !== process.pid || !Array.isArray(parsed.vars)) return new Map();
+		return new Map(parsed.vars.map((envVar) => [envVar.name, envVar]));
+	} catch {
+		return new Map();
+	}
+}
+
+function writeRegistryAtomic(registry: Map<string, ManagedEnvVar>): void {
+	mkdirSync(dirname(REGISTRY_FILE), { recursive: true });
+	const tmp = REGISTRY_FILE + ".tmp";
+	const payload: RegistryFileShape = {
+		pid: process.pid,
+		vars: [...registry.values()].sort((a, b) => a.name.localeCompare(b.name)),
+	};
+	writeFileSync(tmp, JSON.stringify(payload, null, 2), "utf8");
+	renameSync(tmp, REGISTRY_FILE);
+}
+
+function fileURLToPathCompat(url: string): string {
+	if (url.startsWith("file://")) {
+		return decodeURIComponent(new URL(url).pathname);
+	}
+	return url;
 }
