@@ -2,7 +2,7 @@
 
 A Pi extensions workspace rooted at `~/.pi/agent`, so extensions live in the native `extensions/` directory and are auto-discovered by pi without extra path configuration.
 
-Included extensions:
+Included extensions/packages:
 
 - `extensions/code-runner` — `exec_code` + `search_spec` tools for TypeScript code execution with pluggable handles
 - `extensions/exa-search` — registers the `exa` handle (web search, URL fetching, cited answers)
