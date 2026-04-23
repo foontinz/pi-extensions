@@ -6,9 +6,11 @@ Included extensions/packages:
 
 - `extensions/code-runner` — `exec_code` + `search_spec` tools for TypeScript code execution with pluggable handles
 - `extensions/exa-search` — registers the `exa` handle (web search, URL fetching, cited answers)
+- `extensions/playwright-browser` — registers the `playwright` handle (browser automation, page scripting, screenshots)
 - `extensions/envvars` — macOS Keychain-backed env var management (`/envvars`)
 - `extensions/openrouter-provider` — OpenRouter model provider
 - `extensions/fast-mode` — per-model request acceleration toggle
+- `extensions/usage` — `/usage` command for cross-session token/cost heatmap and per-model totals
 - `extensions/extension-manager` — interactive extension toggle UI
 
 ## Workspace usage
@@ -32,6 +34,7 @@ Other extensions register "handles" — pre-initialized API clients injected int
 | Handle | Extension | Description |
 |--------|-----------|-------------|
 | `exa` | exa-search | Exa web search, URL content fetching, cited answers |
+| `playwright` | playwright-browser | Browser automation, DOM interaction, screenshots, in-page JavaScript |
 
 ### Adding a new handle
 
@@ -72,6 +75,14 @@ Then add the SDK package to your extension's `package.json` dependencies and run
 ## Fast mode
 
 `extensions/fast-mode` adds a `/fast` command that toggles per-model request acceleration.
+
+## Usage dashboard
+
+`extensions/usage` adds a `/usage` command that scans local Pi session logs and shows:
+
+- a GitHub-style heatmap of spend across days
+- total spend and turns
+- a per-model breakdown including input, output, cache, and total cost
 
 ## CI
 
