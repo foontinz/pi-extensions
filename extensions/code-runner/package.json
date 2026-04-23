@@ -3,7 +3,6 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-
   "scripts": {
     "clean": "echo 'nothing to clean'",
     "build": "tsc --noEmit",
@@ -15,8 +14,9 @@
     ]
   },
   "dependencies": {
-    "@mariozechner/pi-coding-agent": "^0.67.67",
-    "tsx": "^4.0.0"
+    "@mariozechner/pi-coding-agent": "^0.69.0",
+    "tsx": "^4.0.0",
+    "typebox": "^1.1.31"
   },
   "devDependencies": {
     "@types/node": "^25.6.0",

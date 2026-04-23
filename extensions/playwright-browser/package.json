@@ -9,10 +9,12 @@
     "check": "tsc --noEmit"
   },
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "dependencies": {
-    "@mariozechner/pi-coding-agent": "^0.67.67",
+    "@mariozechner/pi-coding-agent": "^0.69.0",
     "playwright": "1.57.0"
   },
   "devDependencies": {

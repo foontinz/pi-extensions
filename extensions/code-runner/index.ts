@@ -5,7 +5,7 @@ import {
   formatSize,
   truncateTail,
 } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { executeCode } from "./executor";
 import { clearCodeHandles, getRegisteredHandles, searchCodeHandles } from "./hooks";
 
