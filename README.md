@@ -11,6 +11,7 @@ Included extensions/packages:
 - `extensions/openrouter-provider` — OpenRouter model provider
 - `extensions/fast-mode` — per-model request acceleration toggle
 - `extensions/usage` — `/usage` command for cross-session token/cost heatmap and per-model totals
+- `extensions/subagents` — non-blocking background Pi subagents (`run_agent`, `poll_agent`, `stop_agent` tools)
 - `extensions/extension-manager` — interactive extension toggle UI
 
 ## Workspace usage

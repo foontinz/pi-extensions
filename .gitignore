@@ -15,6 +15,8 @@ settings.json
 fast-mode.json
 mcp.json
 mcp-cache.json
+mcp-oauth/
+models.json
 sessions/
 bin/
 .run-*
