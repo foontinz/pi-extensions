@@ -85,7 +85,9 @@ const POST_COPY_PRESERVED_ENV_KEYS = [
   "LC_ALL",
   "TERM",
 ] as const;
-const JOB_STORE_DIR = path.join(os.homedir(), ".pi", "agent", "subagents");
+const JOB_STORE_DIR = process.env.PI_SUBAGENTS_STORE_DIR
+  ? path.resolve(process.env.PI_SUBAGENTS_STORE_DIR)
+  : path.join(os.homedir(), ".pi", "agent", "subagents");
 const JOBS_DIR = path.join(JOB_STORE_DIR, "jobs");
 const LOGS_DIR = path.join(JOB_STORE_DIR, "logs");
 const JOB_LOCK_STALE_MS = 5 * 60_000;
@@ -3564,6 +3566,23 @@ export const __subagentsTest = {
   retryPendingFinishedCallbacks,
   rememberJobForCallbackRetry(job: AgentJob) {
     jobs.set(job.id, job);
+  },
+  putJob(job: AgentJob) {
+    jobs.set(job.id, job);
+  },
+  getJob(id: string) {
+    return jobs.get(id);
+  },
+  clearJobs() {
+    for (const job of jobs.values()) {
+      if (job.timeout) clearTimeout(job.timeout);
+      if (job.killTimer) clearTimeout(job.killTimer);
+      if (job.monitorTimer) clearInterval(job.monitorTimer);
+    }
+    jobs.clear();
+    pendingFinishedCallbacks.clear();
+    clearCallbackFlushTimer();
+    clearStatusRefreshTimer();
   },
   forgetJobForCallbackRetry(id: string) {
     jobs.delete(id);
