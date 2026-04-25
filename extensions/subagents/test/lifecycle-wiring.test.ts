@@ -62,6 +62,22 @@ function makeLegacyJob(overrides: Record<string, unknown> = {}) {
   } as any;
 }
 
+test("status widget includes short job ids and cleanup-failed indicators", () => {
+  const job = makeLegacyJob({
+    id: "agent_mabc1234_deadbeef",
+    label: "status job",
+    cleanupPhase: "failed",
+    cleanupError: "rm failed",
+  });
+  const ctx = { ui: { theme: { fg: (_color: string, text: string) => text } } } as any;
+
+  const lines = __subagentsTest.formatStatusTable([job], ctx);
+  assert.match(lines.join("\n"), /id\s+agent/);
+  assert.match(lines.join("\n"), /deadbeef/);
+  assert.equal(__subagentsTest.shortJobId(job.id), "deadbeef");
+  assert.match(__subagentsTest.compactJobState(job), /cleanup-failed rm failed/);
+});
+
 test("poll log window metadata reports retained range, truncation, and expired cursors", () => {
   const job = makeLegacyJob({
     logs: [
