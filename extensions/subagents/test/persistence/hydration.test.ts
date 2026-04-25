@@ -8,8 +8,7 @@ import {
   UnsupportedJobRecordSchemaError,
 } from "../../core/hydration.js";
 import { JobRecordHydrationError } from "../../core/invariants.js";
-import { legacyJobToRecord, recordToLegacySnapshot } from "../../core/legacy-adapter.js";
-import { makeRecord, terminalRecord, worktree } from "../core/helpers.js";
+import { makeRecord } from "../core/helpers.js";
 
 test("serialize and hydrate current compact JobRecord", () => {
   const record = makeRecord({ phase: "running", startedAt: 1_000 });
@@ -73,65 +72,9 @@ test("hydrateRuntimeState recreates fresh runtime handles", () => {
   assert.deepEqual(first.pendingBuffers, { stdout: "", stderr: "" });
 });
 
-test("legacy adapter normalizes permissive legacy jobs to strict records", () => {
-  const record = legacyJobToRecord({
-    id: "legacy-1",
-    label: "legacy",
-    task: "task",
-    cwd: "/repo/sub",
-    sourceCwd: "/repo",
-    status: "failed",
-    supervisor: "tmux",
-    tmuxSession: "pi-agent-1",
-    startedAt: 1_000,
-    updatedAt: 2_000,
-    finishedAt: 2_000,
-    errorMessage: "timed out",
-    nextSeq: 0,
-    stdoutOffset: -1,
-    stderrOffset: 4,
-    usage: { input: 10, output: -3, cacheRead: Number.NaN },
-    worktree: { root: "/tmp/wt", keepWorktree: "onFailure" },
-    cleanupPending: true,
-  }, { fallbackCwd: "/fallback", now: 3_000 });
-
-  assert.equal(record.schemaVersion, 1);
-  assert.equal(record.phase, "failed");
-  assert.equal(record.terminal?.reason, "timeout");
-  assert.equal(record.logCursor.nextSeq, 1);
-  assert.equal(record.logCursor.stdoutOffset, 0);
-  assert.equal(record.logCursor.stderrOffset, 4);
-  assert.equal(record.usage.input, 10);
-  assert.equal(record.usage.output, 0);
-  assert.equal(record.worktree?.postCopy?.length, 0);
-  assert.equal(record.cleanupPhase, "pending");
-  assert.equal(record.supervisorInfo?.tmuxSession, "pi-agent-1");
-});
-
-test("hydrate legacy records without process.cwd by using explicit fallback", () => {
-  const record = hydrateJobRecord({
-    id: "legacy-2",
-    status: "running",
-    startedAt: 1_000,
-    updatedAt: 1_000,
-  }, { fallbackCwd: "/explicit" });
-
-  assert.equal(record.cwd, "/explicit");
-  assert.equal(record.sourceCwd, "/explicit");
-  assert.equal(record.phase, "running");
-  assert.equal(record.logCursor.nextSeq, 1);
-});
-
-test("recordToLegacySnapshot preserves public legacy status mapping without runtime fields", () => {
-  const cancelled = terminalRecord("cancelled");
-  cancelled.worktree = worktree({ keepWorktree: "always", retained: true });
-  cancelled.cleanupPhase = "retained";
-
-  const legacy = recordToLegacySnapshot(cancelled, { includeEmptyLogs: true });
-
-  assert.equal(legacy.status, "cancelled");
-  assert.equal(legacy.cleanupPending, false);
-  assert.equal(legacy.worktree?.retained, true);
-  assert.deepEqual(legacy.logs, []);
-  assert.equal("waiters" in legacy, false);
+test("schema-less pre-S2 records are rejected after S2 cutover", () => {
+  assert.throws(
+    () => hydrateJobRecord({ id: "pre-s2", status: "running", startedAt: 1_000, updatedAt: 1_000 }),
+    /missing job record schemaVersion/,
+  );
 });

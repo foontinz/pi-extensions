@@ -26,6 +26,19 @@ import {
 import { Text } from "@mariozechner/pi-tui";
 import { Type, type Static } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents, formatAgentList } from "./agents.js";
+import { hydrateJobRecord, serializeJobRecord } from "./core/hydration.js";
+import { reduceJobEvent } from "./core/state-machine.js";
+import {
+  JOB_RECORD_SCHEMA_VERSION,
+  emptyUsageStats,
+  initialLogCursor,
+  type CleanupPhase,
+  type JobEvent,
+  type JobPhase,
+  type JobRecord,
+  type PendingTerminalInfo,
+  type TerminalInfo,
+} from "./core/types.js";
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_TIMEOUT_MS = 12 * 60 * 60 * 1000;
@@ -157,6 +170,7 @@ interface WorktreeInfo {
 }
 
 interface AgentJob {
+  record: JobRecord;
   id: string;
   label: string;
   agent?: string;
@@ -205,6 +219,10 @@ interface AgentJob {
   stderrDecoder?: StringDecoder;
   cleanupPending?: boolean;
   cleanupError?: string;
+  phase?: JobPhase;
+  cleanupPhase?: CleanupPhase;
+  terminal?: TerminalInfo;
+  pendingTerminal?: PendingTerminalInfo;
   waiters: Set<() => void>;
   closeWaiters: Set<() => void>;
 }
@@ -534,7 +552,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
 
       const previousStatus = job.status;
-      const stopped = terminateJob(job, params.reason ?? "cancelled by stop_agent");
+      const stopped = terminateJob(job, params.reason ?? "cancelled by stop_agent", "stop");
       refreshSubagentStatus();
       const currentStatus = job.status as JobStatus;
       const text = stopped
@@ -642,8 +660,28 @@ async function startAgentJob(
 
   args.push(`Task: ${params.task}`);
   const invocation = getPiInvocation(args);
+  const createdAt = Date.now();
+  const timeoutAt = timeoutMs && timeoutMs > 0 ? createdAt + timeoutMs : undefined;
+  const record: JobRecord = {
+    schemaVersion: JOB_RECORD_SCHEMA_VERSION,
+    id,
+    label,
+    task: params.task,
+    sourceCwd,
+    cwd: sourceCwd,
+    phase: "created",
+    cleanupPhase: "none",
+    supervisor: "tmux",
+    createdAt,
+    updatedAt: createdAt,
+    timeoutAt,
+    worktree: worktreePrep.worktree,
+    logCursor: initialLogCursor(),
+    usage: emptyUsageStats(),
+  };
 
   const job: AgentJob = {
+    record,
     id,
     label,
     agent: agent?.name,
@@ -654,9 +692,11 @@ async function startAgentJob(
     worktree: worktreePrep.worktree,
     command: invocation.command,
     args: invocation.args,
-    startedAt: Date.now(),
-    updatedAt: Date.now(),
+    startedAt: createdAt,
+    updatedAt: createdAt,
     status: "running",
+    phase: "created",
+    cleanupPhase: "none",
     messageCount: 0,
     logs: [],
     nextSeq: 1,
@@ -666,10 +706,10 @@ async function startAgentJob(
     latestAssistantText: "",
     pendingAssistantDelta: "",
     lastAssistantDeltaLogAt: 0,
-    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+    usage: emptyUsageStats(),
     tmpPromptDir,
     tmpPromptPath,
-    timeoutAt: timeoutMs && timeoutMs > 0 ? Date.now() + timeoutMs : undefined,
+    timeoutAt,
     supervisor: "tmux",
     tmuxSession: tmuxSessionName(id),
     stdoutPath: path.join(LOGS_DIR, `${id}.stdout.jsonl`),
@@ -682,6 +722,8 @@ async function startAgentJob(
   };
 
   jobs.set(job.id, job);
+  dispatchLifecycleEvent(job, { type: "PrepareRequested" });
+  dispatchLifecycleEvent(job, { type: "PrepareSucceeded", cwd, worktree: worktreePrep.worktree });
   if (job.worktree) {
     addLog(job, "info", `created git worktree ${job.worktree.root} from ${job.worktree.base}`, "worktree");
     if (job.worktree.copied.length > 0) {
@@ -722,6 +764,18 @@ async function startAgentJob(
       timeout: TMUX_COMMAND_TIMEOUT_MS,
       killSignal: "SIGKILL",
     });
+    dispatchLifecycleEvent(job, {
+      type: "SupervisorStarted",
+      handle: {
+        kind: "tmux",
+        command: invocation.command,
+        args: invocation.args,
+        tmuxSession: job.tmuxSession,
+        stdoutPath: job.stdoutPath,
+        stderrPath: job.stderrPath,
+        exitCodePath: job.exitCodePath,
+      },
+    });
     addLog(job, "info", `started tmux session ${job.tmuxSession}; attach: tmux attach -t ${job.tmuxSession}`, "start");
     persistJob(job);
     startTmuxMonitor(job);
@@ -743,9 +797,28 @@ function createFailedPreStartJob(
   errorMessage: string,
 ): AgentJob {
   const now = Date.now();
-  const job: AgentJob = {
+  const label = params.label?.trim() || agent?.name || `agent-${id}`;
+  const record: JobRecord = {
+    schemaVersion: JOB_RECORD_SCHEMA_VERSION,
     id,
-    label: params.label?.trim() || agent?.name || `agent-${id}`,
+    label,
+    task: params.task,
+    sourceCwd,
+    cwd: sourceCwd,
+    phase: "failed",
+    cleanupPhase: "none",
+    supervisor: "tmux",
+    createdAt: now,
+    updatedAt: now,
+    startedAt: now,
+    terminal: { phase: "failed", reason: "prepare-failed", finishedAt: now, message: errorMessage, error: errorMessage },
+    logCursor: initialLogCursor(),
+    usage: emptyUsageStats(),
+  };
+  const job: AgentJob = {
+    record,
+    id,
+    label,
     agent: agent?.name,
     agentSource: agent?.source ?? "adhoc",
     task: params.task,
@@ -757,6 +830,9 @@ function createFailedPreStartJob(
     updatedAt: now,
     finishedAt: now,
     status: "failed",
+    phase: "failed",
+    cleanupPhase: "none",
+    terminal: { phase: "failed", reason: "prepare-failed", finishedAt: now, message: errorMessage, error: errorMessage },
     messageCount: 0,
     logs: [],
     nextSeq: 1,
@@ -767,7 +843,7 @@ function createFailedPreStartJob(
     pendingAssistantDelta: "",
     lastAssistantDeltaLogAt: 0,
     errorMessage,
-    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+    usage: emptyUsageStats(),
     supervisor: "tmux",
     tmuxSession: tmuxSessionName(id),
     stdoutPath: path.join(LOGS_DIR, `${id}.stdout.jsonl`),
@@ -808,11 +884,9 @@ function persistJob(job: AgentJob): void {
     ensureJobStoreDirs();
     withJobFileLock(job.id, () => {
       const file = jobStatePath(job.id);
-      const current = readPersistedJobFile(file);
-      const merged = mergeJobSnapshots(current, toPersistableJob(job));
       const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
       try {
-        fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), { encoding: "utf-8", mode: 0o600 });
+        fs.writeFileSync(tmp, serializeJobRecord(lifecycleRecordForJob(job)), { encoding: "utf-8", mode: 0o600 });
         fs.renameSync(tmp, file);
       } catch (error) {
         try { fs.rmSync(tmp, { force: true }); } catch {}
@@ -824,55 +898,47 @@ function persistJob(job: AgentJob): void {
   }
 }
 
-function toPersistableJob(job: AgentJob): Partial<AgentJob> {
-  return {
-    ...job,
-    proc: undefined,
-    timeout: undefined,
-    killTimer: undefined,
-    monitorTimer: undefined,
-    stdoutDecoder: undefined,
-    stderrDecoder: undefined,
-    waiters: undefined as unknown as Set<() => void>,
-    closeWaiters: undefined as unknown as Set<() => void>,
-  };
+function lifecycleRecordForJob(job: AgentJob): JobRecord {
+  return structuredClone(job.record);
 }
 
-function readPersistedJobFile(file: string): Partial<AgentJob> | undefined {
-  try {
-    return JSON.parse(fs.readFileSync(file, "utf-8")) as Partial<AgentJob>;
-  } catch {
-    return undefined;
+function jobStatusFromPhase(phase: JobPhase): JobStatus {
+  return phase === "completed" || phase === "failed" || phase === "cancelled" ? phase : "running";
+}
+
+function applyLifecycleRecordToJob(job: AgentJob, record: JobRecord): void {
+  job.record = structuredClone(record);
+  job.phase = record.phase;
+  job.cleanupPhase = record.cleanupPhase;
+  job.pendingTerminal = record.pendingTerminal;
+  job.terminal = record.terminal;
+  job.cwd = record.cwd;
+  job.sourceCwd = record.sourceCwd;
+  job.updatedAt = record.updatedAt;
+  job.startedAt = record.startedAt ?? record.createdAt;
+  job.timeoutAt = record.timeoutAt;
+  job.stdoutOffset = record.logCursor.stdoutOffset;
+  job.stderrOffset = record.logCursor.stderrOffset;
+  job.nextSeq = Math.max(job.nextSeq ?? 1, record.logCursor.nextSeq);
+  job.usage = { ...record.usage };
+  job.status = jobStatusFromPhase(record.phase);
+  job.cleanupPending = record.cleanupPhase === "pending" || record.cleanupPhase === "running" || record.cleanupPhase === "failed";
+
+  if (record.terminal) {
+    job.finishedAt = record.terminal.finishedAt;
+    job.exitCode = record.terminal.exitCode;
+    job.signal = record.terminal.signal as NodeJS.Signals | undefined;
+    if (record.terminal.error) job.errorMessage = record.terminal.error;
+    else if (record.phase === "failed" && record.terminal.message) job.errorMessage = record.terminal.message;
+    if (record.terminal.reason === "stop" && record.terminal.message) job.stopReason = record.terminal.message;
+    if (record.terminal.reason === "timeout") job.stopReason = record.terminal.message ?? "timeout elapsed";
   }
 }
 
-function mergeJobSnapshots(current: Partial<AgentJob> | undefined, next: Partial<AgentJob>): Partial<AgentJob> {
-  if (!current?.id) return next;
-  const merged: Partial<AgentJob> = { ...current, ...next };
-  merged.logs = mergeLogEntries(current.logs, next.logs);
-  merged.nextSeq = Math.max(current.nextSeq ?? 1, next.nextSeq ?? 1, (merged.logs?.at(-1)?.seq ?? 0) + 1);
-  merged.stdoutOffset = Math.max(current.stdoutOffset ?? 0, next.stdoutOffset ?? 0);
-  merged.stderrOffset = Math.max(current.stderrOffset ?? 0, next.stderrOffset ?? 0);
-
-  const currentTerminal = current.status && current.status !== "running";
-  const nextTerminal = next.status && next.status !== "running";
-  if (currentTerminal && !nextTerminal) {
-    merged.status = current.status;
-    merged.finishedAt = current.finishedAt;
-    merged.exitCode = current.exitCode;
-    merged.signal = current.signal;
-    merged.errorMessage = current.errorMessage;
-    merged.finalOutput = current.finalOutput;
-  } else if (currentTerminal && nextTerminal && (current.updatedAt ?? 0) > (next.updatedAt ?? 0)) {
-    merged.status = current.status;
-    merged.finishedAt = current.finishedAt;
-    merged.exitCode = current.exitCode;
-    merged.signal = current.signal;
-    merged.errorMessage = current.errorMessage;
-    merged.finalOutput = current.finalOutput;
-  }
-  merged.updatedAt = Math.max(current.updatedAt ?? 0, next.updatedAt ?? 0);
-  return merged;
+function dispatchLifecycleEvent(job: AgentJob, event: JobEvent, now = Date.now()): JobRecord {
+  const transition = reduceJobEvent(lifecycleRecordForJob(job), event, { now });
+  applyLifecycleRecordToJob(job, transition.next);
+  return transition.next;
 }
 
 function mergeLogEntries(a: AgentLogEntry[] | undefined, b: AgentLogEntry[] | undefined): AgentLogEntry[] {
@@ -962,20 +1028,19 @@ function loadPersistedJobs(): void {
     if (!fileName.endsWith(".json")) continue;
     try {
       const raw = fs.readFileSync(path.join(JOBS_DIR, fileName), "utf-8");
-      const parsed = JSON.parse(raw) as Partial<AgentJob> & { id?: string };
-      const job = normalizePersistedJob(parsed, fileName);
-      if (!job) continue;
-      const existing = jobs.get(job.id);
+      const record = hydrateJobRecord(raw);
+      if (fileName !== `${record.id}.json`) continue;
+      const existing = jobs.get(record.id);
       if (existing) {
-        mergePersistedIntoLiveJob(existing, job);
+        applyLifecycleRecordToJob(existing, record);
         if (existing.status === "running") startTmuxMonitor(existing);
         if (existing.cleanupPending) void retryWorktreeCleanup(existing);
         continue;
       }
+      const job = runtimeJobFromRecord(record);
       jobs.set(job.id, job);
       if (job.status === "running") startTmuxMonitor(job);
       if (job.cleanupPending) void retryWorktreeCleanup(job);
-      if (job.status !== parsed.status || job.errorMessage !== parsed.errorMessage) persistJob(job);
     } catch {
       // Skip only the corrupt/unreadable job file; other jobs may still be valid.
       continue;
@@ -984,53 +1049,52 @@ function loadPersistedJobs(): void {
   pruneFinishedJobs();
 }
 
-function normalizePersistedJob(parsed: Partial<AgentJob> & { id?: string }, fileName: string): AgentJob | undefined {
-  if (!parsed.id || !/^agent_[A-Za-z0-9_]+$/.test(parsed.id)) return undefined;
-  if (fileName !== `${parsed.id}.json`) return undefined;
-  const status = parsed.status === "running" || parsed.status === "completed" || parsed.status === "failed" || parsed.status === "cancelled" ? parsed.status : "failed";
-  const now = Date.now();
-  const job = parsed as AgentJob;
-  job.id = parsed.id;
-  job.label = typeof job.label === "string" ? job.label : job.id;
-  job.task = typeof job.task === "string" ? job.task : "";
-  job.cwd = typeof job.cwd === "string" ? job.cwd : process.cwd();
-  job.sourceCwd = typeof job.sourceCwd === "string" ? job.sourceCwd : job.cwd;
-  job.command = typeof job.command === "string" ? job.command : "";
-  job.args = Array.isArray(job.args) ? job.args.filter((arg) => typeof arg === "string") : [];
-  job.startedAt = typeof job.startedAt === "number" ? job.startedAt : now;
-  job.updatedAt = typeof job.updatedAt === "number" ? job.updatedAt : now;
-  job.status = status;
-  job.finishedAt = typeof job.finishedAt === "number" ? job.finishedAt : status === "running" ? undefined : now;
-  job.proc = undefined;
-  job.timeout = undefined;
-  job.killTimer = undefined;
-  job.monitorTimer = undefined;
-  job.stdoutDecoder = undefined;
-  job.stderrDecoder = undefined;
-  job.waiters = new Set();
-  job.closeWaiters = new Set();
-  job.logs = Array.isArray(job.logs) ? job.logs.filter(isValidLogEntry).slice(-MAX_STORED_LOG_ENTRIES) : [];
-  job.nextSeq = typeof job.nextSeq === "number" ? Math.max(job.nextSeq, (job.logs.at(-1)?.seq ?? 0) + 1) : job.logs.length + 1;
-  job.stderr = typeof job.stderr === "string" ? job.stderr : "";
-  job.stdoutBuffer = typeof job.stdoutBuffer === "string" ? job.stdoutBuffer : "";
-  job.stderrBuffer = typeof job.stderrBuffer === "string" ? job.stderrBuffer : "";
-  job.pendingAssistantDelta = typeof job.pendingAssistantDelta === "string" ? job.pendingAssistantDelta : "";
-  job.latestAssistantText = typeof job.latestAssistantText === "string" ? job.latestAssistantText : "";
-  job.usage = normalizeUsageStats(job.usage);
-  if (job.supervisor === "process" && job.status === "running") {
-    job.errorMessage = job.errorMessage ?? "process-supervised job cannot be reattached after reload";
-    job.status = "failed";
-    job.finishedAt = job.finishedAt ?? now;
-  } else {
-    job.supervisor = job.supervisor ?? "tmux";
-  }
-  job.tmuxSession = typeof job.tmuxSession === "string" ? job.tmuxSession : tmuxSessionName(job.id);
-  job.stdoutPath = normalizeStorePath(job.stdoutPath, path.join(LOGS_DIR, `${job.id}.stdout.jsonl`));
-  job.stderrPath = normalizeStorePath(job.stderrPath, path.join(LOGS_DIR, `${job.id}.stderr.log`));
-  job.exitCodePath = normalizeStorePath(job.exitCodePath, path.join(LOGS_DIR, `${job.id}.exit`));
-  job.stdoutOffset = typeof job.stdoutOffset === "number" ? Math.max(0, job.stdoutOffset) : inferExistingOffset(job.stdoutPath, job.logs.length > 0);
-  job.stderrOffset = typeof job.stderrOffset === "number" ? Math.max(0, job.stderrOffset) : inferExistingOffset(job.stderrPath, job.logs.length > 0);
-  job.cleanupPending = Boolean(job.cleanupPending);
+function runtimeJobFromRecord(record: JobRecord): AgentJob {
+  const info = record.supervisorInfo ?? {};
+  const job: AgentJob = {
+    record: structuredClone(record),
+    id: record.id,
+    label: record.label,
+    task: record.task,
+    cwd: record.cwd,
+    sourceCwd: record.sourceCwd,
+    worktree: record.worktree as WorktreeInfo | undefined,
+    command: info.command ?? "",
+    args: info.args ?? [],
+    startedAt: record.startedAt ?? record.createdAt,
+    updatedAt: record.updatedAt,
+    finishedAt: record.terminal?.finishedAt,
+    status: jobStatusFromPhase(record.phase),
+    phase: record.phase,
+    cleanupPhase: record.cleanupPhase,
+    terminal: record.terminal,
+    pendingTerminal: record.pendingTerminal,
+    exitCode: record.terminal?.exitCode,
+    signal: record.terminal?.signal as NodeJS.Signals | undefined,
+    errorMessage: record.terminal?.error ?? (record.phase === "failed" ? record.terminal?.message : undefined),
+    stopReason: record.terminal?.reason === "stop" || record.terminal?.reason === "timeout" ? record.terminal.message : undefined,
+    messageCount: 0,
+    logs: [],
+    nextSeq: record.logCursor.nextSeq,
+    stderr: "",
+    stdoutBuffer: "",
+    stderrBuffer: "",
+    latestAssistantText: "",
+    pendingAssistantDelta: "",
+    lastAssistantDeltaLogAt: 0,
+    usage: { ...record.usage },
+    timeoutAt: record.timeoutAt,
+    supervisor: record.supervisor,
+    tmuxSession: info.tmuxSession ?? tmuxSessionName(record.id),
+    stdoutPath: normalizeStorePath(info.stdoutPath, path.join(LOGS_DIR, `${record.id}.stdout.jsonl`)),
+    stderrPath: normalizeStorePath(info.stderrPath, path.join(LOGS_DIR, `${record.id}.stderr.log`)),
+    exitCodePath: normalizeStorePath(info.exitCodePath, path.join(LOGS_DIR, `${record.id}.exit`)),
+    stdoutOffset: record.logCursor.stdoutOffset,
+    stderrOffset: record.logCursor.stderrOffset,
+    cleanupPending: record.cleanupPhase === "pending" || record.cleanupPhase === "running" || record.cleanupPhase === "failed",
+    waiters: new Set(),
+    closeWaiters: new Set(),
+  };
   return job;
 }
 
@@ -1061,54 +1125,6 @@ function normalizeStorePath(value: unknown, fallback: string): string {
   return resolved;
 }
 
-function mergePersistedIntoLiveJob(live: AgentJob, persisted: AgentJob): void {
-  const timeout = live.timeout;
-  const killTimer = live.killTimer;
-  const monitorTimer = live.monitorTimer;
-  const stdoutDecoder = live.stdoutDecoder;
-  const stderrDecoder = live.stderrDecoder;
-  const waiters = live.waiters;
-  const closeWaiters = live.closeWaiters;
-  const liveUpdatedAt = live.updatedAt ?? 0;
-  const persistedUpdatedAt = persisted.updatedAt ?? 0;
-
-  live.logs = mergeLogEntries(live.logs, persisted.logs);
-  live.nextSeq = Math.max(live.nextSeq ?? 1, persisted.nextSeq ?? 1, (live.logs.at(-1)?.seq ?? 0) + 1);
-
-  const persistedTerminal = persisted.status !== "running";
-  const liveTerminal = live.status !== "running";
-  if (persistedTerminal && (!liveTerminal || persistedUpdatedAt >= liveUpdatedAt)) {
-    const merged = mergeJobSnapshots(toPersistableJob(live), toPersistableJob(persisted));
-    Object.assign(live, merged);
-  } else if (!persistedTerminal && !liveTerminal && persistedUpdatedAt > liveUpdatedAt) {
-    live.stdoutOffset = Math.max(live.stdoutOffset ?? 0, persisted.stdoutOffset ?? 0);
-    live.stderrOffset = Math.max(live.stderrOffset ?? 0, persisted.stderrOffset ?? 0);
-    if (!live.finalOutput && persisted.finalOutput) live.finalOutput = persisted.finalOutput;
-    if (!live.errorMessage && persisted.errorMessage) live.errorMessage = persisted.errorMessage;
-    if (persisted.cleanupPending) live.cleanupPending = true;
-    if (persisted.cleanupError) live.cleanupError = persisted.cleanupError;
-  }
-  live.updatedAt = Math.max(live.updatedAt ?? 0, persisted.updatedAt ?? 0);
-
-  live.proc = undefined;
-  live.timeout = timeout;
-  live.killTimer = killTimer;
-  live.monitorTimer = monitorTimer;
-  live.stdoutDecoder = stdoutDecoder;
-  live.stderrDecoder = stderrDecoder;
-  live.waiters = waiters ?? new Set();
-  live.closeWaiters = closeWaiters ?? new Set();
-}
-
-function inferExistingOffset(filePath: string | undefined, hasParsedLogs: boolean): number {
-  if (!filePath || !hasParsedLogs) return 0;
-  try {
-    return fs.statSync(filePath).size;
-  } catch {
-    return 0;
-  }
-}
-
 function scheduleRunningJobTimeouts(): void {
   for (const job of jobs.values()) {
     if (job.status === "running") scheduleJobTimeout(job);
@@ -1121,13 +1137,13 @@ function scheduleJobTimeout(job: AgentJob): void {
   const timeoutReason = `timeout at ${new Date(job.timeoutAt).toISOString()}`;
   if (remaining <= 0) {
     refreshTmuxJob(job);
-    if (job.status === "running") terminateJob(job, timeoutReason);
+    if (job.status === "running") terminateJob(job, timeoutReason, "timeout");
     return;
   }
   job.timeout = setTimeout(() => {
     job.timeout = undefined;
     refreshTmuxJob(job);
-    if (job.status === "running") terminateJob(job, timeoutReason);
+    if (job.status === "running") terminateJob(job, timeoutReason, "timeout");
   }, remaining);
   job.timeout.unref?.();
 }
@@ -1178,7 +1194,7 @@ function refreshTmuxJobOutput(job: AgentJob, options: { drain?: boolean } = {}):
         job.stdoutDecoder ??= new StringDecoder("utf8");
         processStdout(job, job.stdoutDecoder.write(result.buffer));
       }
-      job.stdoutOffset = result.offset;
+      dispatchLifecycleEvent(job, { type: "OutputChunkRead", stream: "stdout", bytes: result.buffer.length, offsetAfter: result.offset });
     }
     if (job.stderrPath) {
       const result = readFileFromOffset(job.stderrPath, job.stderrOffset);
@@ -1187,7 +1203,7 @@ function refreshTmuxJobOutput(job: AgentJob, options: { drain?: boolean } = {}):
         job.stderrDecoder ??= new StringDecoder("utf8");
         processStderr(job, job.stderrDecoder.write(result.buffer));
       }
-      job.stderrOffset = result.offset;
+      dispatchLifecycleEvent(job, { type: "OutputChunkRead", stream: "stderr", bytes: result.buffer.length, offsetAfter: result.offset });
     }
   } while (options.drain && readMore);
   persistJob(job);
@@ -1397,6 +1413,7 @@ function updateFromAssistantMessage(job: AgentJob, msg: AssistantMessage): void 
     job.usage.cacheWrite += msg.usage.cacheWrite || 0;
     job.usage.cost += msg.usage.cost?.total || 0;
     job.usage.contextTokens = msg.usage.totalTokens || job.usage.contextTokens;
+    dispatchLifecycleEvent(job, { type: "UsageUpdated", usage: job.usage });
   }
   touchJob(job);
 }
@@ -1425,12 +1442,13 @@ function flushAssistantDelta(job: AgentJob): void {
 
 function addLog(job: AgentJob, level: LogLevel, text: string, eventType?: string): void {
   const entry: AgentLogEntry = {
-    seq: job.nextSeq++,
+    seq: job.nextSeq,
     timestamp: Date.now(),
     level,
     text: truncateOneLine(text, 1_500),
     eventType,
   };
+  dispatchLifecycleEvent(job, { type: "LogEntriesAppended", firstSeq: entry.seq, count: 1 }, entry.timestamp);
   job.logs.push(entry);
   if (job.logs.length > MAX_STORED_LOG_ENTRIES) {
     job.logs.splice(0, job.logs.length - MAX_STORED_LOG_ENTRIES);
@@ -1593,8 +1611,9 @@ async function waitForJobUpdate(job: AgentJob, waitMs: number, signal?: AbortSig
   });
 }
 
-function terminateJob(job: AgentJob, reason: string): boolean {
+function terminateJob(job: AgentJob, reason: string, intent: "stop" | "timeout" = "stop"): boolean {
   if (job.status !== "running") return true;
+  dispatchLifecycleEvent(job, intent === "timeout" ? { type: "TimeoutElapsed", message: reason } : { type: "StopRequested", reason });
   addLog(job, "error", `terminating: ${reason}`, "terminate");
 
   if (job.supervisor === "tmux" && job.tmuxSession) {
@@ -1630,11 +1649,10 @@ function terminateJob(job: AgentJob, reason: string): boolean {
 
     if (job.timeout) clearTimeout(job.timeout);
     if (job.monitorTimer) clearInterval(job.monitorTimer);
-    finalizeJob(job, "cancelled", undefined, undefined, reason);
+    finalizeJob(job, intent === "timeout" ? "failed" : "cancelled", undefined, undefined, reason);
     return true;
   }
 
-  job.status = "cancelled";
   job.errorMessage = reason;
   if (job.timeout) clearTimeout(job.timeout);
   if (job.monitorTimer) clearInterval(job.monitorTimer);
@@ -1645,7 +1663,7 @@ function terminateJob(job: AgentJob, reason: string): boolean {
     }, 5_000);
     return true;
   }
-  finalizeJob(job, "cancelled", undefined, undefined, reason);
+  finalizeJob(job, intent === "timeout" ? "failed" : "cancelled", undefined, undefined, reason);
   return true;
 }
 
@@ -1708,20 +1726,43 @@ function finalizeJob(
   cleanupTempPrompt(job);
 
   if (!job.finalOutput && job.latestAssistantText) job.finalOutput = job.latestAssistantText;
-  job.status = status;
-  job.exitCode = exitCode;
-  job.signal = signal;
-  job.finishedAt = Date.now();
+  const finishedAt = Date.now();
+  try {
+    if (job.phase !== "completed" && job.phase !== "failed" && job.phase !== "cancelled") {
+      if (exitCode !== undefined || signal !== undefined) {
+        dispatchLifecycleEvent(job, { type: "ChildExitObserved", exitCode, signal }, finishedAt);
+      } else if (status === "cancelled") {
+        if (!job.pendingTerminal) dispatchLifecycleEvent(job, { type: "StopRequested", reason: errorMessage ?? "cancelled" }, finishedAt);
+        dispatchLifecycleEvent(job, { type: "SupervisorGoneObserved", message: errorMessage }, finishedAt);
+      } else if (status === "failed" && (job.phase === "created" || job.phase === "preparing" || job.phase === "starting")) {
+        dispatchLifecycleEvent(job, { type: "SupervisorFailed", error: errorMessage ?? "supervisor failed" }, finishedAt);
+      } else if (status === "failed") {
+        dispatchLifecycleEvent(job, { type: "SupervisorGoneObserved", message: errorMessage ?? "job failed" }, finishedAt);
+      }
+      if (job.phase === "draining") dispatchLifecycleEvent(job, { type: "DrainComplete" }, finishedAt);
+    }
+  } catch {
+    job.status = status;
+    job.exitCode = exitCode;
+    job.signal = signal;
+    job.finishedAt = finishedAt;
+  }
+  if (job.phase !== "completed" && job.phase !== "failed" && job.phase !== "cancelled") {
+    job.status = status;
+    job.exitCode = exitCode;
+    job.signal = signal;
+    job.finishedAt = finishedAt;
+  }
   if (errorMessage) job.errorMessage = errorMessage;
   if (job.status === "failed" && !job.errorMessage && job.stderr.trim()) job.errorMessage = job.stderr.trim();
-  cleanupWorktree(job, status);
+  cleanupWorktree(job, job.status);
 
-  const parts = [`finished: ${status}`];
+  const parts = [`finished: ${job.status}`];
   if (exitCode !== undefined) parts.push(`exitCode=${exitCode}`);
   if (signal) parts.push(`signal=${signal}`);
   if (job.errorMessage) parts.push(`error=${truncateOneLine(job.errorMessage, 500)}`);
   if (job.worktree?.retained) parts.push(`retainedWorktree=${job.worktree.root}`);
-  addLog(job, status === "completed" ? "info" : "error", parts.join(" "), "finish");
+  addLog(job, job.status === "completed" ? "info" : "error", parts.join(" "), "finish");
   persistJob(job);
   notifyCloseWaiters(job);
   pruneFinishedJobs();
@@ -2514,11 +2555,19 @@ function samePath(a: string, b: string): boolean {
 function cleanupWorktree(job: AgentJob, status: JobStatus): void {
   const worktree = job.worktree;
   if (!worktree) return;
-  if (shouldRetainWorktree(worktree, status)) {
+  const before = job.cleanupPhase;
+  try {
+    dispatchLifecycleEvent(job, { type: "CleanupRequested" });
+  } catch {
+    // Fall back to direct cleanup flags if the lifecycle reducer rejects a corrupt runtime snapshot.
+  }
+  if (job.cleanupPhase === "retained" || shouldRetainWorktree(worktree, status)) {
     worktree.retained = true;
+    job.cleanupPhase = "retained";
     job.cleanupPending = false;
     return;
   }
+  if (job.cleanupPhase !== "running") job.cleanupPhase = before === "failed" ? "failed" : "running";
   job.cleanupPending = true;
   job.cleanupError = undefined;
   persistJob(job);
@@ -2536,12 +2585,14 @@ async function retryWorktreeCleanup(job: AgentJob): Promise<void> {
   if (!worktree || !job.cleanupPending) return;
   try {
     await cleanupWorktreeAsync(worktree);
+    dispatchLifecycleEvent(job, { type: "CleanupSucceeded" });
     job.cleanupPending = false;
     job.cleanupError = undefined;
     addLog(job, "info", `worktree cleanup ok: ${worktree.root}`, "worktree");
   } catch (error) {
     job.cleanupPending = true;
     job.cleanupError = error instanceof Error ? error.message : String(error);
+    try { dispatchLifecycleEvent(job, { type: "CleanupFailed", error: job.cleanupError }); } catch {}
     addLog(job, "error", `worktree cleanup failed: ${job.cleanupError}`, "worktree");
   } finally {
     persistJob(job);
@@ -2643,6 +2694,10 @@ function summarizeJob(job: AgentJob) {
     stdoutPath: job.stdoutPath,
     stderrPath: job.stderrPath,
     status: job.status,
+    phase: job.phase ?? job.status,
+    cleanupPhase: job.cleanupPhase,
+    terminal: job.terminal,
+    pendingTerminal: job.pendingTerminal,
     startedAt: job.startedAt,
     updatedAt: job.updatedAt,
     finishedAt: job.finishedAt,
@@ -2902,4 +2957,7 @@ export const __subagentsTest = {
   getPostCopyTrust,
   rememberPostCopyTrust,
   assertSymlinkTargetInsideRepo,
+  lifecycleRecordForJob,
+  applyLifecycleRecordToJob,
+  dispatchLifecycleEvent,
 };

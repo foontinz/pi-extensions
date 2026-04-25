@@ -4,7 +4,6 @@ import {
   JobRecordHydrationError,
   RUNTIME_ONLY_KEYS,
 } from "./invariants.js";
-import { legacyJobToRecord } from "./legacy-adapter.js";
 import {
   JOB_RECORD_SCHEMA_VERSION,
   createEmptyJobRuntimeState,
@@ -40,11 +39,7 @@ export function hydrateJobRecord(raw: unknown, options: HydrateJobRecordOptions 
   if (!isRecord(parsed)) throw new JobRecordHydrationError("job record must be an object");
 
   if (parsed.schemaVersion === undefined) {
-    return legacyJobToRecord(parsed, {
-      fallbackCwd: options.fallbackCwd ?? fallbackCwdFrom(parsed),
-      now: options.now,
-      id: options.id,
-    });
+    throw new JobRecordHydrationError("missing job record schemaVersion");
   }
 
   if (parsed.schemaVersion !== JOB_RECORD_SCHEMA_VERSION) {
@@ -104,17 +99,6 @@ function stripRuntimeFields(value: unknown, path: string, seen: WeakSet<object>)
   }
   seen.delete(value);
   return output;
-}
-
-function fallbackCwdFrom(record: Record<string, unknown>): string {
-  return firstString(record.cwd, record.sourceCwd, ".");
-}
-
-function firstString(...values: unknown[]): string {
-  for (const value of values) {
-    if (typeof value === "string" && value.length > 0) return value;
-  }
-  return ".";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
