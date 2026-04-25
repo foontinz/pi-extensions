@@ -60,7 +60,7 @@ export interface CodeHandleMatch {
 
 // Registry file path — always resolves to the same absolute location
 // regardless of which jiti instance evaluates this module.
-const REGISTRY_FILE = join(dirname(fileURLToPathCompat(import.meta.url)), ".handle-registry.json");
+const REGISTRY_FILE = join(dirname(fileURLToPathCompat(import.meta.url)), `.handle-registry.${process.pid}.json`);
 
 export function registerCodeHandle(handle: CodeHandle): void {
   const registry = readRegistry();
@@ -146,7 +146,7 @@ function readRegistry(): Map<string, CodeHandle> {
 
 function writeRegistryAtomic(registry: Map<string, CodeHandle>): void {
   mkdirSync(dirname(REGISTRY_FILE), { recursive: true });
-  const tmp = REGISTRY_FILE + ".tmp";
+  const tmp = `${REGISTRY_FILE}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
   writeFileSync(tmp, JSON.stringify([...registry.values()], null, 2), "utf8");
   renameSync(tmp, REGISTRY_FILE);
 }

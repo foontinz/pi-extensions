@@ -24,7 +24,7 @@ interface RegistryFileShape {
 	vars: ManagedEnvVar[];
 }
 
-const REGISTRY_FILE = join(dirname(fileURLToPathCompat(import.meta.url)), ".envvar-registry.json");
+const REGISTRY_FILE = join(dirname(fileURLToPathCompat(import.meta.url)), `.envvar-registry.${process.pid}.json`);
 
 export function registerManagedEnvVar(config: string | ManagedEnvVar): ManagedEnvVar {
 	const normalized = typeof config === "string" ? { name: config } : config;
@@ -110,7 +110,7 @@ function readRegistry(): Map<string, ManagedEnvVar> {
 
 function writeRegistryAtomic(registry: Map<string, ManagedEnvVar>): void {
 	mkdirSync(dirname(REGISTRY_FILE), { recursive: true });
-	const tmp = REGISTRY_FILE + ".tmp";
+	const tmp = `${REGISTRY_FILE}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
 	const payload: RegistryFileShape = {
 		pid: process.pid,
 		vars: [...registry.values()].sort((a, b) => a.name.localeCompare(b.name)),

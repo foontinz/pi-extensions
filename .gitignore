@@ -18,8 +18,9 @@ mcp-cache.json
 mcp-oauth/
 models.json
 sessions/
+/subagents/
 bin/
 .run-*
-.handle-registry.json
-.envvar-registry.json
+.handle-registry*.json
+.envvar-registry*.json
 .debug-hooks.log
