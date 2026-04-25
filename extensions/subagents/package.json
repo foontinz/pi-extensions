@@ -7,7 +7,7 @@
     "clean": "echo 'nothing to clean'",
     "build": "tsc --noEmit",
     "check": "tsc --noEmit",
-    "test": "tsx --test test/*.test.ts"
+    "test": "tsx --test \"test/**/*.test.ts\""
   },
   "pi": {
     "extensions": [
