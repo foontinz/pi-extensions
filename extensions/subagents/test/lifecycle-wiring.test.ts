@@ -127,6 +127,12 @@ test("applying a stale persisted record keeps runtime log cursor contiguous", ()
   assert.equal(job.nextSeq, 73);
 });
 
+test("cleanup-pending jobs are protected from pruning eligibility", () => {
+  assert.equal(__subagentsTest.hasUnresolvedCleanup(makeLegacyJob({ status: "failed", cleanupPhase: "failed" })), true);
+  assert.equal(__subagentsTest.hasUnresolvedCleanup(makeLegacyJob({ status: "failed", cleanupPending: true })), true);
+  assert.equal(__subagentsTest.hasUnresolvedCleanup(makeLegacyJob({ status: "failed", cleanupPhase: "complete" })), false);
+});
+
 test("live AgentJob lifecycle record persists compact observability", () => {
   const job = makeLegacyJob({
     messageCount: 2,

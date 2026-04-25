@@ -106,11 +106,12 @@ Project agents with the same name override user agents when `agentScope: "both"`
 
 ## Notes
 
-- Jobs are supervised by tmux and persisted under `~/.pi/agent/subagents/`, so running jobs survive `/reload`, session switch, and parent Pi exit. Use `stop_agent` to terminate a running job.
+- Jobs are supervised by tmux and persisted under `~/.pi/agent/subagents/`, so running jobs survive `/reload`, session switch, and parent Pi exit. `tmux` on `PATH` and executable `/bin/sh` are required before a job is launched. Use `stop_agent` to terminate a running job.
 - Attach to a live job with `tmux attach -t <session>`; `run_agent` prints the exact session name.
 - `poll_agent` returns summarized/capped logs and persists a compact final output/recent-log snapshot with the job record so completed results remain pollable after reload. Full raw child process streams are persisted under `~/.pi/agent/subagents/logs/*.stdout.jsonl` and `*.stderr.log` for manual inspection. To prevent unbounded disk growth, a running job is stopped if either raw stream exceeds `PI_SUBAGENTS_MAX_RAW_LOG_BYTES` bytes; the default is 512 MiB per stream, and `0` disables this guard.
 - `poll_agent` defaults to compact summary output to avoid flooding the main model context.
 - Child tool access is limited to tools active in the parent Pi session. If `tools` is omitted, the child receives only the active safe read-only default tools: `read`, `grep`, `find`, and `ls` when available. Requested agent/tool allowlists must be a subset of parent active tools. Pass tools explicitly to grant write, execute, network, or other higher-risk capabilities.
+- Running job concurrency is capped by default to protect the host: `PI_SUBAGENTS_MAX_RUNNING` defaults to 8 globally and `PI_SUBAGENTS_MAX_RUNNING_PER_REPO` defaults to 4 per repository/path. Set either to `0` to disable that limit.
 - The child process uses `--no-session`: it does not inherit the parent conversation and does not write a normal Pi session file. Put all needed context in the task, named/ad-hoc system prompt, files, or repo context.
 - Do not pass a `model` override for routine delegation/review. Only set `model` when the user explicitly asks for that exact model/provider; otherwise the child Pi uses its configured default, avoiding provider/API-key mismatches.
 - The child process loads normal Pi configuration/extensions, skills, and context files; these are not model-disableable from `run_agent`.

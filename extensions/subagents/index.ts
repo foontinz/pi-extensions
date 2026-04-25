@@ -52,6 +52,10 @@ const MAX_STDERR_PARTIAL_BUFFER_CHARS = 1_000_000;
 const MAX_LOG_READ_BYTES = 1_000_000;
 const DEFAULT_MAX_RAW_LOG_BYTES = 512 * 1024 * 1024;
 const MAX_RAW_LOG_BYTES = parseOptionalNonNegativeIntegerEnv("PI_SUBAGENTS_MAX_RAW_LOG_BYTES", DEFAULT_MAX_RAW_LOG_BYTES);
+const DEFAULT_MAX_RUNNING_SUBAGENTS = 8;
+const DEFAULT_MAX_RUNNING_SUBAGENTS_PER_REPO = 4;
+const MAX_RUNNING_SUBAGENTS = parseOptionalNonNegativeIntegerEnv("PI_SUBAGENTS_MAX_RUNNING", DEFAULT_MAX_RUNNING_SUBAGENTS);
+const MAX_RUNNING_SUBAGENTS_PER_REPO = parseOptionalNonNegativeIntegerEnv("PI_SUBAGENTS_MAX_RUNNING_PER_REPO", DEFAULT_MAX_RUNNING_SUBAGENTS_PER_REPO);
 const MAX_RETAINED_FINISHED_JOBS = 50;
 const DEFAULT_POLL_LOG_ENTRIES = 20;
 const MAX_POLL_LOG_ENTRIES = 200;
@@ -235,6 +239,7 @@ interface AgentJob {
   cleanupPending?: boolean;
   cleanupError?: string;
   rawLogLimitExceeded?: boolean;
+  repoKey?: string;
   phase?: JobPhase;
   cleanupPhase?: CleanupPhase;
   terminal?: TerminalInfo;
@@ -377,6 +382,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       if (ctx.hasUI) statusContext = ctx;
+      loadPersistedJobs();
+      refreshRunningTmuxJobs();
       refreshSubagentStatus();
       const agentScope: AgentScope = params.agentScope ?? "user";
       const sourceCwd = params.cwd ? path.resolve(ctx.cwd, params.cwd) : ctx.cwd;
@@ -429,7 +436,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
       }
 
-      const job = await startAgentJob(sourceCwd, params, namedAgent, toolSelection.tools, ctx);
+      const capacity = await checkSubagentCapacity(sourceCwd);
+      if (!capacity.ok) {
+        return {
+          content: [{ type: "text", text: capacity.message }],
+          details: capacity.details,
+        };
+      }
+
+      const job = await startAgentJob(sourceCwd, params, namedAgent, toolSelection.tools, ctx, capacity.repoKey);
       const details = summarizeJob(job);
       const text = formatRunAgentStartResult(job);
 
@@ -623,6 +638,40 @@ function formatRunAgentStartResult(job: AgentJob): string {
   return lines.join("\n");
 }
 
+function preflightSupervisorRequirements(): { ok: true } | { ok: false; message: string } {
+  if (!isTmuxAvailable()) {
+    return { ok: false, message: "Cannot start subagent: tmux is required but was not found or did not respond on PATH." };
+  }
+  try {
+    fs.accessSync("/bin/sh", fs.constants.X_OK);
+  } catch {
+    return { ok: false, message: "Cannot start subagent: /bin/sh is required to launch the tmux-supervised child process." };
+  }
+  return { ok: true };
+}
+
+async function checkSubagentCapacity(sourceCwd: string): Promise<
+  | { ok: true; repoKey: string; details: { running: number; maxRunning: number; runningForRepo: number; maxRunningPerRepo: number; repoKey: string } }
+  | { ok: false; repoKey: string; message: string; details: { running: number; maxRunning: number; runningForRepo: number; maxRunningPerRepo: number; repoKey: string } }
+> {
+  const repoKey = await subagentRepoKey(sourceCwd);
+  const runningJobs = [...jobs.values()].filter((job) => job.status === "running");
+  const running = runningJobs.length;
+  const runningForRepo = runningJobs.filter((job) => (job.repoKey ?? job.worktree?.originalRoot ?? job.sourceCwd) === repoKey).length;
+  const details = { running, maxRunning: MAX_RUNNING_SUBAGENTS, runningForRepo, maxRunningPerRepo: MAX_RUNNING_SUBAGENTS_PER_REPO, repoKey };
+  if (MAX_RUNNING_SUBAGENTS > 0 && running >= MAX_RUNNING_SUBAGENTS) {
+    return { ok: false, repoKey, details, message: `Refusing to start subagent: ${running} running jobs already meet PI_SUBAGENTS_MAX_RUNNING=${MAX_RUNNING_SUBAGENTS}. Stop or wait for an existing job, or raise/disable the limit.` };
+  }
+  if (MAX_RUNNING_SUBAGENTS_PER_REPO > 0 && runningForRepo >= MAX_RUNNING_SUBAGENTS_PER_REPO) {
+    return { ok: false, repoKey, details, message: `Refusing to start subagent: ${runningForRepo} running jobs for ${repoKey} already meet PI_SUBAGENTS_MAX_RUNNING_PER_REPO=${MAX_RUNNING_SUBAGENTS_PER_REPO}. Stop or wait for an existing job, or raise/disable the limit.` };
+  }
+  return { ok: true, repoKey, details };
+}
+
+async function subagentRepoKey(sourceCwd: string): Promise<string> {
+  return (await getGitRoot(sourceCwd)) ?? path.resolve(sourceCwd);
+}
+
 function validateToolSelection(
   activeTools: string[],
   requestedTools: string[] | undefined,
@@ -649,8 +698,11 @@ async function startAgentJob(
   agent: AgentConfig | undefined,
   effectiveTools: string[],
   ctx: ExtensionContext,
+  repoKey?: string,
 ): Promise<AgentJob> {
   const id = createJobId();
+  const preflight = preflightSupervisorRequirements();
+  if (!preflight.ok) return createFailedPreStartJob(id, sourceCwd, params, agent, preflight.message);
   let worktreePrep: { cwd: string; worktree?: WorktreeInfo };
   try {
     worktreePrep = await prepareWorktreeForSpawn(sourceCwd, id, ctx);
@@ -715,6 +767,7 @@ async function startAgentJob(
     agentSource: agent?.source ?? "adhoc",
     task: params.task,
     effectiveTools,
+    repoKey,
     cwd,
     sourceCwd,
     worktree: worktreePrep.worktree,
@@ -851,6 +904,7 @@ function createFailedPreStartJob(
     agentSource: agent?.source ?? "adhoc",
     task: params.task,
     effectiveTools: [],
+    repoKey: sourceCwd,
     cwd: sourceCwd,
     sourceCwd,
     command: "",
@@ -1128,6 +1182,7 @@ function runtimeJobFromRecord(record: JobRecord): AgentJob {
     label: record.label,
     task: record.task,
     effectiveTools: [],
+    repoKey: record.worktree?.originalRoot ?? record.sourceCwd,
     cwd: record.cwd,
     sourceCwd: record.sourceCwd,
     worktree: record.worktree as WorktreeInfo | undefined,
@@ -1231,10 +1286,11 @@ function startTmuxMonitor(job: AgentJob): void {
 }
 
 function refreshRunningTmuxJobs(): void {
-  for (const job of jobs.values()) refreshTmuxJob(job);
+  const sessions = listTmuxSessions();
+  for (const job of jobs.values()) refreshTmuxJob(job, sessions);
 }
 
-function refreshTmuxJob(job: AgentJob): void {
+function refreshTmuxJob(job: AgentJob, knownSessions?: Set<string>): void {
   if (job.supervisor !== "tmux") return;
   refreshTmuxJobOutput(job);
   if (job.status !== "running") return;
@@ -1252,7 +1308,7 @@ function refreshTmuxJob(job: AgentJob): void {
     if (!latestLogPreview(job)?.includes("tmux unavailable")) addLog(job, "error", "tmux unavailable; cannot refresh subagent status", "tmux");
     return;
   }
-  if (tmuxSessionExists(job.tmuxSession)) return;
+  if (knownSessions ? Boolean(job.tmuxSession && knownSessions.has(job.tmuxSession)) : tmuxSessionExists(job.tmuxSession)) return;
 
   finalizeJob(job, "failed", undefined, undefined, "tmux session ended before writing exit code");
 }
@@ -1356,6 +1412,26 @@ function isTmuxAvailable(): boolean {
 function tmuxSessionExists(sessionName: string | undefined): boolean {
   if (!sessionName) return false;
   return runTmuxSync(["has-session", "-t", sessionName]).ok;
+}
+
+function listTmuxSessions(): Set<string> | undefined {
+  if (!isTmuxAvailable()) return undefined;
+  const result = runTmuxCaptureSync(["list-sessions", "-F", "#{session_name}"]);
+  if (!result.ok) return undefined;
+  return new Set(result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
+}
+
+function runTmuxCaptureSync(args: string[]): { ok: true; stdout: string } | { ok: false; error: string } {
+  try {
+    const stdout = execFileSync("tmux", args, {
+      encoding: "utf-8",
+      timeout: TMUX_COMMAND_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+    return { ok: true, stdout };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 function runTmuxSync(args: string[]): { ok: true } | { ok: false; error: string } {
@@ -3164,13 +3240,17 @@ function appendCappedText(current: string, chunk: string, maxChars: number): str
 }
 
 function pruneFinishedJobs(): void {
-  const finished = [...jobs.values()]
-    .filter((job) => job.status !== "running")
+  const pruneable = [...jobs.values()]
+    .filter((job) => job.status !== "running" && !hasUnresolvedCleanup(job))
     .sort((a, b) => (b.finishedAt ?? b.updatedAt) - (a.finishedAt ?? a.updatedAt));
-  for (const job of finished.slice(MAX_RETAINED_FINISHED_JOBS)) {
+  for (const job of pruneable.slice(MAX_RETAINED_FINISHED_JOBS)) {
     jobs.delete(job.id);
     removePersistedJobFiles(job.id);
   }
+}
+
+function hasUnresolvedCleanup(job: AgentJob): boolean {
+  return Boolean(job.cleanupPending || job.cleanupPhase === "pending" || job.cleanupPhase === "running" || job.cleanupPhase === "failed");
 }
 
 function removePersistedJobFiles(id: string): void {
@@ -3233,6 +3313,7 @@ export const __subagentsTest = {
   rememberPostCopyTrust,
   assertSymlinkTargetInsideRepo,
   validateToolSelection,
+  hasUnresolvedCleanup,
   lifecycleRecordForJob,
   applyLifecycleRecordToJob,
   dispatchLifecycleEvent,
