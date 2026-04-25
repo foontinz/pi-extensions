@@ -96,6 +96,7 @@ const WORKTREE_CONFIG_PATH = path.join(".pi", "worktree.json");
 const POST_COPY_TRUST_STORE_PATH_ENV = "PI_SUBAGENTS_POSTCOPY_TRUST_STORE";
 const POST_COPY_TRUST_STORE_PATH = path.join(JOB_STORE_DIR, "trusted-postcopy.json");
 const DEFAULT_SUBAGENT_TOOLS = ["read", "grep", "find", "ls"] as const;
+const SUBAGENT_CHILD_ENV = "PI_SUBAGENTS_CHILD";
 
 const execFileAsync = promisify(execFile);
 
@@ -104,6 +105,10 @@ function parseOptionalNonNegativeIntegerEnv(name: string, fallback: number): num
   if (raw === undefined || raw.trim() === "") return fallback;
   const parsed = Number(raw);
   return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
+}
+
+function isSubagentChildProcess(): boolean {
+  return process.env[SUBAGENT_CHILD_ENV] === "1";
 }
 
 type JobStatus = "running" | "completed" | "failed" | "cancelled";
@@ -383,8 +388,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   extensionApi = pi;
 
   pi.on("session_start", async (_event, ctx) => {
+    if (isSubagentChildProcess()) return;
     statusContext = ctx;
     loadPersistedJobs();
+    await stopRunningJobsForSessionBoundary("cancelled because subagents are bounded to the parent Pi session and the previous session ended", 0);
     refreshRunningTmuxJobs();
     scheduleRunningJobTimeouts();
     refreshSubagentStatus();
@@ -394,8 +401,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     name: "run_agent",
     label: "Run Agent",
     description: [
-      "Start a tmux-supervised background Pi subagent in a separate --no-session process and return immediately with a job id.",
+      "Start a session-bounded tmux-supervised background Pi subagent in a separate --no-session process and return immediately with a job id.",
       "Use poll_agent with that id to retrieve compact status; request summarized logs/full output only when needed.",
+      "Running subagents are stopped when the parent Pi session shuts down; use poll_agent before ending the session to collect results.",
       "When started inside a git repo, the child runs in a temporary detached worktree by default; .pi/worktree.json controls copied files, post-copy setup scripts, and retention. Pass worktree:false to run in-place or worktree:true to require isolation.",
       "By default, subagents receive only active read-only tools (read/grep/find/ls); pass tools explicitly to grant write, execute, network, or other higher-risk capabilities.",
       "Can run a named markdown agent or an ad-hoc subagent with optional systemPrompt/tools and an explicit model override only when requested.",
@@ -406,6 +414,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       "After run_agent returns an id, poll sparingly. Prefer poll_agent waitMs around 10000-30000 and avoid tight polling loops.",
       "Use poll_agent's default summary verbosity for routine checks; request verbosity \"logs\" or \"full\" only when needed.",
       "Remember run_agent uses a temporary git worktree when inside a repo unless worktree:false is set; uncommitted/untracked files are visible only if copied by .pi/worktree.json, and dependencies may need postCopy setup.",
+      "Subagents are bounded to the current Pi session and will be stopped during session shutdown/reload; poll them before ending the session if you need results.",
       "Omit tools for the safe read-only default; pass tools explicitly only when the subagent needs additional capabilities.",
       "Do not set the model parameter unless the user explicitly requests a specific model/provider; omit it to use the child Pi default and avoid provider/API-key mismatches.",
       "Subagents do not inherit the parent conversation; include all necessary context in the task, systemPrompt, named agent, files, or repo context.",
@@ -651,8 +660,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
-    // Subagents are supervised by tmux so they intentionally survive /reload,
-    // session switches, and parent Pi exits. Use stop_agent to terminate them.
+    if (isSubagentChildProcess()) return;
+    // Subagents are bounded to the parent Pi session. Stop live children on
+    // graceful shutdown/reload instead of leaving detached tmux work running.
+    await stopRunningJobsForSessionBoundary("cancelled because the parent Pi session shut down", DEFAULT_STOP_WAIT_MS);
     for (const job of jobs.values()) {
       if (job.monitorTimer) clearInterval(job.monitorTimer);
       job.monitorTimer = undefined;
@@ -898,9 +909,10 @@ async function startAgentJob(
 
     const shell = "/bin/sh";
     const commandLine = displayCommand(invocation.command, invocation.args);
+    const childCommandLine = `${SUBAGENT_CHILD_ENV}=1 ${commandLine}`;
     const script = [
       `umask 077`,
-      `${commandLine} > ${shellQuote(job.stdoutPath!)} 2> ${shellQuote(job.stderrPath!)}`,
+      `${childCommandLine} > ${shellQuote(job.stdoutPath!)} 2> ${shellQuote(job.stderrPath!)}`,
       `code=$?`,
       `printf '%s\\n' "$code" > ${shellQuote(job.exitCodePath!)}`,
       `exit "$code"`,
@@ -1232,7 +1244,7 @@ function loadPersistedJobs(): void {
   }
 
   for (const fileName of fileNames) {
-    if (!fileName.endsWith(".json")) continue;
+    if (!fileName.endsWith(".json") || fileName.endsWith(".callback.json")) continue;
     const filePath = path.join(JOBS_DIR, fileName);
     try {
       const raw = fs.readFileSync(filePath, "utf-8");
@@ -1965,6 +1977,18 @@ async function waitForJobUpdate(job: AgentJob, waitMs: number, signal?: AbortSig
     signal?.addEventListener("abort", onAbort, { once: true });
     job.waiters.add(done);
   });
+}
+
+async function stopRunningJobsForSessionBoundary(reason: string, waitMs: number): Promise<void> {
+  const previousStatusContext = statusContext;
+  statusContext = undefined;
+  try {
+    for (const job of [...jobs.values()].filter((job) => job.status === "running")) {
+      await stopAgentJob(job, reason, waitMs);
+    }
+  } finally {
+    statusContext = previousStatusContext;
+  }
 }
 
 async function stopAgentJob(job: AgentJob, reason: string, waitMs: number): Promise<boolean> {
@@ -3670,6 +3694,7 @@ export const __subagentsTest = {
   refreshSubagentStatus,
   loadPersistedJobs,
   recentStoreWarnings,
+  stopRunningJobsForSessionBoundary,
   forgetJobForCallbackRetry(id: string) {
     jobs.delete(id);
   },

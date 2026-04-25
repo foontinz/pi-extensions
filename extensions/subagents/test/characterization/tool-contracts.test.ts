@@ -147,9 +147,15 @@ function appendJsonl(filePath: string, events: unknown[]) {
   fs.appendFileSync(filePath, events.map((event) => JSON.stringify(event)).join("\n") + "\n", "utf-8");
 }
 
-function exitCodePathFor(id: string): string {
+function jobFor(id: string): any {
   const job = __subagentsTest.getJob(id);
-  assert.ok(job?.exitCodePath);
+  assert.ok(job);
+  return job;
+}
+
+function exitCodePathFor(id: string): string {
+  const job = jobFor(id);
+  assert.ok(job.exitCodePath);
   return job.exitCodePath;
 }
 
@@ -406,7 +412,9 @@ test("run_agent successful start text/details are characterized with fake tmux",
     assert.equal(result.details.label, "fake success");
     assert.equal(result.details.cwd, cwd);
     assert.equal(result.details.worktree, undefined);
-    assert.ok(fake.readState().sessions[result.details.tmuxSession]);
+    const session = fake.readState().sessions[result.details.tmuxSession];
+    assert.ok(session);
+    assert.match(session.script, /PI_SUBAGENTS_CHILD=1 .* --mode json -p --no-session/);
   });
 });
 
@@ -624,8 +632,10 @@ test("poll_agent surfaces and quarantines corrupt and unsupported persisted reco
   fs.mkdirSync(jobsDir, { recursive: true });
   const corruptPath = path.join(jobsDir, "agent_bad_corrupt.json");
   const unsupportedPath = path.join(jobsDir, "agent_future_schema.json");
+  const callbackPath = path.join(jobsDir, "agent_callback.callback.json");
   fs.writeFileSync(corruptPath, "{not json", "utf-8");
   fs.writeFileSync(unsupportedPath, JSON.stringify({ schemaVersion: 999, id: "agent_future_schema" }), "utf-8");
+  fs.writeFileSync(callbackPath, JSON.stringify({ delivered: false }), "utf-8");
 
   const result = await tools.get("poll_agent")!.execute("call", {}, new AbortController().signal, () => {}, ctx);
   assert.match(textOf(result), /No background agent jobs are known/);
@@ -639,6 +649,7 @@ test("poll_agent surfaces and quarantines corrupt and unsupported persisted reco
   assert.equal(fs.existsSync(unsupportedPath), false);
   assert.ok(fs.readdirSync(jobsDir).some((name) => /^agent_bad_corrupt\.json\.corrupt\./.test(name)));
   assert.ok(fs.readdirSync(jobsDir).some((name) => /^agent_future_schema\.json\.unsupported\./.test(name)));
+  assert.equal(fs.existsSync(callbackPath), true);
 });
 
 test("poll_agent surfaces job-specific persisted-record warnings", async () => {
@@ -654,4 +665,38 @@ test("poll_agent surfaces job-specific persisted-record warnings", async () => {
   assert.equal(result.details.id, "agent_specific");
   assert.equal(result.details.warnings.length, 1);
   assert.equal(result.details.warnings[0].kind, "corrupt");
+});
+
+test("session boundary stops running fake tmux jobs", async () => {
+  await withFakeTmux({}, async (fake) => {
+    const started = await tools.get("run_agent")!.execute("call", { task: "session bounded", label: "session bounded", worktree: false, timeoutMs: 0 }, new AbortController().signal, () => {}, ctx);
+    assert.ok(fake.readState().sessions[started.details.tmuxSession]);
+
+    await __subagentsTest.stopRunningJobsForSessionBoundary("session ended", 0);
+
+    const job = jobFor(started.details.id);
+    assert.equal(job.status, "cancelled");
+    assert.equal(job.phase, "cancelled");
+    assert.equal(job.stopReason, "session ended");
+    assert.equal(fake.readState().sessions[started.details.tmuxSession], undefined);
+  });
+});
+
+test("new session load stops orphan persisted running jobs instead of adopting them", async () => {
+  await withFakeTmux({}, async (fake) => {
+    const started = await tools.get("run_agent")!.execute("call", { task: "orphan", label: "orphan", worktree: false, timeoutMs: 0 }, new AbortController().signal, () => {}, ctx);
+    assert.ok(fake.readState().sessions[started.details.tmuxSession]);
+
+    __subagentsTest.clearJobs();
+    __subagentsTest.loadPersistedJobs();
+    assert.equal(jobFor(started.details.id).status, "running");
+
+    await __subagentsTest.stopRunningJobsForSessionBoundary("previous session ended", 0);
+
+    const job = jobFor(started.details.id);
+    assert.equal(job.status, "cancelled");
+    assert.equal(job.phase, "cancelled");
+    assert.equal(job.stopReason, "previous session ended");
+    assert.equal(fake.readState().sessions[started.details.tmuxSession], undefined);
+  });
 });

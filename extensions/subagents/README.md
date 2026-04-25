@@ -4,7 +4,7 @@ Non-blocking Pi subagents exposed as tools.
 
 ## Tools
 
-- `run_agent` — starts a detached tmux-supervised `pi --mode json -p --no-session` process and returns a job id immediately. Startup/prep failures return a failed job record when possible so they can be inspected with `poll_agent`. Omit `model` unless the user explicitly requested a specific model; the child Pi will otherwise use its normal/default model configuration.
+- `run_agent` — starts a session-bounded tmux-supervised `pi --mode json -p --no-session` process and returns a job id immediately. Startup/prep failures return a failed job record when possible so they can be inspected with `poll_agent`. Omit `model` unless the user explicitly requested a specific model; the child Pi will otherwise use its normal/default model configuration.
 - `poll_agent` — polls compact status for a job id. Omit `id` to list jobs. Set `verbosity: "logs"` for recent summarized logs or `verbosity: "full"` to retrieve the final assistant output up to tool output limits.
 - `stop_agent` — terminates a running background job.
 
@@ -84,7 +84,7 @@ Supported fields:
 
 Security note: `postCopy` commands are arbitrary shell commands from the repository. Only approve them in trusted repos/configs. Remembered approvals are stored under Pi's subagent state directory and are keyed to the canonical repo path plus an exact hash of the normalized `postCopy` entries, including env values. They run with a minimal inherited environment rather than the full Pi process environment: only common process keys needed for shell/package-manager operation (for example `PATH`, `HOME`, `SHELL`, temp/locale/user keys when present) are preserved, then per-command `env` entries are added. The confirmation dialog lists inherited keys and per-command env keys but never prints env values. Do not put secrets in repo-controlled `.pi/worktree.json`; use public/non-secret `env` values only.
 
-Temp worktrees are removed when Pi observes that the job finished, failed, or was stopped unless `keepWorktree` retains them. Running jobs survive Pi `/reload`, session switches, and parent Pi exit because tmux supervises the child process; if Pi is not running when a job exits, cleanup happens on the next reload/poll that observes completion. Cleanup state is persisted and retried if a previous cleanup attempt was interrupted or failed.
+Temp worktrees are removed when Pi observes that the job finished, failed, or was stopped unless `keepWorktree` retains them. Running jobs are bounded to the parent Pi session: on graceful session shutdown or `/reload`, Pi sends Ctrl-C to running subagents and then hard-kills their tmux sessions after the stop grace period. If Pi exits ungracefully and leaves orphan tmux jobs behind, the next session load stops those recovered running jobs instead of adopting them. Cleanup state is persisted and retried if a previous cleanup attempt was interrupted or failed.
 
 ## Named markdown agents
 
@@ -113,7 +113,7 @@ Project agents with the same name override user agents when `agentScope: "both"`
 
 ## Notes
 
-- Jobs are supervised by tmux and persisted under `~/.pi/agent/subagents/`, so running jobs survive `/reload`, session switch, and parent Pi exit. `tmux` on `PATH` and executable `/bin/sh` are required before a job is launched. Use `stop_agent` to terminate a running job; it sends Ctrl-C to the tmux pane first, drains output, then hard-kills the tmux session after the grace period (`waitMs`, default 5000, max 60000) if needed.
+- Jobs are supervised by tmux and persisted under `~/.pi/agent/subagents/`, but running jobs are bounded to the parent Pi session. Graceful `/reload`, session switch, and parent Pi shutdown stop running subagents; the next session also stops recovered orphan running jobs left by an ungraceful exit. `tmux` on `PATH` and executable `/bin/sh` are required before a job is launched. Use `stop_agent` to terminate a running job explicitly; it sends Ctrl-C to the tmux pane first, drains output, then hard-kills the tmux session after the grace period (`waitMs`, default 5000, max 60000) if needed.
 - Attach to a live job with `tmux attach -t <session>`; `run_agent` prints the exact session name.
 - `poll_agent` returns summarized/capped logs and persists a compact final output/recent-log snapshot with the job record so completed results remain pollable after reload. Full raw child process streams are persisted under `~/.pi/agent/subagents/logs/*.stdout.jsonl` and `*.stderr.log` for manual inspection. To prevent unbounded disk growth, a running job is stopped if either raw stream exceeds `PI_SUBAGENTS_MAX_RAW_LOG_BYTES` bytes; the default is 512 MiB per stream, and `0` disables this guard.
 - `poll_agent` defaults to compact summary output to avoid flooding the main model context.
