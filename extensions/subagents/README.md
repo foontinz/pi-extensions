@@ -4,7 +4,7 @@ Non-blocking Pi subagents exposed as tools.
 
 ## Tools
 
-- `run_agent` — starts a detached tmux-supervised `pi --mode json -p --no-session` process and returns a job id immediately. Startup/prep failures return a failed job record when possible so they can be inspected with `poll_agent`.
+- `run_agent` — starts a detached tmux-supervised `pi --mode json -p --no-session` process and returns a job id immediately. Startup/prep failures return a failed job record when possible so they can be inspected with `poll_agent`. Omit `model` unless the user explicitly requested a specific model; the child Pi will otherwise use its normal/default model configuration.
 - `poll_agent` — polls compact status for a job id. Omit `id` to list jobs. Set `verbosity: "logs"` for recent summarized logs or `verbosity: "full"` to retrieve the final assistant output up to tool output limits.
 - `stop_agent` — terminates a running background job.
 
@@ -105,4 +105,5 @@ Project agents with the same name override user agents when `agentScope: "both"`
 - `poll_agent` defaults to compact summary output to avoid flooding the main model context.
 - Child tool access is limited to tools active in the parent Pi session. Requested agent/tool allowlists must be a subset of parent active tools.
 - The child process uses `--no-session`: it does not inherit the parent conversation and does not write a normal Pi session file. Put all needed context in the task, named/ad-hoc system prompt, files, or repo context.
+- Do not pass a `model` override for routine delegation/review. Only set `model` when the user explicitly asks for that exact model/provider; otherwise the child Pi uses its configured default, avoiding provider/API-key mismatches.
 - The child process loads normal Pi configuration/extensions, skills, and context files; these are not model-disableable from `run_agent`.

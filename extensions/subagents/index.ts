@@ -217,7 +217,7 @@ const RunAgentParams = Type.Object({
   systemPrompt: Type.Optional(
     Type.String({ description: "Optional ad-hoc system prompt appended after any named agent prompt." }),
   ),
-  model: Type.Optional(Type.String({ description: "Optional model pattern/id, e.g. openai/gpt-5.5 or claude-sonnet:high." })),
+  model: Type.Optional(Type.String({ description: "Optional explicit model pattern/id. Omit unless the user specifically requested a model; omitted lets the child Pi use its normal/default model configuration." })),
   thinking: Type.Optional(ThinkingSchema),
   tools: Type.Optional(
     Type.Array(Type.String(), {
@@ -285,7 +285,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       "Start a tmux-supervised background Pi subagent in a separate --no-session process and return immediately with a job id.",
       "Use poll_agent with that id to retrieve compact status; request summarized logs/full output only when needed.",
       "When started inside a git repo, the child runs in a temporary detached worktree; .pi/worktree.env controls copied files, post-copy setup scripts, and retention.",
-      "Can run a named markdown agent or an ad-hoc subagent with optional systemPrompt/model/tools.",
+      "Can run a named markdown agent or an ad-hoc subagent with optional systemPrompt/tools and an explicit model override only when requested.",
     ].join(" "),
     promptSnippet: "Start a non-blocking background Pi subagent job and return a job id for poll_agent.",
     promptGuidelines: [
@@ -294,6 +294,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       "Use poll_agent's default summary verbosity for routine checks; request verbosity \"logs\" or \"full\" only when needed.",
       "Remember run_agent uses a temporary git worktree when inside a repo; uncommitted/untracked files are visible only if copied by .pi/worktree.env, and dependencies may need postCopy setup.",
       "Use run_agent tools to restrict subagents to read-only tools when delegating review or reconnaissance tasks.",
+      "Do not set the model parameter unless the user explicitly requests a specific model/provider; omit it to use the child Pi default and avoid provider/API-key mismatches.",
       "Subagents do not inherit the parent conversation; include all necessary context in the task, systemPrompt, named agent, files, or repo context.",
     ],
     parameters: RunAgentParams,
