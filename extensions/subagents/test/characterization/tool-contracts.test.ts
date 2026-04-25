@@ -700,3 +700,24 @@ test("new session load stops orphan persisted running jobs instead of adopting t
     assert.equal(fake.readState().sessions[started.details.tmuxSession], undefined);
   });
 });
+
+test("subagent child detection recognizes env marker and json no-session argv", () => {
+  const previousEnv = process.env.PI_SUBAGENTS_CHILD;
+  const previousArgv = [...process.argv];
+  try {
+    delete process.env.PI_SUBAGENTS_CHILD;
+    process.argv.splice(0, process.argv.length, ...previousArgv.filter((arg) => !["--mode", "json", "--mode=json", "--no-session"].includes(arg)));
+    assert.equal(__subagentsTest.isSubagentChildProcess(), false);
+
+    process.env.PI_SUBAGENTS_CHILD = "1";
+    assert.equal(__subagentsTest.isSubagentChildProcess(), true);
+
+    delete process.env.PI_SUBAGENTS_CHILD;
+    process.argv.push("--mode", "json", "-p", "--no-session");
+    assert.equal(__subagentsTest.isSubagentChildProcess(), true);
+  } finally {
+    if (previousEnv === undefined) delete process.env.PI_SUBAGENTS_CHILD;
+    else process.env.PI_SUBAGENTS_CHILD = previousEnv;
+    process.argv.splice(0, process.argv.length, ...previousArgv);
+  }
+});

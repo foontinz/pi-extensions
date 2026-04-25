@@ -108,7 +108,14 @@ function parseOptionalNonNegativeIntegerEnv(name: string, fallback: number): num
 }
 
 function isSubagentChildProcess(): boolean {
-  return process.env[SUBAGENT_CHILD_ENV] === "1";
+  if (process.env[SUBAGENT_CHILD_ENV] === "1") return true;
+  // Defensive fallback: subagent children are launched as `pi --mode json -p --no-session`.
+  // If a wrapper/re-exec path drops PI_SUBAGENTS_CHILD, still avoid running parent
+  // session-boundary recovery inside the child process.
+  const args = process.argv.slice(2);
+  const modeIndex = args.indexOf("--mode");
+  const hasJsonMode = args.includes("--mode=json") || (modeIndex >= 0 && args[modeIndex + 1] === "json");
+  return hasJsonMode && args.includes("--no-session");
 }
 
 type JobStatus = "running" | "completed" | "failed" | "cancelled";
@@ -3691,6 +3698,7 @@ export const __subagentsTest = {
   resetTmuxAvailabilityCache() {
     tmuxAvailabilityCache = undefined;
   },
+  isSubagentChildProcess,
   refreshSubagentStatus,
   loadPersistedJobs,
   recentStoreWarnings,
