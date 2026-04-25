@@ -3587,6 +3587,7 @@ export const __subagentsTest = {
   resetTmuxAvailabilityCache() {
     tmuxAvailabilityCache = undefined;
   },
+  refreshSubagentStatus,
   forgetJobForCallbackRetry(id: string) {
     jobs.delete(id);
   },

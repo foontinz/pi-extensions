@@ -125,6 +125,46 @@ async function withFakeTmux<T>(config: Record<string, unknown>, action: (fake: R
   }
 }
 
+function appendJsonl(filePath: string, events: unknown[]) {
+  fs.appendFileSync(filePath, events.map((event) => JSON.stringify(event)).join("\n") + "\n", "utf-8");
+}
+
+function exitCodePathFor(id: string): string {
+  const job = __subagentsTest.getJob(id);
+  assert.ok(job?.exitCodePath);
+  return job.exitCodePath;
+}
+
+function assistantEndEvent(text: string) {
+  return {
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text }],
+      stopReason: "end_turn",
+      usage: { input: 3, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 8, cost: { total: 0.001 } },
+    },
+  };
+}
+
+function toolEndEvent() {
+  return { type: "tool_execution_end", toolName: "read", args: { path: "x" }, result: { content: [{ type: "text", text: "tool output" }] }, isError: false };
+}
+
+function makeStatusCtx() {
+  const calls: any[] = [];
+  return {
+    cwd,
+    hasUI: true,
+    ui: {
+      theme: { fg: (_color: string, value: string) => value },
+      setStatus(key: string, value: string | undefined) { calls.push({ kind: "status", key, value }); },
+      setWidget(key: string, value: string[] | undefined, options?: unknown) { calls.push({ kind: "widget", key, value, options }); },
+    },
+    calls,
+  } as any;
+}
+
 function makeJob(overrides: Record<string, any> = {}) {
   const now = overrides.startedAt ?? 1_700_000_000_000;
   const id = overrides.id ?? "agent_contract_1";
@@ -388,4 +428,94 @@ test("stop_agent tmux kill failure keeps job running and reports failure text", 
     assert.equal(result.details.phase, "stopping");
     assert.ok(fake.readState().sessions[started.details.tmuxSession]);
   });
+});
+
+test("poll_agent extracts assistant final output from child JSONL and reports no-output jobs", async () => {
+  await withFakeTmux({}, async () => {
+    const assistant = await tools.get("run_agent")!.execute("call", { task: "assistant output", label: "assistant out", worktree: false, timeoutMs: 0 }, new AbortController().signal, () => {}, ctx);
+    appendJsonl(assistant.details.stdoutPath, [assistantEndEvent("answer from assistant")]);
+    fs.writeFileSync(exitCodePathFor(assistant.details.id), "0\n", "utf-8");
+    const assistantPoll = await tools.get("poll_agent")!.execute("call", { id: assistant.details.id, verbosity: "full" }, new AbortController().signal, () => {}, ctx);
+    assert.match(textOf(assistantPoll), /Final output:\nanswer from assistant/);
+    assert.equal(assistantPoll.details.job.status, "completed");
+    assert.equal(assistantPoll.details.finalOutput, "answer from assistant");
+    assert.equal(assistantPoll.details.job.messageCount, 1);
+    assert.equal(assistantPoll.details.job.usage.turns, 1);
+
+    const noOutput = await tools.get("run_agent")!.execute("call", { task: "no assistant output", label: "no output", worktree: false, timeoutMs: 0 }, new AbortController().signal, () => {}, ctx);
+    appendJsonl(noOutput.details.stdoutPath, [{ type: "agent_start" }, { type: "agent_end" }]);
+    fs.writeFileSync(exitCodePathFor(noOutput.details.id), "0\n", "utf-8");
+    const noOutputPoll = await tools.get("poll_agent")!.execute("call", { id: noOutput.details.id, verbosity: "full" }, new AbortController().signal, () => {}, ctx);
+    assert.match(textOf(noOutputPoll), /Final output:\n\(no final assistant output\)/);
+    assert.equal(noOutputPoll.details.job.status, "completed");
+    assert.equal(noOutputPoll.details.finalOutput, undefined);
+  });
+});
+
+test("poll_agent keeps tool-only turns out of final output", async () => {
+  await withFakeTmux({}, async () => {
+    const started = await tools.get("run_agent")!.execute("call", { task: "tool only", label: "tool only", worktree: false, timeoutMs: 0 }, new AbortController().signal, () => {}, ctx);
+    appendJsonl(started.details.stdoutPath, [toolEndEvent()]);
+    fs.writeFileSync(exitCodePathFor(started.details.id), "0\n", "utf-8");
+    const result = await tools.get("poll_agent")!.execute("call", { id: started.details.id, verbosity: "logs" }, new AbortController().signal, () => {}, ctx);
+    assert.match(textOf(result), /✓ read: tool output/);
+    assert.match(textOf(result), /Final output preview:\n\(no final assistant output\)/);
+    assert.equal(result.details.job.status, "completed");
+    assert.equal(result.details.finalOutput, undefined);
+  });
+});
+
+test("poll_agent characterizes large final-output preview versus full output", async () => {
+  await withFakeTmux({}, async () => {
+    const large = `start ${"x".repeat(1_600)} tail-marker`;
+    const started = await tools.get("run_agent")!.execute("call", { task: "large output", label: "large", worktree: false, timeoutMs: 0 }, new AbortController().signal, () => {}, ctx);
+    appendJsonl(started.details.stdoutPath, [assistantEndEvent(large)]);
+    fs.writeFileSync(exitCodePathFor(started.details.id), "0\n", "utf-8");
+
+    const summary = await tools.get("poll_agent")!.execute("call", { id: started.details.id }, new AbortController().signal, () => {}, ctx);
+    assert.match(textOf(summary), /result: start x+/);
+    assert.match(textOf(summary), /full: poll_agent\(\{ id: "agent_.*", verbosity: "full" \}\)/);
+    assert.equal(summary.details.finalOutput?.includes("tail-marker"), false);
+
+    const full = await tools.get("poll_agent")!.execute("call", { id: started.details.id, verbosity: "full" }, new AbortController().signal, () => {}, ctx);
+    assert.match(textOf(full), /Final output:\nstart /);
+    assert.match(textOf(full), /tail-marker/);
+    assert.equal(full.details.finalOutput, large);
+  });
+});
+
+test("status widget formatting characterizes running and terminal rows", () => {
+  const statusCtx = makeStatusCtx();
+  const rows = __subagentsTest.formatStatusTable([
+    makeJob({ id: "agent_alpha_11111111", label: "running job", status: "running", latestAssistantText: "checking repository files" }),
+    makeJob({ id: "agent_beta_22222222", label: "completed job", status: "completed", phase: "completed", finalOutput: "ship final patch", finishedAt: 1_700_000_010_000 }),
+    makeJob({ id: "agent_gamma_33333333", label: "failed job", status: "failed", phase: "failed", errorMessage: "boom stack trace", finishedAt: 1_700_000_010_000 }),
+    makeJob({ id: "agent_delta_44444444", label: "cancelled job", status: "cancelled", phase: "cancelled", stopReason: "user requested stop", finishedAt: 1_700_000_010_000 }),
+    makeJob({ id: "agent_epsilon_55555555", label: "cleanup pending", status: "failed", phase: "failed", cleanupPhase: "pending", cleanupPending: true, finishedAt: 1_700_000_010_000 }),
+  ], statusCtx);
+  const table = rows.join("\n");
+  assert.match(table, /^subagents\nid\s+agent/);
+  assert.match(table, /11111111\s+running-job\s+\d\d:\d\d\s+\d+(?::\d\d){1,2}\s+running\s+running checking repository files/);
+  assert.match(table, /22222222\s+completed-job\s+\d\d:\d\d\s+\d+(?::\d\d){1,2}\s+completed\s+done ship final patch/);
+  assert.match(table, /33333333\s+failed-job\s+\d\d:\d\d\s+\d+(?::\d\d){1,2}\s+failed\s+failed boom stack trace/);
+  assert.match(table, /44444444\s+cancelled-job\s+\d\d:\d\d\s+\d+(?::\d\d){1,2}\s+cancelled\s+stopped user requested stop/);
+  assert.match(table, /55555555\s+cleanup-pending\s+\d\d:\d\d\s+\d+(?::\d\d){1,2}\s+failed\s+cleanup-pending/);
+});
+
+test("status widget terminal visibility window hides expired terminal jobs", () => {
+  const statusCtx = makeStatusCtx();
+  __subagentsTest.setCallbackHarness(undefined, statusCtx);
+  const recent = makeJob({ id: "agent_recent_aaaaaaaa", label: "recent", status: "completed", phase: "completed", finishedAt: Date.now() - 1_000 });
+  const expired = makeJob({ id: "agent_expired_bbbbbbbb", label: "expired", status: "failed", phase: "failed", finishedAt: Date.now() - 60_000 });
+  __subagentsTest.putJob(recent);
+  __subagentsTest.putJob(expired);
+
+  __subagentsTest.refreshSubagentStatus();
+  const widget = statusCtx.calls.findLast((call: any) => call.kind === "widget");
+  assert.ok(widget);
+  const rendered = widget.value.join("\n");
+  assert.match(rendered, /aaaaaaaa/);
+  assert.doesNotMatch(rendered, /bbbbbbbb/);
+  const status = statusCtx.calls.findLast((call: any) => call.kind === "status");
+  assert.equal(status.value, "agents: 1 recent");
 });
