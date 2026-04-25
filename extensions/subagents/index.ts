@@ -242,6 +242,9 @@ const jobs = new Map<string, AgentJob>();
 let extensionApi: ExtensionAPI | undefined;
 let statusContext: ExtensionContext | undefined;
 let statusRefreshTimer: NodeJS.Timeout | undefined;
+const pendingFinishedCallbacks = new Map<string, AgentJob>();
+let callbackFlushTimer: NodeJS.Timeout | undefined;
+const CALLBACK_STACK_DELAY_MS = 250;
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
   description: 'Which markdown agent directories to use. Default: "user". Use "both" to include project-local .pi/agents.',
@@ -578,6 +581,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       job.monitorTimer = undefined;
     }
     clearStatusRefreshTimer();
+    clearCallbackFlushTimer();
     if (ctx.hasUI) ctx.ui.setStatus("subagents", undefined);
     if (ctx.hasUI) ctx.ui.setWidget("subagents", undefined);
     if (statusContext === ctx) statusContext = undefined;
@@ -1780,23 +1784,58 @@ function notifyMainAgentOfFinishedJob(job: AgentJob): void {
     if (!api || !ctx?.hasUI) return;
     if (!tryCreateCallbackMarker(job.id)) return;
 
-    const message = formatSubagentFinishedCallback(job);
-    try {
-      api.sendUserMessage(message, { deliverAs: "followUp" });
-    } catch (error) {
-      removeCallbackMarker(job.id);
-      tryNotify(
-        ctx,
-        `Subagent ${job.id} finished, but callback delivery failed: ${error instanceof Error ? error.message : String(error)}`,
-        "error",
-      );
-      return;
-    }
-
+    pendingFinishedCallbacks.set(job.id, job);
+    scheduleFinishedCallbackFlush();
     tryNotify(ctx, `Subagent ${job.id} finished; queued callback to main agent.`, job.status === "completed" ? "info" : "warning");
   } catch {
     // Callback delivery must never destabilize subagent monitoring/finalization.
   }
+}
+
+function scheduleFinishedCallbackFlush(): void {
+  if (callbackFlushTimer) return;
+  callbackFlushTimer = setTimeout(flushPendingFinishedCallbacks, CALLBACK_STACK_DELAY_MS);
+  callbackFlushTimer.unref?.();
+}
+
+function clearCallbackFlushTimer(): void {
+  if (!callbackFlushTimer) return;
+  clearTimeout(callbackFlushTimer);
+  callbackFlushTimer = undefined;
+}
+
+function flushPendingFinishedCallbacks(): void {
+  clearCallbackFlushTimer();
+  const api = extensionApi;
+  const ctx = statusContext;
+  if (!api || !ctx?.hasUI || pendingFinishedCallbacks.size === 0) return;
+
+  const callbackJobs = [...pendingFinishedCallbacks.values()].sort((a, b) => (a.finishedAt ?? a.updatedAt) - (b.finishedAt ?? b.updatedAt));
+  pendingFinishedCallbacks.clear();
+  const message = formatStackedSubagentFinishedCallback(callbackJobs);
+  try {
+    api.sendUserMessage(message, { deliverAs: ctx.isIdle() ? "followUp" : "steer" });
+  } catch (error) {
+    for (const job of callbackJobs) removeCallbackMarker(job.id);
+    tryNotify(
+      ctx,
+      `Subagent callback delivery failed for ${callbackJobs.length} job(s): ${error instanceof Error ? error.message : String(error)}`,
+      "error",
+    );
+  }
+}
+
+function formatStackedSubagentFinishedCallback(callbackJobs: AgentJob[]): string {
+  if (callbackJobs.length === 1) return formatSubagentFinishedCallback(callbackJobs[0]!);
+  const lines = [
+    `[subagents-finished] ${callbackJobs.length} jobs`,
+    "",
+    "Multiple background subagents have finished. Review their results below and decide whether any follow-up action is needed. If no action is needed, say so briefly.",
+  ];
+  callbackJobs.forEach((job, index) => {
+    lines.push("", `--- subagent ${index + 1}/${callbackJobs.length} ---`, formatSubagentFinishedCallback(job));
+  });
+  return lines.join("\n");
 }
 
 function formatSubagentFinishedCallback(job: AgentJob): string {
@@ -3064,8 +3103,11 @@ export const __subagentsTest = {
   callbackMarkerPath,
   removeCallbackMarker,
   removePersistedJobFiles,
+  flushPendingFinishedCallbacks,
   setCallbackHarness(api: ExtensionAPI | undefined, ctx: ExtensionContext | undefined) {
     extensionApi = api;
     statusContext = ctx;
+    pendingFinishedCallbacks.clear();
+    clearCallbackFlushTimer();
   },
 };

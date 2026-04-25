@@ -66,6 +66,7 @@ test("finish callback sends a follow-up user message when the main agent is idle
     __subagentsTest.setCallbackHarness(harness.api, harness.ctx);
 
     __subagentsTest.notifyMainAgentOfFinishedJob(job);
+    __subagentsTest.flushPendingFinishedCallbacks();
 
     assert.equal(harness.sent.length, 1);
     assert.deepEqual(harness.sent[0]!.options, { deliverAs: "followUp" });
@@ -78,7 +79,7 @@ test("finish callback sends a follow-up user message when the main agent is idle
   }
 });
 
-test("finish callback queues as follow-up while the main agent is busy and deduplicates by marker", () => {
+test("finish callback steers while the main agent is busy and deduplicates by marker", () => {
   const job = makeFinishedJob();
   const harness = makeHarness(false);
   try {
@@ -86,11 +87,34 @@ test("finish callback queues as follow-up while the main agent is busy and dedup
 
     __subagentsTest.notifyMainAgentOfFinishedJob(job);
     __subagentsTest.notifyMainAgentOfFinishedJob(job);
+    __subagentsTest.flushPendingFinishedCallbacks();
 
     assert.equal(harness.sent.length, 1);
-    assert.deepEqual(harness.sent[0]!.options, { deliverAs: "followUp" });
+    assert.deepEqual(harness.sent[0]!.options, { deliverAs: "steer" });
   } finally {
     __subagentsTest.removeCallbackMarker(job.id);
+    __subagentsTest.setCallbackHarness(undefined, undefined);
+  }
+});
+
+test("finish callbacks are stacked into one main-agent message", () => {
+  const first = makeFinishedJob({ label: "first", finalOutput: "first done", finishedAt: Date.now() - 10 });
+  const second = makeFinishedJob({ label: "second", finalOutput: "second done", finishedAt: Date.now() });
+  const harness = makeHarness(true);
+  try {
+    __subagentsTest.setCallbackHarness(harness.api, harness.ctx);
+
+    __subagentsTest.notifyMainAgentOfFinishedJob(first);
+    __subagentsTest.notifyMainAgentOfFinishedJob(second);
+    __subagentsTest.flushPendingFinishedCallbacks();
+
+    assert.equal(harness.sent.length, 1);
+    assert.match(harness.sent[0]!.content, /^\[subagents-finished\] 2 jobs/);
+    assert.match(harness.sent[0]!.content, /first done/);
+    assert.match(harness.sent[0]!.content, /second done/);
+  } finally {
+    __subagentsTest.removeCallbackMarker(first.id);
+    __subagentsTest.removeCallbackMarker(second.id);
     __subagentsTest.setCallbackHarness(undefined, undefined);
   }
 });
@@ -102,6 +126,7 @@ test("finish callback is suppressed when no interactive UI context is available"
     __subagentsTest.setCallbackHarness(harness.api, harness.ctx);
 
     __subagentsTest.notifyMainAgentOfFinishedJob(job);
+    __subagentsTest.flushPendingFinishedCallbacks();
 
     assert.equal(harness.sent.length, 0);
     assert.equal(fs.existsSync(__subagentsTest.callbackMarkerPath(job.id)), false);
@@ -118,6 +143,7 @@ test("finish callback removes marker when delivery fails so a later attempt can 
   try {
     __subagentsTest.setCallbackHarness(failingHarness.api, failingHarness.ctx);
     __subagentsTest.notifyMainAgentOfFinishedJob(job);
+    __subagentsTest.flushPendingFinishedCallbacks();
 
     assert.equal(failingHarness.sent.length, 0);
     assert.equal(fs.existsSync(__subagentsTest.callbackMarkerPath(job.id)), false);
@@ -125,6 +151,7 @@ test("finish callback removes marker when delivery fails so a later attempt can 
 
     __subagentsTest.setCallbackHarness(retryHarness.api, retryHarness.ctx);
     __subagentsTest.notifyMainAgentOfFinishedJob(job);
+    __subagentsTest.flushPendingFinishedCallbacks();
     assert.equal(retryHarness.sent.length, 1);
   } finally {
     __subagentsTest.removeCallbackMarker(job.id);
@@ -138,6 +165,7 @@ test("removing persisted job files also removes the callback marker", () => {
   try {
     __subagentsTest.setCallbackHarness(harness.api, harness.ctx);
     __subagentsTest.notifyMainAgentOfFinishedJob(job);
+    __subagentsTest.flushPendingFinishedCallbacks();
 
     assert.equal(Boolean(__subagentsTest.callbackMarkerPath(job.id)), true);
     __subagentsTest.removePersistedJobFiles(job.id);
@@ -145,6 +173,7 @@ test("removing persisted job files also removes the callback marker", () => {
     assert.equal(harness.sent.length, 1);
     // A second notification would only be deduped if the marker still existed.
     __subagentsTest.notifyMainAgentOfFinishedJob(job);
+    __subagentsTest.flushPendingFinishedCallbacks();
     assert.equal(harness.sent.length, 2);
   } finally {
     __subagentsTest.removeCallbackMarker(job.id);
