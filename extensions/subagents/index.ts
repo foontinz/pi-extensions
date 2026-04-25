@@ -1035,13 +1035,15 @@ function lifecycleRecordForJob(job: AgentJob): JobRecord {
 }
 
 function syncDurableObservability(record: JobRecord, job: AgentJob): void {
-  const logs = job.logs.slice(-MAX_DURABLE_LOG_ENTRIES).map((entry): DurableLogEntry => ({
-    seq: entry.seq,
-    timestamp: entry.timestamp,
-    level: entry.level,
-    text: truncateString(entry.text, 1_500),
-    eventType: entry.eventType,
-  }));
+  const logs = uniqueLogsBySeq(job.logs)
+    .slice(-MAX_DURABLE_LOG_ENTRIES)
+    .map((entry): DurableLogEntry => ({
+      seq: entry.seq,
+      timestamp: entry.timestamp,
+      level: entry.level,
+      text: truncateString(entry.text, 1_500),
+      eventType: entry.eventType,
+    }));
   record.observability = {
     finalOutput: job.finalOutput ? truncateString(job.finalOutput, MAX_DURABLE_TEXT_CHARS) : undefined,
     latestAssistantText: job.latestAssistantText ? truncateString(job.latestAssistantText, MAX_DURABLE_TEXT_CHARS) : undefined,
@@ -1113,12 +1115,21 @@ function durableLogsToRuntime(logs: DurableLogEntry[] | undefined): AgentLogEntr
 }
 
 function mergeLogEntries(a: AgentLogEntry[] | undefined, b: AgentLogEntry[] | undefined): AgentLogEntry[] {
-  const byKey = new Map<string, AgentLogEntry>();
-  for (const entry of [...(a ?? []), ...(b ?? [])]) {
+  return uniqueLogsBySeq([...(a ?? []), ...(b ?? [])]).slice(-MAX_STORED_LOG_ENTRIES);
+}
+
+function uniqueLogsBySeq(entries: AgentLogEntry[] | undefined): AgentLogEntry[] {
+  const bySeq = new Map<number, AgentLogEntry>();
+  for (const entry of entries ?? []) {
     if (!isValidLogEntry(entry)) continue;
-    byKey.set(`${entry.seq}:${entry.timestamp}:${entry.level}:${entry.eventType ?? ""}:${entry.text}`, entry);
+    const existing = bySeq.get(entry.seq);
+    // Prefer the later copy for hydrated durable logs because it may contain
+    // truncated/normalized text that is safe to persist. The invariant is that
+    // sequence numbers are the identity; duplicate seq entries must never reach
+    // durable observability, regardless of text/timestamp differences.
+    if (!existing || entry.timestamp >= existing.timestamp) bySeq.set(entry.seq, entry);
   }
-  return [...byKey.values()].sort((x, y) => x.seq - y.seq).slice(-MAX_STORED_LOG_ENTRIES);
+  return [...bySeq.values()].sort((x, y) => x.seq - y.seq);
 }
 
 function isValidLogEntry(entry: unknown): entry is AgentLogEntry {
@@ -3543,6 +3554,7 @@ export const __subagentsTest = {
   validateToolSelection,
   hasUnresolvedCleanup,
   lifecycleRecordForJob,
+  uniqueLogsBySeq,
   applyLifecycleRecordToJob,
   dispatchLifecycleEvent,
   notifyMainAgentOfFinishedJob,

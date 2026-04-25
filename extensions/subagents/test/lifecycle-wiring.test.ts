@@ -62,6 +62,23 @@ function makeLegacyJob(overrides: Record<string, unknown> = {}) {
   } as any;
 }
 
+test("lifecycle observability de-duplicates log entries by sequence", () => {
+  const job = makeLegacyJob({
+    logs: [
+      { seq: 2, timestamp: 1_002, level: "info", text: "two original" },
+      { seq: 1, timestamp: 1_001, level: "info", text: "one" },
+      { seq: 2, timestamp: 1_003, level: "info", text: "two hydrated variant" },
+    ],
+    nextSeq: 3,
+  });
+
+  const unique = __subagentsTest.uniqueLogsBySeq(job.logs);
+  assert.deepEqual(unique.map((entry: any) => entry.seq), [1, 2]);
+
+  const record = __subagentsTest.lifecycleRecordForJob(job);
+  assert.deepEqual(record.observability?.logs?.map((entry: any) => entry.seq), [1, 2]);
+});
+
 test("status widget includes short job ids and cleanup-failed indicators", () => {
   const job = makeLegacyJob({
     id: "agent_mabc1234_deadbeef",
