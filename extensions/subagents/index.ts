@@ -7,7 +7,7 @@
  */
 
 import { execFile, execFileSync, type ChildProcess } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -66,6 +66,8 @@ const LOGS_DIR = path.join(JOB_STORE_DIR, "logs");
 const JOB_LOCK_STALE_MS = 5 * 60_000;
 const JOB_LOCK_WAIT_MS = 2_000;
 const WORKTREE_CONFIG_PATH = path.join(".pi", "worktree.env");
+const POST_COPY_TRUST_STORE_PATH_ENV = "PI_SUBAGENTS_POSTCOPY_TRUST_STORE";
+const POST_COPY_TRUST_STORE_PATH = path.join(JOB_STORE_DIR, "trusted-postcopy.json");
 
 const execFileAsync = promisify(execFile);
 
@@ -1763,7 +1765,7 @@ async function prepareWorktreeForSpawn(sourceCwd: string, jobId: string, ctx: Ex
   const base = config.base ?? "HEAD";
   const keepWorktree = config.keepWorktree;
   await validateConfiguredCopies(repoRoot, config.copy, config.exclusions);
-  await confirmTrustedPostCopyIfNeeded(config.configPath, config.postCopy, ctx);
+  await confirmTrustedPostCopyIfNeeded(repoRoot, config.configPath, config.postCopy, ctx);
 
   const tempParent = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-worktree-"));
   const worktreeRoot = path.join(tempParent, "worktree");
@@ -1888,23 +1890,139 @@ function normalizeWorktreeEnvConfig(config: WorktreeEnvConfig, configPath?: stri
 }
 
 async function confirmTrustedPostCopyIfNeeded(
+  repoRoot: string,
   configPath: string | undefined,
   scripts: NormalizedWorktreePostCopySpec[],
   ctx: ExtensionContext,
 ): Promise<void> {
   if (scripts.length === 0) return;
+
+  const trust = await getPostCopyTrust(repoRoot, scripts);
+  if (trust.trusted) return;
+
   const details = formatPostCopyConfirmationDetails(configPath, scripts);
   if (!ctx.hasUI) {
     throw new Error(
-      `${WORKTREE_CONFIG_PATH}: postCopy contains repo-controlled shell commands but this session cannot ask for confirmation. ` +
-      `Remove postCopy or run from an interactive trusted Pi session.\n\n${details}`,
+      `${WORKTREE_CONFIG_PATH}: postCopy contains repo-controlled shell commands that have not been approved for this repository/configuration, ` +
+      `and this session cannot ask for confirmation. Remove postCopy or approve it once from an interactive Pi session.\n\n${details}`,
     );
   }
   const ok = await ctx.ui.confirm(
     "Run subagent worktree postCopy commands?",
-    details,
+    `${details}\n\nApproving will remember this repository and exact normalized postCopy configuration, so Pi will not ask again unless it changes.`,
   );
   if (!ok) throw new Error(`${WORKTREE_CONFIG_PATH}: postCopy commands were not approved.`);
+  await rememberPostCopyTrust(trust);
+}
+
+interface PostCopyTrustStore {
+  version: 1;
+  trusted: Record<string, PostCopyTrustRecord>;
+}
+
+interface PostCopyTrustRecord {
+  repoRoot: string;
+  repoKey: string;
+  scriptsHash: string;
+  trustedAt: number;
+}
+
+interface PostCopyTrustDecision extends PostCopyTrustRecord {
+  trusted: boolean;
+  trustKey: string;
+}
+
+async function getPostCopyTrust(repoRoot: string, scripts: NormalizedWorktreePostCopySpec[]): Promise<PostCopyTrustDecision> {
+  const canonicalRepoRoot = await canonicalizePath(repoRoot);
+  const repoKey = hashJson({ repoRoot: canonicalRepoRoot });
+  const scriptsHash = hashJson(normalizePostCopySpecsForTrust(scripts));
+  const trustKey = hashJson({ repoKey, scriptsHash });
+  const store = await readPostCopyTrustStore();
+  const record = store.trusted[trustKey];
+  return {
+    repoRoot: canonicalRepoRoot,
+    repoKey,
+    scriptsHash,
+    trustedAt: record?.trustedAt ?? Date.now(),
+    trustKey,
+    trusted: record?.repoKey === repoKey && record.scriptsHash === scriptsHash,
+  };
+}
+
+async function rememberPostCopyTrust(decision: PostCopyTrustDecision): Promise<void> {
+  const storePath = getPostCopyTrustStorePath();
+  await fs.promises.mkdir(path.dirname(storePath), { recursive: true, mode: 0o700 });
+  await withFileMutationQueue(storePath, async () => {
+    const store = await readPostCopyTrustStore();
+    store.trusted[decision.trustKey] = {
+      repoRoot: decision.repoRoot,
+      repoKey: decision.repoKey,
+      scriptsHash: decision.scriptsHash,
+      trustedAt: Date.now(),
+    };
+    await fs.promises.writeFile(storePath, `${JSON.stringify(store, null, 2)}\n`, { encoding: "utf-8", mode: 0o600 });
+  });
+}
+
+async function readPostCopyTrustStore(): Promise<PostCopyTrustStore> {
+  const storePath = getPostCopyTrustStorePath();
+  try {
+    const raw = await fs.promises.readFile(storePath, "utf-8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return emptyPostCopyTrustStore();
+    const trusted = (parsed as { trusted?: unknown }).trusted;
+    if (!trusted || typeof trusted !== "object" || Array.isArray(trusted)) return emptyPostCopyTrustStore();
+    const sanitized: Record<string, PostCopyTrustRecord> = {};
+    for (const [key, value] of Object.entries(trusted)) {
+      if (!/^[a-f0-9]{64}$/.test(key) || !value || typeof value !== "object" || Array.isArray(value)) continue;
+      const record = value as Partial<PostCopyTrustRecord>;
+      if (
+        typeof record.repoRoot !== "string" ||
+        typeof record.repoKey !== "string" ||
+        typeof record.scriptsHash !== "string" ||
+        typeof record.trustedAt !== "number"
+      ) continue;
+      sanitized[key] = { repoRoot: record.repoRoot, repoKey: record.repoKey, scriptsHash: record.scriptsHash, trustedAt: record.trustedAt };
+    }
+    return { version: 1, trusted: sanitized };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyPostCopyTrustStore();
+    return emptyPostCopyTrustStore();
+  }
+}
+
+function emptyPostCopyTrustStore(): PostCopyTrustStore {
+  return { version: 1, trusted: {} };
+}
+
+function getPostCopyTrustStorePath(): string {
+  return process.env[POST_COPY_TRUST_STORE_PATH_ENV] || POST_COPY_TRUST_STORE_PATH;
+}
+
+async function canonicalizePath(filePath: string): Promise<string> {
+  try {
+    return await fs.promises.realpath(filePath);
+  } catch {
+    return path.resolve(filePath);
+  }
+}
+
+function normalizePostCopySpecsForTrust(scripts: NormalizedWorktreePostCopySpec[]): unknown {
+  return scripts.map((script) => ({
+    command: script.command,
+    cwd: script.cwd ?? ".",
+    optional: script.optional,
+    timeoutMs: script.timeoutMs,
+    env: sortObject(script.env ?? {}),
+  }));
+}
+
+function sortObject(value: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+function hashJson(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
 function formatPostCopyConfirmationDetails(
@@ -2781,5 +2899,7 @@ export const __subagentsTest = {
   normalizeWorktreeEnvConfig,
   formatPostCopyConfirmationDetails,
   buildPostCopyEnv,
+  getPostCopyTrust,
+  rememberPostCopyTrust,
   assertSymlinkTargetInsideRepo,
 };

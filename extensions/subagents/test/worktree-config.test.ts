@@ -48,6 +48,38 @@ test("postCopy environment is minimal plus explicit env", () => {
   assert.equal(env.AWS_SECRET_ACCESS_KEY, undefined);
 });
 
+test("postCopy trust is remembered for the same repo and exact normalized scripts", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "subagents-postcopy-trust-test-"));
+  const previousStore = process.env.PI_SUBAGENTS_POSTCOPY_TRUST_STORE;
+  process.env.PI_SUBAGENTS_POSTCOPY_TRUST_STORE = path.join(temp, "trust.json");
+  try {
+    const repoRoot = path.join(temp, "repo");
+    await fs.mkdir(repoRoot);
+    const scripts = [
+      { command: "npm install --ignore-scripts", cwd: ".", timeoutMs: 120_000, optional: false, env: { B: "2", A: "1" } },
+    ];
+
+    const before = await __subagentsTest.getPostCopyTrust(repoRoot, scripts);
+    assert.equal(before.trusted, false);
+
+    await __subagentsTest.rememberPostCopyTrust(before);
+
+    const after = await __subagentsTest.getPostCopyTrust(repoRoot, [
+      { command: "npm install --ignore-scripts", cwd: ".", timeoutMs: 120_000, optional: false, env: { A: "1", B: "2" } },
+    ]);
+    assert.equal(after.trusted, true);
+
+    const changed = await __subagentsTest.getPostCopyTrust(repoRoot, [
+      { command: "npm install", cwd: ".", timeoutMs: 120_000, optional: false, env: { A: "1", B: "2" } },
+    ]);
+    assert.equal(changed.trusted, false);
+  } finally {
+    if (previousStore === undefined) delete process.env.PI_SUBAGENTS_POSTCOPY_TRUST_STORE;
+    else process.env.PI_SUBAGENTS_POSTCOPY_TRUST_STORE = previousStore;
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("outbound copy symlinks are rejected", async () => {
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), "subagents-symlink-test-"));
   try {
