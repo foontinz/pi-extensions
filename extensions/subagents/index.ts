@@ -31,7 +31,8 @@ const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_TIMEOUT_MS = 12 * 60 * 60 * 1000;
 const MAX_STORED_LOG_ENTRIES = 5_000;
 const MAX_STORED_STDERR_CHARS = 100_000;
-const MAX_PARTIAL_BUFFER_CHARS = 1_000_000;
+const MAX_STDOUT_LINE_CHARS = 64 * 1024 * 1024;
+const MAX_STDERR_PARTIAL_BUFFER_CHARS = 1_000_000;
 const MAX_LOG_READ_BYTES = 1_000_000;
 const MAX_RETAINED_FINISHED_JOBS = 50;
 const DEFAULT_POLL_LOG_ENTRIES = 20;
@@ -184,6 +185,7 @@ interface PollDetails {
   nextSeq?: number;
   finalOutput?: string;
   latestAssistantText?: string;
+  hasMoreLogs?: boolean;
 }
 
 const jobs = new Map<string, AgentJob>();
@@ -435,7 +437,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       if (verbosity !== "summary") flushAssistantDelta(job);
       const logs = verbosity === "summary" ? [] : getLogsSince(job, sinceSeq, maxLogEntries);
-      const nextSeq = job.nextSeq - 1;
+      const hasMoreLogs = verbosity !== "summary" && logs.length > 0 && job.logs.some((entry) => entry.seq > logs[logs.length - 1]!.seq);
+      const nextSeq = verbosity !== "summary" && logs.length > 0 ? logs[logs.length - 1]!.seq : job.nextSeq - 1;
       const summary = summarizeJob(job);
       const details: PollDetails = {
         id: job.id,
@@ -444,11 +447,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         nextSeq,
         latestAssistantText: job.latestAssistantText ? compactPreview(job.latestAssistantText, 600, 3) : undefined,
         finalOutput: job.finalOutput ? (verbosity === "full" ? truncateForTool(job.finalOutput) : compactPreview(job.finalOutput, 1_000, 6)) : undefined,
+        hasMoreLogs,
       };
 
       const text = verbosity === "summary"
         ? formatCompactPollResult(job, sinceSeq, nextSeq)
-        : formatPollResult(job, logs, nextSeq, verbosity === "full");
+        : formatPollResult(job, logs, nextSeq, verbosity === "full", hasMoreLogs);
       return {
         content: [{ type: "text", text: truncateForTool(text) }],
         details,
@@ -601,7 +605,7 @@ async function startAgentJob(
   } catch (error) {
     cleanupPromptFiles(tmpPromptPath, tmpPromptDir);
     cleanupWorktreeInfo(worktreePrep.worktree);
-    throw error;
+    return createFailedPreStartJob(id, sourceCwd, params, agent, `failed to prepare system prompt: ${error instanceof Error ? error.message : String(error)}`);
   }
 
   args.push(`Task: ${params.task}`);
@@ -668,13 +672,14 @@ async function startAgentJob(
 
   try {
     ensureJobStoreDirs();
-    fs.writeFileSync(job.stdoutPath!, "", "utf-8");
-    fs.writeFileSync(job.stderrPath!, "", "utf-8");
+    fs.writeFileSync(job.stdoutPath!, "", { encoding: "utf-8", mode: 0o600 });
+    fs.writeFileSync(job.stderrPath!, "", { encoding: "utf-8", mode: 0o600 });
     fs.rmSync(job.exitCodePath!, { force: true });
 
     const shell = "/bin/sh";
     const commandLine = displayCommand(invocation.command, invocation.args);
     const script = [
+      `umask 077`,
       `${commandLine} > ${shellQuote(job.stdoutPath!)} 2> ${shellQuote(job.stderrPath!)}`,
       `code=$?`,
       `printf '%s\\n' "$code" > ${shellQuote(job.exitCodePath!)}`,
@@ -745,8 +750,14 @@ function createFailedPreStartJob(
 }
 
 function ensureJobStoreDirs(): void {
-  fs.mkdirSync(JOBS_DIR, { recursive: true });
-  fs.mkdirSync(LOGS_DIR, { recursive: true });
+  for (const dir of [JOB_STORE_DIR, JOBS_DIR, LOGS_DIR]) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    try {
+      fs.chmodSync(dir, 0o700);
+    } catch {
+      // Best effort; persistence still works if chmod is unavailable.
+    }
+  }
 }
 
 function jobStatePath(id: string): string {
@@ -970,7 +981,7 @@ function normalizePersistedJob(parsed: Partial<AgentJob> & { id?: string }, file
   job.stderrBuffer = typeof job.stderrBuffer === "string" ? job.stderrBuffer : "";
   job.pendingAssistantDelta = typeof job.pendingAssistantDelta === "string" ? job.pendingAssistantDelta : "";
   job.latestAssistantText = typeof job.latestAssistantText === "string" ? job.latestAssistantText : "";
-  job.usage = job.usage ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
+  job.usage = normalizeUsageStats(job.usage);
   if (job.supervisor === "process" && job.status === "running") {
     job.errorMessage = job.errorMessage ?? "process-supervised job cannot be reattached after reload";
     job.status = "failed";
@@ -988,6 +999,25 @@ function normalizePersistedJob(parsed: Partial<AgentJob> & { id?: string }, file
   return job;
 }
 
+function normalizeUsageStats(value: unknown): UsageStats {
+  const fallback: UsageStats = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
+  if (!value || typeof value !== "object" || Array.isArray(value)) return fallback;
+  const source = value as Partial<Record<keyof UsageStats, unknown>>;
+  return {
+    input: numberOrZero(source.input),
+    output: numberOrZero(source.output),
+    cacheRead: numberOrZero(source.cacheRead),
+    cacheWrite: numberOrZero(source.cacheWrite),
+    cost: numberOrZero(source.cost),
+    contextTokens: numberOrZero(source.contextTokens),
+    turns: numberOrZero(source.turns),
+  };
+}
+
+function numberOrZero(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
 function normalizeStorePath(value: unknown, fallback: string): string {
   if (typeof value !== "string") return fallback;
   const resolved = path.resolve(value);
@@ -998,17 +1028,39 @@ function normalizeStorePath(value: unknown, fallback: string): string {
 
 function mergePersistedIntoLiveJob(live: AgentJob, persisted: AgentJob): void {
   const timeout = live.timeout;
+  const killTimer = live.killTimer;
   const monitorTimer = live.monitorTimer;
+  const stdoutDecoder = live.stdoutDecoder;
+  const stderrDecoder = live.stderrDecoder;
   const waiters = live.waiters;
   const closeWaiters = live.closeWaiters;
-  const merged = mergeJobSnapshots(toPersistableJob(live), toPersistableJob(persisted));
-  Object.assign(live, merged);
+  const liveUpdatedAt = live.updatedAt ?? 0;
+  const persistedUpdatedAt = persisted.updatedAt ?? 0;
+
+  live.logs = mergeLogEntries(live.logs, persisted.logs);
+  live.nextSeq = Math.max(live.nextSeq ?? 1, persisted.nextSeq ?? 1, (live.logs.at(-1)?.seq ?? 0) + 1);
+
+  const persistedTerminal = persisted.status !== "running";
+  const liveTerminal = live.status !== "running";
+  if (persistedTerminal && (!liveTerminal || persistedUpdatedAt >= liveUpdatedAt)) {
+    const merged = mergeJobSnapshots(toPersistableJob(live), toPersistableJob(persisted));
+    Object.assign(live, merged);
+  } else if (!persistedTerminal && !liveTerminal && persistedUpdatedAt > liveUpdatedAt) {
+    live.stdoutOffset = Math.max(live.stdoutOffset ?? 0, persisted.stdoutOffset ?? 0);
+    live.stderrOffset = Math.max(live.stderrOffset ?? 0, persisted.stderrOffset ?? 0);
+    if (!live.finalOutput && persisted.finalOutput) live.finalOutput = persisted.finalOutput;
+    if (!live.errorMessage && persisted.errorMessage) live.errorMessage = persisted.errorMessage;
+    if (persisted.cleanupPending) live.cleanupPending = true;
+    if (persisted.cleanupError) live.cleanupError = persisted.cleanupError;
+  }
+  live.updatedAt = Math.max(live.updatedAt ?? 0, persisted.updatedAt ?? 0);
+
   live.proc = undefined;
   live.timeout = timeout;
-  live.killTimer = undefined;
+  live.killTimer = killTimer;
   live.monitorTimer = monitorTimer;
-  live.stdoutDecoder = undefined;
-  live.stderrDecoder = undefined;
+  live.stdoutDecoder = stdoutDecoder;
+  live.stderrDecoder = stderrDecoder;
   live.waiters = waiters ?? new Set();
   live.closeWaiters = closeWaiters ?? new Set();
 }
@@ -1080,23 +1132,29 @@ function refreshTmuxJob(job: AgentJob): void {
   finalizeJob(job, "failed", undefined, undefined, "tmux session ended before writing exit code");
 }
 
-function refreshTmuxJobOutput(job: AgentJob): void {
-  if (job.stdoutPath) {
-    const result = readFileFromOffset(job.stdoutPath, job.stdoutOffset);
-    if (result.buffer.length > 0) {
-      job.stdoutDecoder ??= new StringDecoder("utf8");
-      processStdout(job, job.stdoutDecoder.write(result.buffer));
+function refreshTmuxJobOutput(job: AgentJob, options: { drain?: boolean } = {}): void {
+  let readMore = false;
+  do {
+    readMore = false;
+    if (job.stdoutPath) {
+      const result = readFileFromOffset(job.stdoutPath, job.stdoutOffset);
+      if (result.buffer.length > 0) {
+        readMore = true;
+        job.stdoutDecoder ??= new StringDecoder("utf8");
+        processStdout(job, job.stdoutDecoder.write(result.buffer));
+      }
+      job.stdoutOffset = result.offset;
     }
-    job.stdoutOffset = result.offset;
-  }
-  if (job.stderrPath) {
-    const result = readFileFromOffset(job.stderrPath, job.stderrOffset);
-    if (result.buffer.length > 0) {
-      job.stderrDecoder ??= new StringDecoder("utf8");
-      processStderr(job, job.stderrDecoder.write(result.buffer));
+    if (job.stderrPath) {
+      const result = readFileFromOffset(job.stderrPath, job.stderrOffset);
+      if (result.buffer.length > 0) {
+        readMore = true;
+        job.stderrDecoder ??= new StringDecoder("utf8");
+        processStderr(job, job.stderrDecoder.write(result.buffer));
+      }
+      job.stderrOffset = result.offset;
     }
-    job.stderrOffset = result.offset;
-  }
+  } while (options.drain && readMore);
   persistJob(job);
 }
 
@@ -1152,9 +1210,10 @@ function readExitCode(filePath: string | undefined): number | undefined {
 
 function processStdout(job: AgentJob, chunk: string): void {
   job.stdoutBuffer += chunk;
-  if (job.stdoutBuffer.length > MAX_PARTIAL_BUFFER_CHARS) {
-    addLog(job, "error", `stdout partial JSON line exceeded ${MAX_PARTIAL_BUFFER_CHARS} chars; dropping buffered partial output`, "stdout");
-    job.stdoutBuffer = job.stdoutBuffer.slice(-MAX_PARTIAL_BUFFER_CHARS / 2);
+  if (job.stdoutBuffer.length > MAX_STDOUT_LINE_CHARS) {
+    addLog(job, "error", `stdout JSON line exceeded ${MAX_STDOUT_LINE_CHARS} chars before a newline; dropping oversized line`, "stdout");
+    job.stdoutBuffer = "";
+    return;
   }
   const lines = job.stdoutBuffer.split("\n");
   job.stdoutBuffer = lines.pop() ?? "";
@@ -1164,9 +1223,9 @@ function processStdout(job: AgentJob, chunk: string): void {
 function processStderr(job: AgentJob, chunk: string): void {
   job.stderr = appendCappedText(job.stderr, chunk, MAX_STORED_STDERR_CHARS);
   job.stderrBuffer = (job.stderrBuffer ?? "") + chunk;
-  if (job.stderrBuffer.length > MAX_PARTIAL_BUFFER_CHARS) {
-    addLog(job, "error", `stderr partial line exceeded ${MAX_PARTIAL_BUFFER_CHARS} chars; dropping buffered partial output`, "stderr");
-    job.stderrBuffer = job.stderrBuffer.slice(-MAX_PARTIAL_BUFFER_CHARS / 2);
+  if (job.stderrBuffer.length > MAX_STDERR_PARTIAL_BUFFER_CHARS) {
+    addLog(job, "error", `stderr partial line exceeded ${MAX_STDERR_PARTIAL_BUFFER_CHARS} chars; dropping buffered partial output`, "stderr");
+    job.stderrBuffer = job.stderrBuffer.slice(-MAX_STDERR_PARTIAL_BUFFER_CHARS / 2);
   }
   const lines = job.stderrBuffer.split(/\r?\n/);
   job.stderrBuffer = lines.pop() ?? "";
@@ -1605,7 +1664,7 @@ function finalizeJob(
   if (job.timeout) clearTimeout(job.timeout);
   if (job.killTimer) clearTimeout(job.killTimer);
   if (job.monitorTimer) clearInterval(job.monitorTimer);
-  refreshTmuxJobOutput(job);
+  refreshTmuxJobOutput(job, { drain: true });
   if (job.stdoutDecoder) processStdout(job, job.stdoutDecoder.end());
   if (job.stderrDecoder) processStderr(job, job.stderrDecoder.end());
   if (job.stdoutBuffer.trim()) processJsonLine(job, job.stdoutBuffer);
@@ -2256,7 +2315,7 @@ function createJobId(): string {
 }
 
 function getLogsSince(job: AgentJob, sinceSeq: number, maxLogEntries: number): AgentLogEntry[] {
-  return job.logs.filter((entry) => entry.seq > sinceSeq).slice(-maxLogEntries);
+  return job.logs.filter((entry) => entry.seq > sinceSeq).slice(0, maxLogEntries);
 }
 
 function summarizeJob(job: AgentJob) {
@@ -2333,10 +2392,10 @@ function formatCompactPollResult(job: AgentJob, sinceSeq: number, nextSeq: numbe
   return lines.join("\n");
 }
 
-function formatPollResult(job: AgentJob, logs: AgentLogEntry[], nextSeq: number, includeFullOutput: boolean): string {
+function formatPollResult(job: AgentJob, logs: AgentLogEntry[], nextSeq: number, includeFullOutput: boolean, hasMoreLogs = false): string {
   const lines: string[] = [];
   lines.push(formatJobSummaryLine(summarizeJob(job)));
-  lines.push(`nextSeq: ${nextSeq}`);
+  lines.push(`nextSeq: ${nextSeq}${hasMoreLogs ? " (more logs available; poll again with this sinceSeq)" : ""}`);
   if (job.errorMessage && job.status !== "running") lines.push(`error: ${job.errorMessage}`);
   lines.push("");
   lines.push(logs.length === 0 ? "(no new logs)" : logs.map(formatLogEntry).join("\n"));
@@ -2489,8 +2548,19 @@ function pruneFinishedJobs(): void {
     .sort((a, b) => (b.finishedAt ?? b.updatedAt) - (a.finishedAt ?? a.updatedAt));
   for (const job of finished.slice(MAX_RETAINED_FINISHED_JOBS)) {
     jobs.delete(job.id);
+    removePersistedJobFiles(job.id);
+  }
+}
+
+function removePersistedJobFiles(id: string): void {
+  for (const file of [
+    jobStatePath(id),
+    path.join(LOGS_DIR, `${id}.stdout.jsonl`),
+    path.join(LOGS_DIR, `${id}.stderr.log`),
+    path.join(LOGS_DIR, `${id}.exit`),
+  ]) {
     try {
-      fs.rmSync(jobStatePath(job.id), { force: true });
+      fs.rmSync(file, { force: true });
     } catch {
       // ignore
     }
