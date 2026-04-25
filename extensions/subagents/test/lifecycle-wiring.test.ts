@@ -113,3 +113,16 @@ test("live AgentJob lifecycle dispatch owns output/log cursors", () => {
     /stdoutOffset cannot move backwards/,
   );
 });
+
+test("applying a stale persisted record keeps runtime log cursor contiguous", () => {
+  const staleRecord = makeLegacyJob().record;
+  staleRecord.logCursor.nextSeq = 64;
+  const job = makeLegacyJob({ nextSeq: 72 });
+
+  __subagentsTest.applyLifecycleRecordToJob(job, staleRecord);
+  assert.equal(job.nextSeq, 72);
+  assert.equal(job.record.logCursor.nextSeq, 72);
+
+  __subagentsTest.dispatchLifecycleEvent(job, { type: "LogEntriesAppended", firstSeq: 72, count: 1 }, 2_000);
+  assert.equal(job.nextSeq, 73);
+});

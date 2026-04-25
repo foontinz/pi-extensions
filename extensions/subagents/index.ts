@@ -47,6 +47,8 @@ const MAX_STORED_STDERR_CHARS = 100_000;
 const MAX_STDOUT_LINE_CHARS = 64 * 1024 * 1024;
 const MAX_STDERR_PARTIAL_BUFFER_CHARS = 1_000_000;
 const MAX_LOG_READ_BYTES = 1_000_000;
+const DEFAULT_MAX_RAW_LOG_BYTES = 512 * 1024 * 1024;
+const MAX_RAW_LOG_BYTES = parseOptionalNonNegativeIntegerEnv("PI_SUBAGENTS_MAX_RAW_LOG_BYTES", DEFAULT_MAX_RAW_LOG_BYTES);
 const MAX_RETAINED_FINISHED_JOBS = 50;
 const DEFAULT_POLL_LOG_ENTRIES = 20;
 const MAX_POLL_LOG_ENTRIES = 200;
@@ -81,8 +83,16 @@ const JOB_LOCK_WAIT_MS = 2_000;
 const WORKTREE_CONFIG_PATH = path.join(".pi", "worktree.env");
 const POST_COPY_TRUST_STORE_PATH_ENV = "PI_SUBAGENTS_POSTCOPY_TRUST_STORE";
 const POST_COPY_TRUST_STORE_PATH = path.join(JOB_STORE_DIR, "trusted-postcopy.json");
+const DEFAULT_SUBAGENT_TOOLS = ["read", "grep", "find", "ls"] as const;
 
 const execFileAsync = promisify(execFile);
+
+function parseOptionalNonNegativeIntegerEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
+}
 
 type JobStatus = "running" | "completed" | "failed" | "cancelled";
 type LogLevel = "info" | "assistant" | "tool" | "stdout" | "stderr" | "error";
@@ -176,6 +186,7 @@ interface AgentJob {
   agent?: string;
   agentSource?: "user" | "project" | "adhoc";
   task: string;
+  effectiveTools: string[];
   cwd: string;
   sourceCwd: string;
   worktree?: WorktreeInfo;
@@ -219,6 +230,7 @@ interface AgentJob {
   stderrDecoder?: StringDecoder;
   cleanupPending?: boolean;
   cleanupError?: string;
+  rawLogLimitExceeded?: boolean;
   phase?: JobPhase;
   cleanupPhase?: CleanupPhase;
   terminal?: TerminalInfo;
@@ -343,6 +355,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       "Start a tmux-supervised background Pi subagent in a separate --no-session process and return immediately with a job id.",
       "Use poll_agent with that id to retrieve compact status; request summarized logs/full output only when needed.",
       "When started inside a git repo, the child runs in a temporary detached worktree; .pi/worktree.env controls copied files, post-copy setup scripts, and retention.",
+      "By default, subagents receive only active read-only tools (read/grep/find/ls); pass tools explicitly to grant write, execute, network, or other higher-risk capabilities.",
       "Can run a named markdown agent or an ad-hoc subagent with optional systemPrompt/tools and an explicit model override only when requested.",
     ].join(" "),
     promptSnippet: "Start a non-blocking background Pi subagent job and return a job id for poll_agent.",
@@ -351,7 +364,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       "After run_agent returns an id, poll sparingly. Prefer poll_agent waitMs around 10000-30000 and avoid tight polling loops.",
       "Use poll_agent's default summary verbosity for routine checks; request verbosity \"logs\" or \"full\" only when needed.",
       "Remember run_agent uses a temporary git worktree when inside a repo; uncommitted/untracked files are visible only if copied by .pi/worktree.env, and dependencies may need postCopy setup.",
-      "Use run_agent tools to restrict subagents to read-only tools when delegating review or reconnaissance tasks.",
+      "Omit tools for the safe read-only default; pass tools explicitly only when the subagent needs additional capabilities.",
       "Do not set the model parameter unless the user explicitly requests a specific model/provider; omit it to use the child Pi default and avoid provider/API-key mismatches.",
       "Subagents do not inherit the parent conversation; include all necessary context in the task, systemPrompt, named agent, files, or repo context.",
     ],
@@ -594,6 +607,7 @@ function formatRunAgentStartResult(job: AgentJob): string {
     `Status: ${job.status}`,
     `Label: ${job.label}`,
     `Supervisor: ${job.supervisor}${job.tmuxSession ? ` (${job.tmuxSession})` : ""}`,
+    `Tools: ${job.effectiveTools.length > 0 ? job.effectiveTools.join(", ") : "none"}`,
   ];
   if (job.status === "running") {
     lines.push(job.tmuxSession ? `Attach: tmux attach -t ${job.tmuxSession}` : `PID: ${job.pid ?? "(spawn pending)"}`);
@@ -609,8 +623,9 @@ function validateToolSelection(
   requestedTools: string[] | undefined,
 ): { ok: true; tools: string[]; activeTools: string[]; requestedTools: string[] } | { ok: false; message: string; activeTools: string[]; requestedTools: string[] } {
   const active = [...new Set(activeTools)].sort();
-  const requested = [...new Set(requestedTools ?? active)].sort();
   const activeSet = new Set(active);
+  const defaultTools = DEFAULT_SUBAGENT_TOOLS.filter((tool) => activeSet.has(tool));
+  const requested = [...new Set(requestedTools ?? defaultTools)].sort();
   const disallowed = requested.filter((tool) => !activeSet.has(tool));
   if (disallowed.length > 0) {
     return {
@@ -694,6 +709,7 @@ async function startAgentJob(
     agent: agent?.name,
     agentSource: agent?.source ?? "adhoc",
     task: params.task,
+    effectiveTools,
     cwd,
     sourceCwd,
     worktree: worktreePrep.worktree,
@@ -829,6 +845,7 @@ function createFailedPreStartJob(
     agent: agent?.name,
     agentSource: agent?.source ?? "adhoc",
     task: params.task,
+    effectiveTools: [],
     cwd: sourceCwd,
     sourceCwd,
     command: "",
@@ -928,6 +945,12 @@ function applyLifecycleRecordToJob(job: AgentJob, record: JobRecord): void {
   job.stdoutOffset = record.logCursor.stdoutOffset;
   job.stderrOffset = record.logCursor.stderrOffset;
   job.nextSeq = Math.max(job.nextSeq ?? 1, record.logCursor.nextSeq);
+  // Existing in-memory jobs may have logs that have not yet made it to the
+  // durable record, for example if a best-effort persist failed and a later
+  // reload pass reads the stale on-disk record. Keep the durable cursor in
+  // sync with the runtime cursor so the next LogEntriesAppended transition does
+  // not see an artificial gap and crash the extension monitor.
+  if (job.record.logCursor.nextSeq < job.nextSeq) job.record.logCursor.nextSeq = job.nextSeq;
   job.usage = { ...record.usage };
   job.status = jobStatusFromPhase(record.phase);
   job.cleanupPending = record.cleanupPhase === "pending" || record.cleanupPhase === "running" || record.cleanupPhase === "failed";
@@ -1064,6 +1087,7 @@ function runtimeJobFromRecord(record: JobRecord): AgentJob {
     id: record.id,
     label: record.label,
     task: record.task,
+    effectiveTools: [],
     cwd: record.cwd,
     sourceCwd: record.sourceCwd,
     worktree: record.worktree as WorktreeInfo | undefined,
@@ -1173,6 +1197,7 @@ function refreshTmuxJob(job: AgentJob): void {
   if (job.supervisor !== "tmux") return;
   refreshTmuxJobOutput(job);
   if (job.status !== "running") return;
+  if (enforceRawLogLimit(job)) return;
 
   const exitCode = readExitCode(job.exitCodePath);
   if (exitCode !== undefined) {
@@ -1215,6 +1240,40 @@ function refreshTmuxJobOutput(job: AgentJob, options: { drain?: boolean } = {}):
     }
   } while (options.drain && readMore);
   persistJob(job);
+}
+
+function rawLogSizes(job: AgentJob): { stdout?: number; stderr?: number; total: number } {
+  const stdout = fileSizeIfExists(job.stdoutPath);
+  const stderr = fileSizeIfExists(job.stderrPath);
+  return { stdout, stderr, total: (stdout ?? 0) + (stderr ?? 0) };
+}
+
+function fileSizeIfExists(filePath: string | undefined): number | undefined {
+  if (!filePath) return undefined;
+  try {
+    return fs.statSync(filePath).size;
+  } catch {
+    return undefined;
+  }
+}
+
+function enforceRawLogLimit(job: AgentJob): boolean {
+  if (MAX_RAW_LOG_BYTES <= 0 || job.status !== "running") return false;
+  const sizes = rawLogSizes(job);
+  const exceeded = [
+    sizes.stdout !== undefined && sizes.stdout > MAX_RAW_LOG_BYTES ? `stdout ${formatSize(sizes.stdout)}` : undefined,
+    sizes.stderr !== undefined && sizes.stderr > MAX_RAW_LOG_BYTES ? `stderr ${formatSize(sizes.stderr)}` : undefined,
+  ].filter(Boolean).join(", ");
+  if (!exceeded) return false;
+
+  const message = `raw subagent log limit exceeded (${exceeded}; limit ${formatSize(MAX_RAW_LOG_BYTES)}). Stopping job to prevent disk growth.`;
+  if (!job.rawLogLimitExceeded) {
+    job.rawLogLimitExceeded = true;
+    job.errorMessage = message;
+    addLog(job, "error", message, "raw_log_limit");
+    terminateJob(job, message, "error");
+  }
+  return true;
 }
 
 function readFileFromOffset(filePath: string, offset: number): { buffer: Buffer; offset: number } {
@@ -1456,6 +1515,13 @@ function addLog(job: AgentJob, level: LogLevel, text: string, eventType?: string
     text: truncateOneLine(text, 1_500),
     eventType,
   };
+  if (job.record.logCursor.nextSeq < entry.seq) {
+    // Tolerate stale durable cursors instead of letting a monitor tick crash the
+    // whole Pi process. This can happen when runtime logs advanced but a prior
+    // best-effort persist did not reach disk before a persisted record was
+    // re-applied to the live job.
+    job.record.logCursor.nextSeq = entry.seq;
+  }
   dispatchLifecycleEvent(job, { type: "LogEntriesAppended", firstSeq: entry.seq, count: 1 }, entry.timestamp);
   job.logs.push(entry);
   if (job.logs.length > MAX_STORED_LOG_ENTRIES) {
@@ -1619,9 +1685,16 @@ async function waitForJobUpdate(job: AgentJob, waitMs: number, signal?: AbortSig
   });
 }
 
-function terminateJob(job: AgentJob, reason: string, intent: "stop" | "timeout" = "stop"): boolean {
+function terminateJob(job: AgentJob, reason: string, intent: "stop" | "timeout" | "error" = "stop"): boolean {
   if (job.status !== "running") return true;
-  dispatchLifecycleEvent(job, intent === "timeout" ? { type: "TimeoutElapsed", message: reason } : { type: "StopRequested", reason });
+  dispatchLifecycleEvent(
+    job,
+    intent === "timeout"
+      ? { type: "TimeoutElapsed", message: reason }
+      : intent === "error"
+        ? { type: "SupervisorFailed", error: reason }
+        : { type: "StopRequested", reason },
+  );
   addLog(job, "error", `terminating: ${reason}`, "terminate");
 
   if (job.supervisor === "tmux" && job.tmuxSession) {
@@ -1657,7 +1730,7 @@ function terminateJob(job: AgentJob, reason: string, intent: "stop" | "timeout" 
 
     if (job.timeout) clearTimeout(job.timeout);
     if (job.monitorTimer) clearInterval(job.monitorTimer);
-    finalizeJob(job, intent === "timeout" ? "failed" : "cancelled", undefined, undefined, reason);
+    finalizeJob(job, intent === "stop" ? "cancelled" : "failed", undefined, undefined, reason);
     return true;
   }
 
@@ -1671,7 +1744,7 @@ function terminateJob(job: AgentJob, reason: string, intent: "stop" | "timeout" 
     }, 5_000);
     return true;
   }
-  finalizeJob(job, intent === "timeout" ? "failed" : "cancelled", undefined, undefined, reason);
+  finalizeJob(job, intent === "stop" ? "cancelled" : "failed", undefined, undefined, reason);
   return true;
 }
 
@@ -2811,6 +2884,7 @@ function summarizeJob(job: AgentJob) {
     agent: job.agent,
     agentSource: job.agentSource,
     task: job.task,
+    effectiveTools: job.effectiveTools,
     cwd: job.cwd,
     sourceCwd: job.sourceCwd,
     worktree: job.worktree
@@ -2831,6 +2905,9 @@ function summarizeJob(job: AgentJob) {
     tmuxSession: job.tmuxSession,
     stdoutPath: job.stdoutPath,
     stderrPath: job.stderrPath,
+    rawLogBytes: rawLogSizes(job),
+    rawLogLimitBytes: MAX_RAW_LOG_BYTES,
+    rawLogLimitExceeded: job.rawLogLimitExceeded,
     status: job.status,
     phase: job.phase ?? job.status,
     cleanupPhase: job.cleanupPhase,
@@ -3096,6 +3173,7 @@ export const __subagentsTest = {
   getPostCopyTrust,
   rememberPostCopyTrust,
   assertSymlinkTargetInsideRepo,
+  validateToolSelection,
   lifecycleRecordForJob,
   applyLifecycleRecordToJob,
   dispatchLifecycleEvent,

@@ -15,8 +15,13 @@ Tool names use underscores for provider/tool-call compatibility; labels render a
 ```jsonc
 // 1. Start a job
 run_agent({
-  "task": "Search the repo for auth middleware and summarize the relevant files",
-  "tools": ["read", "grep", "find", "ls"]
+  "task": "Search the repo for auth middleware and summarize the relevant files"
+})
+
+// Pass tools explicitly only when more than the safe read-only default is needed.
+run_agent({
+  "task": "Run the test suite and summarize failures",
+  "tools": ["read", "grep", "find", "ls", "bash"]
 })
 
 // 2. Poll sparingly; default verbosity is a few-line status.
@@ -81,7 +86,7 @@ Temp worktrees are removed when Pi observes that the job finished, failed, or wa
 - `~/.pi/agent/agents/*.md` (default `agentScope: "user"`)
 - nearest project `.pi/agents/*.md` when `agentScope` is `"project"` or `"both"`
 
-Project agents are repo-controlled prompts and require interactive confirmation by default.
+Project agents are repo-controlled prompts and always require interactive confirmation; non-interactive sessions cannot run them.
 
 Agent files use YAML frontmatter:
 
@@ -103,9 +108,9 @@ Project agents with the same name override user agents when `agentScope: "both"`
 
 - Jobs are supervised by tmux and persisted under `~/.pi/agent/subagents/`, so running jobs survive `/reload`, session switch, and parent Pi exit. Use `stop_agent` to terminate a running job.
 - Attach to a live job with `tmux attach -t <session>`; `run_agent` prints the exact session name.
-- `poll_agent` returns summarized/capped in-memory logs. Full raw child process streams are persisted under `~/.pi/agent/subagents/logs/*.stdout.jsonl` and `*.stderr.log` for manual inspection.
+- `poll_agent` returns summarized/capped in-memory logs. Full raw child process streams are persisted under `~/.pi/agent/subagents/logs/*.stdout.jsonl` and `*.stderr.log` for manual inspection. To prevent unbounded disk growth, a running job is stopped if either raw stream exceeds `PI_SUBAGENTS_MAX_RAW_LOG_BYTES` bytes; the default is 512 MiB per stream, and `0` disables this guard.
 - `poll_agent` defaults to compact summary output to avoid flooding the main model context.
-- Child tool access is limited to tools active in the parent Pi session. Requested agent/tool allowlists must be a subset of parent active tools.
+- Child tool access is limited to tools active in the parent Pi session. If `tools` is omitted, the child receives only the active safe read-only default tools: `read`, `grep`, `find`, and `ls` when available. Requested agent/tool allowlists must be a subset of parent active tools. Pass tools explicitly to grant write, execute, network, or other higher-risk capabilities.
 - The child process uses `--no-session`: it does not inherit the parent conversation and does not write a normal Pi session file. Put all needed context in the task, named/ad-hoc system prompt, files, or repo context.
 - Do not pass a `model` override for routine delegation/review. Only set `model` when the user explicitly asks for that exact model/provider; otherwise the child Pi uses its configured default, avoiding provider/API-key mismatches.
 - The child process loads normal Pi configuration/extensions, skills, and context files; these are not model-disableable from `run_agent`.
