@@ -6,7 +6,8 @@
   "scripts": {
     "clean": "echo 'nothing to clean'",
     "build": "tsc --noEmit",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts"
   },
   "pi": {
     "extensions": [
@@ -21,6 +22,7 @@
   },
   "devDependencies": {
     "@types/node": "^25.6.0",
+    "tsx": "^4.21.0",
     "typescript": "^5.9.3"
   }
 }

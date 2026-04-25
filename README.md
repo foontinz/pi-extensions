@@ -11,7 +11,7 @@ Included extensions/packages:
 - `extensions/openrouter-provider` — OpenRouter model provider
 - `extensions/fast-mode` — per-model request acceleration toggle
 - `extensions/usage` — `/usage` command for cross-session token/cost heatmap and per-model totals
-- `extensions/subagents` — non-blocking background Pi subagents (`run_agent`, `poll_agent`, `stop_agent` tools), with `.pi/worktree.env` copy/setup support
+- `extensions/subagents` — non-blocking background Pi subagents (`run_agent`, `poll_agent`, `stop_agent` tools), with repo-root `.pi/worktree.env` copy/setup support, normalized postCopy confirmation/env hardening, and guarded symlink copies
 - `extensions/extension-manager` — interactive extension toggle UI
 
 ## Workspace usage

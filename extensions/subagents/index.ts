@@ -43,6 +43,23 @@ const FINISHED_STATUS_VISIBLE_MS = 15 * 1000;
 const ASSISTANT_DELTA_LOG_INTERVAL_MS = 1_250;
 const ASSISTANT_DELTA_LOG_CHARS = 1_200;
 const TMUX_STATUS_INTERVAL_MS = 2_000;
+const TMUX_COMMAND_TIMEOUT_MS = 5_000;
+const GIT_CLEANUP_TIMEOUT_MS = 10_000;
+const POST_COPY_DEFAULT_TIMEOUT_MS = 120_000;
+const POST_COPY_MAX_TIMEOUT_MS = 30 * 60 * 1000;
+const POST_COPY_PRESERVED_ENV_KEYS = [
+  "PATH",
+  "HOME",
+  "SHELL",
+  "USER",
+  "LOGNAME",
+  "TMPDIR",
+  "TEMP",
+  "TMP",
+  "LANG",
+  "LC_ALL",
+  "TERM",
+] as const;
 const JOB_STORE_DIR = path.join(os.homedir(), ".pi", "agent", "subagents");
 const JOBS_DIR = path.join(JOB_STORE_DIR, "jobs");
 const LOGS_DIR = path.join(JOB_STORE_DIR, "logs");
@@ -109,6 +126,19 @@ interface WorktreeScriptResult {
   stdout?: string;
   stderr?: string;
   failed?: boolean;
+}
+
+type NormalizedWorktreeCopySpec = Required<Pick<WorktreeCopyObject, "from" | "optional">> & { to?: string };
+type NormalizedWorktreePostCopySpec = Required<Pick<WorktreePostCopyObject, "command" | "optional" | "timeoutMs">> & Pick<WorktreePostCopyObject, "cwd" | "env">;
+
+interface NormalizedWorktreeEnvConfig {
+  enabled?: boolean;
+  base?: string;
+  copy: NormalizedWorktreeCopySpec[];
+  exclusions: string[];
+  postCopy: NormalizedWorktreePostCopySpec[];
+  keepWorktree: WorktreeKeepMode;
+  configPath?: string;
 }
 
 interface WorktreeInfo {
@@ -686,7 +716,10 @@ async function startAgentJob(
       `exit "$code"`,
     ].join("; ");
 
-    await execFileAsync("tmux", ["new-session", "-d", "-s", job.tmuxSession!, "-c", cwd, shell, "-c", script]);
+    await execFileAsync("tmux", ["new-session", "-d", "-s", job.tmuxSession!, "-c", cwd, shell, "-c", script], {
+      timeout: TMUX_COMMAND_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
     addLog(job, "info", `started tmux session ${job.tmuxSession}; attach: tmux attach -t ${job.tmuxSession}`, "start");
     persistJob(job);
     startTmuxMonitor(job);
@@ -1178,21 +1211,24 @@ function readFileFromOffset(filePath: string, offset: number): { buffer: Buffer;
 }
 
 function isTmuxAvailable(): boolean {
-  try {
-    execFileSync("tmux", ["-V"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
+  return runTmuxSync(["-V"]).ok;
 }
 
 function tmuxSessionExists(sessionName: string | undefined): boolean {
   if (!sessionName) return false;
+  return runTmuxSync(["has-session", "-t", sessionName]).ok;
+}
+
+function runTmuxSync(args: string[]): { ok: true } | { ok: false; error: string } {
   try {
-    execFileSync("tmux", ["has-session", "-t", sessionName], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
+    execFileSync("tmux", args, {
+      stdio: "ignore",
+      timeout: TMUX_COMMAND_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
 }
 
@@ -1563,12 +1599,8 @@ function terminateJob(job: AgentJob, reason: string): boolean {
     refreshTmuxJob(job);
     if (job.status !== "running") return true;
 
-    let killError: string | undefined;
-    try {
-      execFileSync("tmux", ["kill-session", "-t", job.tmuxSession], { stdio: "ignore" });
-    } catch (error) {
-      killError = error instanceof Error ? error.message : String(error);
-    }
+    const killResult = runTmuxSync(["kill-session", "-t", job.tmuxSession]);
+    const killError = killResult.ok ? undefined : killResult.error;
 
     refreshTmuxJobOutput(job);
     const exitCode = readExitCode(job.exitCodePath);
@@ -1728,18 +1760,19 @@ async function prepareWorktreeForSpawn(sourceCwd: string, jobId: string, ctx: Ex
   const config = await readWorktreeEnv(repoRoot);
   if (config.enabled === false) return { cwd: sourceCwd };
 
+  const base = config.base ?? "HEAD";
+  const keepWorktree = config.keepWorktree;
+  await validateConfiguredCopies(repoRoot, config.copy, config.exclusions);
+  await confirmTrustedPostCopyIfNeeded(config.configPath, config.postCopy, ctx);
+
   const tempParent = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-worktree-"));
   const worktreeRoot = path.join(tempParent, "worktree");
-  const base = config.base ?? "HEAD";
-  const keepWorktree = normalizeKeepWorktree(config.keepWorktree);
 
   try {
     await execFileAsync("git", ["-C", repoRoot, "worktree", "add", "--detach", "--quiet", worktreeRoot, base]);
 
-    const copied = await copyConfiguredFiles(repoRoot, worktreeRoot, config.copy ?? [], config.exclude ?? config.exclusions ?? []);
-    const postCopySpecs = config.postCopy ?? config.postCopyScripts ?? [];
-    await confirmTrustedPostCopyIfNeeded(config.configPath, postCopySpecs, ctx);
-    const postCopy = await runPostCopyScripts(worktreeRoot, postCopySpecs);
+    const copied = await copyConfiguredFiles(repoRoot, worktreeRoot, config.copy, config.exclusions);
+    const postCopy = await runPostCopyScripts(worktreeRoot, config.postCopy);
     const relativeCwd = path.relative(repoRoot, sourceCwd);
     const childCwd = relativeCwd ? path.resolve(worktreeRoot, relativeCwd) : worktreeRoot;
     assertInside(worktreeRoot, childCwd, "cwd");
@@ -1765,7 +1798,7 @@ async function prepareWorktreeForSpawn(sourceCwd: string, jobId: string, ctx: Ex
       throw new Error(`${message}\nRetained failed-prep worktree for inspection: ${worktreeRoot}`);
     }
     try {
-      execFileSync("git", ["-C", repoRoot, "worktree", "remove", "--force", worktreeRoot], { stdio: "ignore" });
+      execFileSync("git", ["-C", repoRoot, "worktree", "remove", "--force", worktreeRoot], { stdio: "ignore", timeout: GIT_CLEANUP_TIMEOUT_MS, killSignal: "SIGKILL" });
     } catch {
       // ignore cleanup failures
     }
@@ -1788,7 +1821,7 @@ async function getGitRoot(cwd: string): Promise<string | undefined> {
   }
 }
 
-async function readWorktreeEnv(repoRoot: string): Promise<WorktreeEnvConfig & { configPath?: string }> {
+async function readWorktreeEnv(repoRoot: string): Promise<NormalizedWorktreeEnvConfig> {
   const configPath = path.join(repoRoot, WORKTREE_CONFIG_PATH);
   try {
     const raw = await fs.promises.readFile(configPath, "utf-8");
@@ -1796,76 +1829,170 @@ async function readWorktreeEnv(repoRoot: string): Promise<WorktreeEnvConfig & { 
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       throw new Error(`${WORKTREE_CONFIG_PATH} must contain a JSON object.`);
     }
-    const config = parsed as WorktreeEnvConfig;
-    if (config.enabled !== undefined && typeof config.enabled !== "boolean") {
-      throw new Error(`${WORKTREE_CONFIG_PATH}: enabled must be a boolean.`);
-    }
-    if (config.base !== undefined && typeof config.base !== "string") {
-      throw new Error(`${WORKTREE_CONFIG_PATH}: base must be a string.`);
-    }
-    if (config.copy !== undefined && !Array.isArray(config.copy)) {
-      throw new Error(`${WORKTREE_CONFIG_PATH}: copy must be an array.`);
-    }
-    if (config.exclude !== undefined && !Array.isArray(config.exclude)) {
-      throw new Error(`${WORKTREE_CONFIG_PATH}: exclude must be an array.`);
-    }
-    if (config.exclusions !== undefined && !Array.isArray(config.exclusions)) {
-      throw new Error(`${WORKTREE_CONFIG_PATH}: exclusions must be an array.`);
-    }
-    if (config.exclude !== undefined && config.exclusions !== undefined) {
-      throw new Error(`${WORKTREE_CONFIG_PATH}: use either exclude or exclusions, not both.`);
-    }
-    if ((config.exclude ?? config.exclusions)?.some((entry) => typeof entry !== "string")) {
-      throw new Error(`${WORKTREE_CONFIG_PATH}: exclude entries must be strings.`);
-    }
-    if (config.postCopy !== undefined && !Array.isArray(config.postCopy)) {
-      throw new Error(`${WORKTREE_CONFIG_PATH}: postCopy must be an array.`);
-    }
-    if (config.postCopyScripts !== undefined && !Array.isArray(config.postCopyScripts)) {
-      throw new Error(`${WORKTREE_CONFIG_PATH}: postCopyScripts must be an array.`);
-    }
-    if (config.postCopy !== undefined && config.postCopyScripts !== undefined) {
-      throw new Error(`${WORKTREE_CONFIG_PATH}: use either postCopy or postCopyScripts, not both.`);
-    }
-    normalizeKeepWorktree(config.keepWorktree);
-    return { ...config, configPath };
+    return normalizeWorktreeEnvConfig(parsed as WorktreeEnvConfig, configPath);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return defaultWorktreeEnvConfig();
     throw error;
   }
 }
 
+function defaultWorktreeEnvConfig(configPath?: string): NormalizedWorktreeEnvConfig {
+  return { copy: [], exclusions: [], postCopy: [], keepWorktree: "never", configPath };
+}
+
+function normalizeWorktreeEnvConfig(config: WorktreeEnvConfig, configPath?: string): NormalizedWorktreeEnvConfig {
+  if (config.enabled !== undefined && typeof config.enabled !== "boolean") {
+    throw new Error(`${WORKTREE_CONFIG_PATH}: enabled must be a boolean.`);
+  }
+  if (config.base !== undefined && typeof config.base !== "string") {
+    throw new Error(`${WORKTREE_CONFIG_PATH}: base must be a string.`);
+  }
+  const base = config.base?.trim();
+  if (config.base !== undefined && !base) {
+    throw new Error(`${WORKTREE_CONFIG_PATH}: base must be a non-empty git revision.`);
+  }
+  if (config.copy !== undefined && !Array.isArray(config.copy)) {
+    throw new Error(`${WORKTREE_CONFIG_PATH}: copy must be an array.`);
+  }
+  if (config.exclude !== undefined && !Array.isArray(config.exclude)) {
+    throw new Error(`${WORKTREE_CONFIG_PATH}: exclude must be an array.`);
+  }
+  if (config.exclusions !== undefined && !Array.isArray(config.exclusions)) {
+    throw new Error(`${WORKTREE_CONFIG_PATH}: exclusions must be an array.`);
+  }
+  if (config.exclude !== undefined && config.exclusions !== undefined) {
+    throw new Error(`${WORKTREE_CONFIG_PATH}: use either exclude or exclusions, not both.`);
+  }
+  if ((config.exclude ?? config.exclusions)?.some((entry) => typeof entry !== "string")) {
+    throw new Error(`${WORKTREE_CONFIG_PATH}: exclude entries must be strings.`);
+  }
+  if (config.postCopy !== undefined && !Array.isArray(config.postCopy)) {
+    throw new Error(`${WORKTREE_CONFIG_PATH}: postCopy must be an array.`);
+  }
+  if (config.postCopyScripts !== undefined && !Array.isArray(config.postCopyScripts)) {
+    throw new Error(`${WORKTREE_CONFIG_PATH}: postCopyScripts must be an array.`);
+  }
+  if (config.postCopy !== undefined && config.postCopyScripts !== undefined) {
+    throw new Error(`${WORKTREE_CONFIG_PATH}: use either postCopy or postCopyScripts, not both.`);
+  }
+
+  return {
+    enabled: config.enabled,
+    base,
+    copy: (config.copy ?? []).map(normalizeCopySpec),
+    exclusions: (config.exclude ?? config.exclusions ?? []).map((entry) => normalizeRepoRelativePath(entry, "exclude")),
+    postCopy: (config.postCopy ?? config.postCopyScripts ?? []).map(normalizePostCopySpec),
+    keepWorktree: normalizeKeepWorktree(config.keepWorktree),
+    configPath,
+  };
+}
+
 async function confirmTrustedPostCopyIfNeeded(
   configPath: string | undefined,
-  scripts: Array<string | WorktreePostCopyObject>,
+  scripts: NormalizedWorktreePostCopySpec[],
   ctx: ExtensionContext,
 ): Promise<void> {
   if (scripts.length === 0) return;
-  const commands = scripts.map((entry) => typeof entry === "string" ? entry : entry.command).join("\n");
+  const details = formatPostCopyConfirmationDetails(configPath, scripts);
   if (!ctx.hasUI) {
     throw new Error(
       `${WORKTREE_CONFIG_PATH}: postCopy contains repo-controlled shell commands but this session cannot ask for confirmation. ` +
-      `Remove postCopy or run from an interactive trusted Pi session. Commands:\n${commands}`,
+      `Remove postCopy or run from an interactive trusted Pi session.\n\n${details}`,
     );
   }
   const ok = await ctx.ui.confirm(
     "Run subagent worktree postCopy commands?",
-    `Source: ${configPath ?? WORKTREE_CONFIG_PATH}\n\nThese repo-controlled commands run before the subagent starts and are not limited by the subagent tool allowlist. Only continue for trusted repositories.\n\n${commands}`,
+    details,
   );
   if (!ok) throw new Error(`${WORKTREE_CONFIG_PATH}: postCopy commands were not approved.`);
+}
+
+function formatPostCopyConfirmationDetails(
+  configPath: string | undefined,
+  scripts: NormalizedWorktreePostCopySpec[],
+): string {
+  const preservedKeys = getPostCopyBaseEnvKeys();
+  const commandDetails = scripts.map((script, index) => {
+    const envKeys = Object.keys(script.env ?? {}).sort();
+    return [
+      `${index + 1}. command: ${script.command}`,
+      `   cwd: ${script.cwd ?? "."}`,
+      `   timeoutMs: ${script.timeoutMs}`,
+      `   optional: ${script.optional}`,
+      `   env keys: ${envKeys.length > 0 ? envKeys.join(", ") : "none"} (values hidden)`,
+    ].join("\n");
+  }).join("\n\n");
+
+  return [
+    `Source: ${configPath ?? WORKTREE_CONFIG_PATH}`,
+    "",
+    "These repo-controlled commands run before the subagent starts and are not limited by the subagent tool allowlist. Only continue for trusted repositories.",
+    "",
+    `Environment: commands run with a minimal inherited environment. Preserved keys present in Pi's environment: ${preservedKeys.length > 0 ? preservedKeys.join(", ") : "none"}. No other Pi/process environment variables are inherited. Per-command env keys below are added or override preserved keys; values are hidden here but come from the repo config.`,
+    "",
+    commandDetails,
+  ].join("\n");
+}
+
+async function validateConfiguredCopies(
+  repoRoot: string,
+  copy: NormalizedWorktreeCopySpec[],
+  exclusions: string[],
+): Promise<void> {
+  const excludeMatcher = createExcludeMatcher(exclusions);
+  for (const spec of copy) {
+    if (hasGlobMagic(spec.from)) {
+      const matches = await expandCopyGlob(repoRoot, spec.from, excludeMatcher);
+      if (matches.length === 0) {
+        if (spec.optional) continue;
+        throw new Error(`${WORKTREE_CONFIG_PATH}: copy glob matched no files: ${spec.from}`);
+      }
+      for (const match of matches) {
+        await validateCopyTree(repoRoot, resolveRepoPath(repoRoot, match, "copy.from"), excludeMatcher);
+      }
+      continue;
+    }
+
+    const from = resolveRepoPath(repoRoot, spec.from, "copy.from");
+    try {
+      await fs.promises.access(from, fs.constants.F_OK);
+    } catch {
+      if (spec.optional) continue;
+      throw new Error(`${WORKTREE_CONFIG_PATH}: copy source does not exist: ${spec.from}`);
+    }
+
+    if (excludeMatcher(spec.from)) {
+      if (spec.optional) continue;
+      throw new Error(`${WORKTREE_CONFIG_PATH}: copy source is excluded: ${spec.from}`);
+    }
+
+    await validateCopyTree(repoRoot, from, excludeMatcher);
+  }
+}
+
+async function validateCopyTree(
+  repoRoot: string,
+  absolutePath: string,
+  excludeMatcher: (relativePath: string) => boolean,
+): Promise<void> {
+  const relative = normalizeRelativePath(path.relative(repoRoot, absolutePath));
+  if (relative !== "." && (hasGitMetadataSegment(relative) || excludeMatcher(relative))) return;
+  await assertSymlinkTargetInsideRepo(repoRoot, absolutePath, relative);
+  const stat = await fs.promises.lstat(absolutePath);
+  if (!stat.isDirectory()) return;
+  const entries = await fs.promises.readdir(absolutePath, { withFileTypes: true });
+  for (const entry of entries) await validateCopyTree(repoRoot, path.join(absolutePath, entry.name), excludeMatcher);
 }
 
 async function copyConfiguredFiles(
   repoRoot: string,
   worktreeRoot: string,
-  copy: Array<string | WorktreeCopyObject>,
+  copy: NormalizedWorktreeCopySpec[],
   exclusions: string[],
 ): Promise<string[]> {
   const copied: string[] = [];
   const excludeMatcher = createExcludeMatcher(exclusions);
-  for (const entry of copy) {
-    const spec = normalizeCopySpec(entry);
-
+  for (const spec of copy) {
     if (hasGlobMagic(spec.from)) {
       const matches = await expandCopyGlob(repoRoot, spec.from, excludeMatcher);
       if (matches.length === 0) {
@@ -1908,10 +2035,7 @@ async function copyConfiguredFiles(
       recursive: true,
       force: true,
       dereference: false,
-      filter: (src) => {
-        const relative = normalizeRelativePath(path.relative(repoRoot, src));
-        return !hasGitMetadataSegment(relative) && !excludeMatcher(relative);
-      },
+      filter: createCopyFilter(repoRoot, excludeMatcher),
     });
     copied.push(spec.to && spec.to !== spec.from ? `${spec.from} -> ${spec.to}` : spec.from);
   }
@@ -1936,11 +2060,44 @@ async function copyOneRepoPath(
     recursive: true,
     force: true,
     dereference: false,
-    filter: (src) => {
-      const relative = normalizeRelativePath(path.relative(repoRoot, src));
-      return !hasGitMetadataSegment(relative) && !excludeMatcher(relative);
-    },
+    filter: createCopyFilter(repoRoot, excludeMatcher),
   });
+}
+
+function createCopyFilter(
+  repoRoot: string,
+  excludeMatcher: (relativePath: string) => boolean,
+): (src: string) => Promise<boolean> {
+  return async (src: string): Promise<boolean> => {
+    const relative = normalizeRelativePath(path.relative(repoRoot, src));
+    if (relative !== "." && (hasGitMetadataSegment(relative) || excludeMatcher(relative))) return false;
+    await assertSymlinkTargetInsideRepo(repoRoot, src, relative);
+    return true;
+  };
+}
+
+async function assertSymlinkTargetInsideRepo(repoRoot: string, sourcePath: string, relativePath = normalizeRelativePath(path.relative(repoRoot, sourcePath))): Promise<void> {
+  const stat = await fs.promises.lstat(sourcePath);
+  if (!stat.isSymbolicLink()) return;
+
+  const linkTarget = await fs.promises.readlink(sourcePath);
+  const resolvedTarget = path.isAbsolute(linkTarget)
+    ? path.resolve(linkTarget)
+    : path.resolve(path.dirname(sourcePath), linkTarget);
+  const relativeTarget = path.relative(repoRoot, resolvedTarget);
+  if (relativeTarget === "" || (!relativeTarget.startsWith("..") && !path.isAbsolute(relativeTarget))) {
+    const normalizedTarget = normalizeRelativePath(relativeTarget);
+    if (hasGitMetadataSegment(normalizedTarget)) {
+      throw new Error(
+        `${WORKTREE_CONFIG_PATH}: refusing to copy symlink ${relativePath} -> ${linkTarget} because its target resolves into .git metadata.`,
+      );
+    }
+    return;
+  }
+
+  throw new Error(
+    `${WORKTREE_CONFIG_PATH}: refusing to copy symlink ${relativePath} -> ${linkTarget} because its target resolves outside the repo root.`,
+  );
 }
 
 async function expandCopyGlob(repoRoot: string, pattern: string, excludeMatcher: (relativePath: string) => boolean): Promise<string[]> {
@@ -2035,10 +2192,9 @@ function normalizeRelativePath(input: string): string {
   return normalized === "" ? "." : normalized;
 }
 
-async function runPostCopyScripts(worktreeRoot: string, scripts: Array<string | WorktreePostCopyObject>): Promise<WorktreeScriptResult[]> {
+async function runPostCopyScripts(worktreeRoot: string, scripts: NormalizedWorktreePostCopySpec[]): Promise<WorktreeScriptResult[]> {
   const results: WorktreeScriptResult[] = [];
-  for (const entry of scripts) {
-    const spec = normalizePostCopySpec(entry);
+  for (const spec of scripts) {
     const cwd = spec.cwd ? resolveRepoPathAllowRoot(worktreeRoot, spec.cwd, "postCopy.cwd") : worktreeRoot;
     const result: WorktreeScriptResult = {
       command: spec.command,
@@ -2053,7 +2209,7 @@ async function runPostCopyScripts(worktreeRoot: string, scripts: Array<string | 
         cwd,
         timeout: spec.timeoutMs,
         maxBuffer: 1_000_000,
-        env: spec.env ? { ...process.env, ...spec.env } : process.env,
+        env: buildPostCopyEnv(spec.env),
       });
       result.stdout = compactPreview(stdout.trim(), 600, 4);
       result.stderr = compactPreview(stderr.trim(), 600, 4);
@@ -2082,7 +2238,24 @@ function getShellInvocation(command: string): { command: string; args: string[] 
   return { command: process.env.SHELL || "/bin/bash", args: ["-lc", command] };
 }
 
-function normalizeCopySpec(entry: string | WorktreeCopyObject): Required<Pick<WorktreeCopyObject, "from" | "optional">> & { to?: string } {
+function buildPostCopyEnv(extraEnv: Record<string, string> | undefined): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of POST_COPY_PRESERVED_ENV_KEYS) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  if (process.platform === "win32" && process.env.ComSpec !== undefined) env.ComSpec = process.env.ComSpec;
+  for (const [key, value] of Object.entries(extraEnv ?? {})) env[key] = value;
+  return env;
+}
+
+function getPostCopyBaseEnvKeys(): string[] {
+  const keys = POST_COPY_PRESERVED_ENV_KEYS.filter((key) => process.env[key] !== undefined) as string[];
+  if (process.platform === "win32" && process.env.ComSpec !== undefined) keys.push("ComSpec");
+  return keys.sort();
+}
+
+function normalizeCopySpec(entry: string | WorktreeCopyObject): NormalizedWorktreeCopySpec {
   if (typeof entry === "string") return { from: normalizeRepoRelativePath(entry, "copy"), optional: false };
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
     throw new Error(`${WORKTREE_CONFIG_PATH}: copy entries must be strings or objects.`);
@@ -2103,8 +2276,8 @@ function normalizeCopySpec(entry: string | WorktreeCopyObject): Required<Pick<Wo
   };
 }
 
-function normalizePostCopySpec(entry: string | WorktreePostCopyObject): Required<Pick<WorktreePostCopyObject, "command" | "optional" | "timeoutMs">> & Pick<WorktreePostCopyObject, "cwd" | "env"> {
-  if (typeof entry === "string") return { command: normalizeCommand(entry, "postCopy"), optional: false, timeoutMs: 120_000 };
+function normalizePostCopySpec(entry: string | WorktreePostCopyObject): NormalizedWorktreePostCopySpec {
+  if (typeof entry === "string") return { command: normalizeCommand(entry, "postCopy"), optional: false, timeoutMs: POST_COPY_DEFAULT_TIMEOUT_MS };
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
     throw new Error(`${WORKTREE_CONFIG_PATH}: postCopy entries must be strings or objects.`);
   }
@@ -2117,8 +2290,8 @@ function normalizePostCopySpec(entry: string | WorktreePostCopyObject): Required
   if (entry.optional !== undefined && typeof entry.optional !== "boolean") {
     throw new Error(`${WORKTREE_CONFIG_PATH}: postCopy object "optional" must be a boolean.`);
   }
-  if (entry.timeoutMs !== undefined && (!Number.isInteger(entry.timeoutMs) || entry.timeoutMs < 1 || entry.timeoutMs > 30 * 60 * 1000)) {
-    throw new Error(`${WORKTREE_CONFIG_PATH}: postCopy object "timeoutMs" must be an integer from 1 to 1800000.`);
+  if (entry.timeoutMs !== undefined && (!Number.isInteger(entry.timeoutMs) || entry.timeoutMs < 1 || entry.timeoutMs > POST_COPY_MAX_TIMEOUT_MS)) {
+    throw new Error(`${WORKTREE_CONFIG_PATH}: postCopy object "timeoutMs" must be an integer from 1 to ${POST_COPY_MAX_TIMEOUT_MS}.`);
   }
   if (entry.env !== undefined) {
     if (!entry.env || typeof entry.env !== "object" || Array.isArray(entry.env)) {
@@ -2134,7 +2307,7 @@ function normalizePostCopySpec(entry: string | WorktreePostCopyObject): Required
     command: normalizeCommand(entry.command, "postCopy.command"),
     cwd: entry.cwd === undefined ? undefined : normalizeRepoRelativePathAllowRoot(entry.cwd, "postCopy.cwd"),
     optional: entry.optional ?? false,
-    timeoutMs: entry.timeoutMs ?? 120_000,
+    timeoutMs: entry.timeoutMs ?? POST_COPY_DEFAULT_TIMEOUT_MS,
     env: entry.env,
   };
 }
@@ -2158,7 +2331,7 @@ function normalizeRepoRelativePath(input: string, fieldName: string): string {
   if (path.isAbsolute(raw) || raw.startsWith("/") || /^[A-Za-z]:[\\/]/.test(raw)) {
     throw new Error(`${WORKTREE_CONFIG_PATH}: ${fieldName} must be relative to the repo root: ${input}`);
   }
-  const normalized = path.posix.normalize(raw.replace(/\\/g, "/"));
+  const normalized = canonicalRepoRelativePath(raw);
   if (!normalized || normalized === "." || normalized === ".." || normalized.startsWith("../")) {
     throw new Error(`${WORKTREE_CONFIG_PATH}: ${fieldName} must stay inside the repo and may not target the repo root: ${input}`);
   }
@@ -2174,7 +2347,7 @@ function normalizeRepoRelativePathAllowRoot(input: string, fieldName: string): s
   if (path.isAbsolute(raw) || raw.startsWith("/") || /^[A-Za-z]:[\\/]/.test(raw)) {
     throw new Error(`${WORKTREE_CONFIG_PATH}: ${fieldName} must be relative to the repo root: ${input}`);
   }
-  const normalized = path.posix.normalize(raw.replace(/\\/g, "/"));
+  const normalized = canonicalRepoRelativePath(raw);
   if (!normalized || normalized === ".." || normalized.startsWith("../")) {
     throw new Error(`${WORKTREE_CONFIG_PATH}: ${fieldName} must stay inside the repo: ${input}`);
   }
@@ -2182,6 +2355,12 @@ function normalizeRepoRelativePathAllowRoot(input: string, fieldName: string): s
     throw new Error(`${WORKTREE_CONFIG_PATH}: refusing to use .git metadata paths: ${input}`);
   }
   return normalized === "." ? "." : normalized;
+}
+
+function canonicalRepoRelativePath(input: string): string {
+  const normalized = path.posix.normalize(input.replace(/\\/g, "/"));
+  if (normalized === "./") return ".";
+  return normalized.length > 1 ? normalized.replace(/\/+$/, "") : normalized;
 }
 
 function resolveRepoPath(root: string, relativePath: string, fieldName: string): string {
@@ -2597,3 +2776,10 @@ function shellQuote(value: string): string {
   if (/^[A-Za-z0-9_./:@=-]+$/.test(value)) return value;
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
+
+export const __subagentsTest = {
+  normalizeWorktreeEnvConfig,
+  formatPostCopyConfirmationDetails,
+  buildPostCopyEnv,
+  assertSymlinkTargetInsideRepo,
+};
