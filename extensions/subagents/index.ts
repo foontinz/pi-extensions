@@ -239,6 +239,7 @@ interface PollDetails {
 }
 
 const jobs = new Map<string, AgentJob>();
+let extensionApi: ExtensionAPI | undefined;
 let statusContext: ExtensionContext | undefined;
 let statusRefreshTimer: NodeJS.Timeout | undefined;
 
@@ -322,6 +323,8 @@ const StopAgentParams = Type.Object({
 });
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+  extensionApi = pi;
+
   pi.on("session_start", async (_event, ctx) => {
     statusContext = ctx;
     loadPersistedJobs();
@@ -857,6 +860,7 @@ function createFailedPreStartJob(
   jobs.set(job.id, job);
   addLog(job, "error", `failed before launch: ${errorMessage}`, "start");
   persistJob(job);
+  notifyMainAgentOfFinishedJob(job);
   return job;
 }
 
@@ -1765,7 +1769,102 @@ function finalizeJob(
   addLog(job, job.status === "completed" ? "info" : "error", parts.join(" "), "finish");
   persistJob(job);
   notifyCloseWaiters(job);
+  notifyMainAgentOfFinishedJob(job);
   pruneFinishedJobs();
+}
+
+function notifyMainAgentOfFinishedJob(job: AgentJob): void {
+  try {
+    const api = extensionApi;
+    const ctx = statusContext;
+    if (!api || !ctx?.hasUI) return;
+    if (!tryCreateCallbackMarker(job.id)) return;
+
+    const message = formatSubagentFinishedCallback(job);
+    try {
+      api.sendUserMessage(message, { deliverAs: "followUp" });
+    } catch (error) {
+      removeCallbackMarker(job.id);
+      tryNotify(
+        ctx,
+        `Subagent ${job.id} finished, but callback delivery failed: ${error instanceof Error ? error.message : String(error)}`,
+        "error",
+      );
+      return;
+    }
+
+    tryNotify(ctx, `Subagent ${job.id} finished; queued callback to main agent.`, job.status === "completed" ? "info" : "warning");
+  } catch {
+    // Callback delivery must never destabilize subagent monitoring/finalization.
+  }
+}
+
+function formatSubagentFinishedCallback(job: AgentJob): string {
+  const lines = [
+    `[subagent-finished] ${job.id}`,
+    `Status: ${job.status}`,
+    `Label: ${job.label}`,
+    `CWD: ${job.cwd}`,
+    `Runtime: ${formatJobRuntime(job)}`,
+  ];
+  if (job.exitCode !== undefined) lines.push(`Exit code: ${job.exitCode}`);
+  if (job.signal) lines.push(`Signal: ${job.signal}`);
+  if (job.errorMessage) lines.push(`Error: ${compactPreview(job.errorMessage, 1_000, 6)}`);
+  if (job.worktree?.retained) lines.push(`Retained worktree: ${job.worktree.root}`);
+  lines.push(
+    "",
+    "The background subagent has finished. Review its result below and decide whether any follow-up action is needed. If no action is needed, say so briefly.",
+    "",
+    "Result:",
+    job.finalOutput ? truncateForCallback(job.finalOutput) : "(no final assistant output captured; use poll_agent for logs if needed)",
+  );
+  return lines.join("\n");
+}
+
+function callbackMarkerPath(id: string): string {
+  return path.join(JOBS_DIR, `${id}.callback.json`);
+}
+
+function tryCreateCallbackMarker(id: string): boolean {
+  let fd: number | undefined;
+  try {
+    ensureJobStoreDirs();
+    fd = fs.openSync(callbackMarkerPath(id), "wx", 0o600);
+    fs.writeFileSync(fd, JSON.stringify({ id, deliveredAt: Date.now() }) + "\n", "utf-8");
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    if (fd !== undefined) removeCallbackMarker(id);
+    // If marker persistence is unavailable, prefer a best-effort callback over silence.
+    return true;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+}
+
+function tryNotify(ctx: ExtensionContext, message: string, type: "info" | "warning" | "error"): void {
+  try {
+    ctx.ui.notify(message, type);
+  } catch {
+    // ignore stale UI contexts
+  }
+}
+
+function removeCallbackMarker(id: string): void {
+  try {
+    fs.rmSync(callbackMarkerPath(id), { force: true });
+  } catch {
+    // ignore
+  }
+}
+
+function truncateForCallback(text: string): string {
+  return truncateTail(text || "(empty)", {
+    maxLines: Math.min(DEFAULT_MAX_LINES, 120),
+    maxBytes: Math.min(DEFAULT_MAX_BYTES, 24_000),
+  }).content;
 }
 
 function notifyCloseWaiters(job: AgentJob): void {
@@ -2907,6 +3006,7 @@ function pruneFinishedJobs(): void {
 function removePersistedJobFiles(id: string): void {
   for (const file of [
     jobStatePath(id),
+    callbackMarkerPath(id),
     path.join(LOGS_DIR, `${id}.stdout.jsonl`),
     path.join(LOGS_DIR, `${id}.stderr.log`),
     path.join(LOGS_DIR, `${id}.exit`),
@@ -2960,4 +3060,12 @@ export const __subagentsTest = {
   lifecycleRecordForJob,
   applyLifecycleRecordToJob,
   dispatchLifecycleEvent,
+  notifyMainAgentOfFinishedJob,
+  callbackMarkerPath,
+  removeCallbackMarker,
+  removePersistedJobFiles,
+  setCallbackHarness(api: ExtensionAPI | undefined, ctx: ExtensionContext | undefined) {
+    extensionApi = api;
+    statusContext = ctx;
+  },
 };
