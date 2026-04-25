@@ -26,7 +26,7 @@ import {
 import { Text } from "@mariozechner/pi-tui";
 import { Type, type Static } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents, formatAgentList } from "./agents.js";
-import { hydrateJobRecord, serializeJobRecord } from "./core/hydration.js";
+import { hydrateJobRecord, serializeJobRecord, UnsupportedJobRecordSchemaError } from "./core/hydration.js";
 import { reduceJobEvent } from "./core/state-machine.js";
 import {
   JOB_RECORD_SCHEMA_VERSION,
@@ -252,10 +252,19 @@ interface AgentJob {
   closeWaiters: Set<() => void>;
 }
 
+interface StoreDiagnosticWarning {
+  timestamp: number;
+  path: string;
+  kind: "corrupt" | "unsupported" | "unreadable" | "quarantine-failed" | "persistence";
+  message: string;
+  quarantinePath?: string;
+}
+
 interface PollDetails {
   id?: string;
   jobs?: Array<ReturnType<typeof summarizeJob>>;
   job?: ReturnType<typeof summarizeJob>;
+  warnings?: StoreDiagnosticWarning[];
   logs?: AgentLogEntry[];
   nextSeq?: number;
   logWindowStartSeq?: number;
@@ -274,6 +283,8 @@ let statusRefreshTimer: NodeJS.Timeout | undefined;
 const pendingFinishedCallbacks = new Map<string, AgentJob>();
 let callbackFlushTimer: NodeJS.Timeout | undefined;
 let tmuxAvailabilityCache: { checkedAt: number; ok: boolean } | undefined;
+const storeWarnings: StoreDiagnosticWarning[] = [];
+const MAX_STORE_WARNINGS = 50;
 const CALLBACK_STACK_DELAY_MS = 250;
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
@@ -518,18 +529,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       refreshSubagentStatus();
       if (!params.id) {
         const summaries = [...jobs.values()].map(summarizeJob).sort((a, b) => b.startedAt - a.startedAt);
-        const text = summaries.length === 0
+        const baseText = summaries.length === 0
           ? "No background agent jobs are known in this Pi session."
           : summaries.map(formatJobSummaryLine).join("\n");
-        return { content: [{ type: "text", text }], details: { jobs: summaries } satisfies PollDetails };
+        const warnings = recentStoreWarnings();
+        const text = appendStoreWarnings(baseText, warnings);
+        return { content: [{ type: "text", text }], details: { jobs: summaries, warnings } satisfies PollDetails };
       }
 
       const job = jobs.get(params.id);
       if (!job) {
         const known = [...jobs.keys()].join(", ") || "none";
+        const warnings = recentStoreWarnings();
         return {
-          content: [{ type: "text", text: `Unknown agent job id: ${params.id}. Known ids: ${known}` }],
-          details: { id: params.id, jobs: [...jobs.values()].map(summarizeJob) } satisfies PollDetails,
+          content: [{ type: "text", text: appendStoreWarnings(`Unknown agent job id: ${params.id}. Known ids: ${known}`, warnings) }],
+          details: { id: params.id, jobs: [...jobs.values()].map(summarizeJob), warnings } satisfies PollDetails,
         };
       }
 
@@ -551,9 +565,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const hasMoreLogs = verbosity !== "summary" && logWindow.logsTruncated;
       const nextSeq = verbosity !== "summary" && logs.length > 0 ? logs[logs.length - 1]!.seq : job.nextSeq - 1;
       const summary = summarizeJob(job);
+      const warnings = recentStoreWarningsForJob(job.id);
       const details: PollDetails = {
         id: job.id,
         job: summary,
+        warnings,
         logs: verbosity === "summary" ? undefined : logs,
         nextSeq,
         latestAssistantText: job.latestAssistantText ? compactPreview(job.latestAssistantText, 600, 3) : undefined,
@@ -565,9 +581,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         hasMoreLogs,
       };
 
-      const text = verbosity === "summary"
+      const baseText = verbosity === "summary"
         ? formatCompactPollResult(job, sinceSeq, nextSeq, logWindow)
         : formatPollResult(job, logs, nextSeq, verbosity === "full", logWindow);
+      const text = appendStoreWarnings(baseText, warnings);
       return {
         content: [{ type: "text", text: truncateForTool(text) }],
         details,
@@ -1201,23 +1218,30 @@ function sleepSync(ms: number): void {
 function loadPersistedJobs(): void {
   try {
     ensureJobStoreDirs();
-  } catch {
+  } catch (error) {
+    recordStoreWarning({ path: JOB_STORE_DIR, kind: "unreadable", message: `could not ensure subagent store directories: ${errorMessage(error)}` });
     return;
   }
 
   let fileNames: string[];
   try {
     fileNames = fs.readdirSync(JOBS_DIR);
-  } catch {
+  } catch (error) {
+    recordStoreWarning({ path: JOBS_DIR, kind: "unreadable", message: `could not read subagent jobs directory: ${errorMessage(error)}` });
     return;
   }
 
   for (const fileName of fileNames) {
     if (!fileName.endsWith(".json")) continue;
+    const filePath = path.join(JOBS_DIR, fileName);
     try {
-      const raw = fs.readFileSync(path.join(JOBS_DIR, fileName), "utf-8");
+      const raw = fs.readFileSync(filePath, "utf-8");
       const record = hydrateJobRecord(raw);
-      if (fileName !== `${record.id}.json`) continue;
+      if (fileName !== `${record.id}.json`) {
+        recordStoreWarning({ path: filePath, kind: "corrupt", message: `job record id ${record.id} does not match file name ${fileName}` });
+        quarantineJobRecord(filePath, "corrupt", `job record id ${record.id} does not match file name ${fileName}`);
+        continue;
+      }
       const existing = jobs.get(record.id);
       if (existing) {
         applyLifecycleRecordToJob(existing, record);
@@ -1229,13 +1253,68 @@ function loadPersistedJobs(): void {
       jobs.set(job.id, job);
       if (job.status === "running") startTmuxMonitor(job);
       if (job.cleanupPending) void retryWorktreeCleanup(job);
-    } catch {
-      // Skip only the corrupt/unreadable job file; other jobs may still be valid.
+    } catch (error) {
+      const kind = classifyHydrationFailure(error);
+      quarantineJobRecord(filePath, kind, errorMessage(error));
       continue;
     }
   }
   retryPendingFinishedCallbacks();
   pruneFinishedJobs();
+}
+
+function classifyHydrationFailure(error: unknown): StoreDiagnosticWarning["kind"] {
+  if (error instanceof UnsupportedJobRecordSchemaError) return "unsupported";
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  if (code === "EACCES" || code === "EPERM" || code === "EISDIR") return "unreadable";
+  return "corrupt";
+}
+
+function quarantineJobRecord(filePath: string, kind: StoreDiagnosticWarning["kind"], message: string): void {
+  const timestamp = Date.now();
+  const quarantinePath = `${filePath}.${kind}.${new Date(timestamp).toISOString().replace(/[:.]/g, "-")}`;
+  try {
+    fs.renameSync(filePath, quarantinePath);
+    recordStoreWarning({ timestamp, path: filePath, kind, message, quarantinePath });
+  } catch (error) {
+    recordStoreWarning({
+      timestamp,
+      path: filePath,
+      kind: "quarantine-failed",
+      message: `could not quarantine ${kind} job record (${message}): ${errorMessage(error)}`,
+    });
+  }
+}
+
+function recordStoreWarning(warning: Omit<StoreDiagnosticWarning, "timestamp"> & { timestamp?: number }): void {
+  const timestamp = warning.timestamp ?? Date.now();
+  const normalized: StoreDiagnosticWarning = { ...warning, timestamp };
+  const last = storeWarnings[storeWarnings.length - 1];
+  if (last && last.path === normalized.path && last.kind === normalized.kind && last.message === normalized.message && last.quarantinePath === normalized.quarantinePath) return;
+  storeWarnings.push(normalized);
+  if (storeWarnings.length > MAX_STORE_WARNINGS) storeWarnings.splice(0, storeWarnings.length - MAX_STORE_WARNINGS);
+}
+
+function recentStoreWarnings(): StoreDiagnosticWarning[] | undefined {
+  return storeWarnings.length > 0 ? storeWarnings.slice(-10) : undefined;
+}
+
+function recentStoreWarningsForJob(id: string): StoreDiagnosticWarning[] | undefined {
+  const relevant = storeWarnings.filter((warning) => path.basename(warning.path).startsWith(`${id}.`));
+  return relevant.length > 0 ? relevant.slice(-10) : undefined;
+}
+
+function appendStoreWarnings(text: string, warnings: StoreDiagnosticWarning[] | undefined): string {
+  if (!warnings || warnings.length === 0) return text;
+  const lines = warnings.map((warning) => {
+    const quarantine = warning.quarantinePath ? `; quarantined: ${warning.quarantinePath}` : "";
+    return `- ${warning.kind}: ${warning.path}: ${warning.message}${quarantine}`;
+  });
+  return `${text}\n\nStore warnings:\n${lines.join("\n")}`;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function runtimeJobFromRecord(record: JobRecord): AgentJob {
@@ -3580,6 +3659,7 @@ export const __subagentsTest = {
       if (job.monitorTimer) clearInterval(job.monitorTimer);
     }
     jobs.clear();
+    storeWarnings.length = 0;
     pendingFinishedCallbacks.clear();
     clearCallbackFlushTimer();
     clearStatusRefreshTimer();
@@ -3588,6 +3668,8 @@ export const __subagentsTest = {
     tmuxAvailabilityCache = undefined;
   },
   refreshSubagentStatus,
+  loadPersistedJobs,
+  recentStoreWarnings,
   forgetJobForCallbackRetry(id: string) {
     jobs.delete(id);
   },

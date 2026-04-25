@@ -618,3 +618,40 @@ test("stop_agent tmux unavailable during stop reports failure and keeps job runn
     }
   });
 });
+
+test("poll_agent surfaces and quarantines corrupt and unsupported persisted records", async () => {
+  const jobsDir = path.join(process.env.PI_SUBAGENTS_STORE_DIR!, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  const corruptPath = path.join(jobsDir, "agent_bad_corrupt.json");
+  const unsupportedPath = path.join(jobsDir, "agent_future_schema.json");
+  fs.writeFileSync(corruptPath, "{not json", "utf-8");
+  fs.writeFileSync(unsupportedPath, JSON.stringify({ schemaVersion: 999, id: "agent_future_schema" }), "utf-8");
+
+  const result = await tools.get("poll_agent")!.execute("call", {}, new AbortController().signal, () => {}, ctx);
+  assert.match(textOf(result), /No background agent jobs are known/);
+  assert.match(textOf(result), /Store warnings:/);
+  assert.match(textOf(result), /corrupt: .*agent_bad_corrupt\.json: failed to parse job record JSON/);
+  assert.match(textOf(result), /unsupported: .*agent_future_schema\.json: unsupported job record schemaVersion 999/);
+  assert.equal(result.details.jobs.length, 0);
+  assert.equal(result.details.warnings.length, 2);
+  assert.deepEqual(result.details.warnings.map((warning: any) => warning.kind).sort(), ["corrupt", "unsupported"]);
+  assert.equal(fs.existsSync(corruptPath), false);
+  assert.equal(fs.existsSync(unsupportedPath), false);
+  assert.ok(fs.readdirSync(jobsDir).some((name) => /^agent_bad_corrupt\.json\.corrupt\./.test(name)));
+  assert.ok(fs.readdirSync(jobsDir).some((name) => /^agent_future_schema\.json\.unsupported\./.test(name)));
+});
+
+test("poll_agent surfaces job-specific persisted-record warnings", async () => {
+  const jobsDir = path.join(process.env.PI_SUBAGENTS_STORE_DIR!, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  const badPath = path.join(jobsDir, "agent_specific.json");
+  fs.writeFileSync(badPath, "{bad", "utf-8");
+
+  const result = await tools.get("poll_agent")!.execute("call", { id: "agent_specific" }, new AbortController().signal, () => {}, ctx);
+  assert.match(textOf(result), /Unknown agent job id: agent_specific/);
+  assert.match(textOf(result), /Store warnings:/);
+  assert.match(textOf(result), /agent_specific\.json/);
+  assert.equal(result.details.id, "agent_specific");
+  assert.equal(result.details.warnings.length, 1);
+  assert.equal(result.details.warnings[0].kind, "corrupt");
+});
