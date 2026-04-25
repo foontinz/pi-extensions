@@ -33,6 +33,7 @@ import {
   emptyUsageStats,
   initialLogCursor,
   type CleanupPhase,
+  type DurableLogEntry,
   type JobEvent,
   type JobPhase,
   type JobRecord,
@@ -43,6 +44,8 @@ import {
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_TIMEOUT_MS = 12 * 60 * 60 * 1000;
 const MAX_STORED_LOG_ENTRIES = 5_000;
+const MAX_DURABLE_LOG_ENTRIES = 500;
+const MAX_DURABLE_TEXT_CHARS = 256_000;
 const MAX_STORED_STDERR_CHARS = 100_000;
 const MAX_STDOUT_LINE_CHARS = 64 * 1024 * 1024;
 const MAX_STDERR_PARTIAL_BUFFER_CHARS = 1_000_000;
@@ -59,6 +62,7 @@ const ASSISTANT_DELTA_LOG_INTERVAL_MS = 1_250;
 const ASSISTANT_DELTA_LOG_CHARS = 1_200;
 const TMUX_STATUS_INTERVAL_MS = 2_000;
 const TMUX_COMMAND_TIMEOUT_MS = 5_000;
+const TMUX_AVAILABILITY_CACHE_MS = 30_000;
 const GIT_CLEANUP_TIMEOUT_MS = 10_000;
 const POST_COPY_DEFAULT_TIMEOUT_MS = 120_000;
 const POST_COPY_MAX_TIMEOUT_MS = 30 * 60 * 1000;
@@ -256,6 +260,7 @@ let statusContext: ExtensionContext | undefined;
 let statusRefreshTimer: NodeJS.Timeout | undefined;
 const pendingFinishedCallbacks = new Map<string, AgentJob>();
 let callbackFlushTimer: NodeJS.Timeout | undefined;
+let tmuxAvailabilityCache: { checkedAt: number; ok: boolean } | undefined;
 const CALLBACK_STACK_DELAY_MS = 250;
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
@@ -924,7 +929,26 @@ function persistJob(job: AgentJob): void {
 }
 
 function lifecycleRecordForJob(job: AgentJob): JobRecord {
-  return structuredClone(job.record);
+  const record = structuredClone(job.record);
+  syncDurableObservability(record, job);
+  return record;
+}
+
+function syncDurableObservability(record: JobRecord, job: AgentJob): void {
+  const logs = job.logs.slice(-MAX_DURABLE_LOG_ENTRIES).map((entry): DurableLogEntry => ({
+    seq: entry.seq,
+    timestamp: entry.timestamp,
+    level: entry.level,
+    text: truncateString(entry.text, 1_500),
+    eventType: entry.eventType,
+  }));
+  record.observability = {
+    finalOutput: job.finalOutput ? truncateString(job.finalOutput, MAX_DURABLE_TEXT_CHARS) : undefined,
+    latestAssistantText: job.latestAssistantText ? truncateString(job.latestAssistantText, MAX_DURABLE_TEXT_CHARS) : undefined,
+    logs,
+    messageCount: job.messageCount,
+    lastLogAt: logs.length > 0 ? logs[logs.length - 1]!.timestamp : undefined,
+  };
 }
 
 function jobStatusFromPhase(phase: JobPhase): JobStatus {
@@ -944,6 +968,11 @@ function applyLifecycleRecordToJob(job: AgentJob, record: JobRecord): void {
   job.timeoutAt = record.timeoutAt;
   job.stdoutOffset = record.logCursor.stdoutOffset;
   job.stderrOffset = record.logCursor.stderrOffset;
+  const durableLogs = durableLogsToRuntime(record.observability?.logs);
+  job.logs = mergeLogEntries(job.logs, durableLogs);
+  job.messageCount = Math.max(job.messageCount ?? 0, record.observability?.messageCount ?? 0);
+  job.latestAssistantText = job.latestAssistantText || record.observability?.latestAssistantText || "";
+  job.finalOutput = job.finalOutput || record.observability?.finalOutput;
   job.nextSeq = Math.max(job.nextSeq ?? 1, record.logCursor.nextSeq);
   // Existing in-memory jobs may have logs that have not yet made it to the
   // durable record, for example if a best-effort persist failed and a later
@@ -951,6 +980,7 @@ function applyLifecycleRecordToJob(job: AgentJob, record: JobRecord): void {
   // sync with the runtime cursor so the next LogEntriesAppended transition does
   // not see an artificial gap and crash the extension monitor.
   if (job.record.logCursor.nextSeq < job.nextSeq) job.record.logCursor.nextSeq = job.nextSeq;
+  syncDurableObservability(job.record, job);
   job.usage = { ...record.usage };
   job.status = jobStatusFromPhase(record.phase);
   job.cleanupPending = record.cleanupPhase === "pending" || record.cleanupPhase === "running" || record.cleanupPhase === "failed";
@@ -970,6 +1000,16 @@ function dispatchLifecycleEvent(job: AgentJob, event: JobEvent, now = Date.now()
   const transition = reduceJobEvent(lifecycleRecordForJob(job), event, { now });
   applyLifecycleRecordToJob(job, transition.next);
   return transition.next;
+}
+
+function durableLogsToRuntime(logs: DurableLogEntry[] | undefined): AgentLogEntry[] {
+  return (logs ?? []).map((entry) => ({
+    seq: entry.seq,
+    timestamp: entry.timestamp,
+    level: entry.level,
+    text: entry.text,
+    eventType: entry.eventType,
+  }));
 }
 
 function mergeLogEntries(a: AgentLogEntry[] | undefined, b: AgentLogEntry[] | undefined): AgentLogEntry[] {
@@ -1105,15 +1145,16 @@ function runtimeJobFromRecord(record: JobRecord): AgentJob {
     signal: record.terminal?.signal as NodeJS.Signals | undefined,
     errorMessage: record.terminal?.error ?? (record.phase === "failed" ? record.terminal?.message : undefined),
     stopReason: record.terminal?.reason === "stop" || record.terminal?.reason === "timeout" ? record.terminal.message : undefined,
-    messageCount: 0,
-    logs: [],
+    messageCount: record.observability?.messageCount ?? 0,
+    logs: durableLogsToRuntime(record.observability?.logs),
     nextSeq: record.logCursor.nextSeq,
     stderr: "",
     stdoutBuffer: "",
     stderrBuffer: "",
-    latestAssistantText: "",
+    latestAssistantText: record.observability?.latestAssistantText ?? "",
     pendingAssistantDelta: "",
     lastAssistantDeltaLogAt: 0,
+    finalOutput: record.observability?.finalOutput,
     usage: { ...record.usage },
     timeoutAt: record.timeoutAt,
     supervisor: record.supervisor,
@@ -1218,6 +1259,7 @@ function refreshTmuxJob(job: AgentJob): void {
 
 function refreshTmuxJobOutput(job: AgentJob, options: { drain?: boolean } = {}): void {
   let readMore = false;
+  let cursorChanged = false;
   do {
     readMore = false;
     if (job.stdoutPath) {
@@ -1227,7 +1269,10 @@ function refreshTmuxJobOutput(job: AgentJob, options: { drain?: boolean } = {}):
         job.stdoutDecoder ??= new StringDecoder("utf8");
         processStdout(job, job.stdoutDecoder.write(result.buffer));
       }
-      dispatchLifecycleEvent(job, { type: "OutputChunkRead", stream: "stdout", bytes: result.buffer.length, offsetAfter: result.offset });
+      if (result.offset > job.stdoutOffset) {
+        dispatchLifecycleEvent(job, { type: "OutputChunkRead", stream: "stdout", bytes: result.buffer.length, offsetAfter: result.offset });
+        cursorChanged = true;
+      }
     }
     if (job.stderrPath) {
       const result = readFileFromOffset(job.stderrPath, job.stderrOffset);
@@ -1236,10 +1281,13 @@ function refreshTmuxJobOutput(job: AgentJob, options: { drain?: boolean } = {}):
         job.stderrDecoder ??= new StringDecoder("utf8");
         processStderr(job, job.stderrDecoder.write(result.buffer));
       }
-      dispatchLifecycleEvent(job, { type: "OutputChunkRead", stream: "stderr", bytes: result.buffer.length, offsetAfter: result.offset });
+      if (result.offset > job.stderrOffset) {
+        dispatchLifecycleEvent(job, { type: "OutputChunkRead", stream: "stderr", bytes: result.buffer.length, offsetAfter: result.offset });
+        cursorChanged = true;
+      }
     }
   } while (options.drain && readMore);
-  persistJob(job);
+  if (cursorChanged) persistJob(job);
 }
 
 function rawLogSizes(job: AgentJob): { stdout?: number; stderr?: number; total: number } {
@@ -1296,7 +1344,13 @@ function readFileFromOffset(filePath: string, offset: number): { buffer: Buffer;
 }
 
 function isTmuxAvailable(): boolean {
-  return runTmuxSync(["-V"]).ok;
+  const now = Date.now();
+  if (tmuxAvailabilityCache && now - tmuxAvailabilityCache.checkedAt < TMUX_AVAILABILITY_CACHE_MS) {
+    return tmuxAvailabilityCache.ok;
+  }
+  const ok = runTmuxSync(["-V"]).ok;
+  tmuxAvailabilityCache = { checkedAt: now, ok };
+  return ok;
 }
 
 function tmuxSessionExists(sessionName: string | undefined): boolean {
@@ -3151,6 +3205,11 @@ function truncateForTool(text: string): string {
 function truncateOneLine(text: string, maxChars: number): string {
   const oneLine = squashWhitespace(text);
   return oneLine.length > maxChars ? `${oneLine.slice(0, Math.max(0, maxChars - 1))}…` : oneLine;
+}
+
+function truncateString(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(0, maxChars - 1))}…`;
 }
 
 function squashWhitespace(text: string): string {

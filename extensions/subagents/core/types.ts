@@ -99,6 +99,24 @@ export interface DurableSupervisorInfo {
   exitCodePath?: string;
 }
 
+export type DurableLogLevel = "info" | "assistant" | "tool" | "stdout" | "stderr" | "error";
+
+export interface DurableLogEntry {
+  seq: number;
+  timestamp: number;
+  level: DurableLogLevel;
+  text: string;
+  eventType?: string;
+}
+
+export interface DurableObservabilityState {
+  finalOutput?: string;
+  latestAssistantText?: string;
+  logs?: DurableLogEntry[];
+  messageCount?: number;
+  lastLogAt?: number;
+}
+
 export interface JobRecord {
   schemaVersion: typeof JOB_RECORD_SCHEMA_VERSION;
 
@@ -127,6 +145,7 @@ export interface JobRecord {
 
   logCursor: LogCursor;
   usage: UsageStats;
+  observability?: DurableObservabilityState;
 }
 
 export type JobEvent =

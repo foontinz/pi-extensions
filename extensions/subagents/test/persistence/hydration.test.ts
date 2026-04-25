@@ -25,6 +25,24 @@ test("unsupported future schemas are reported", () => {
   );
 });
 
+test("durable observability hydrates with compact final output and recent logs", () => {
+  const record = makeRecord({
+    logCursor: { stdoutOffset: 0, stderrOffset: 0, nextSeq: 3 },
+    observability: {
+      finalOutput: "final answer",
+      latestAssistantText: "latest answer",
+      messageCount: 2,
+      lastLogAt: 2_100,
+      logs: [
+        { seq: 1, timestamp: 2_000, level: "info", text: "started", eventType: "start" },
+        { seq: 2, timestamp: 2_100, level: "assistant", text: "assistant: final answer", eventType: "message_update" },
+      ],
+    },
+  });
+
+  assert.deepEqual(hydrateJobRecord(serializeJobRecord(record)), record);
+});
+
 test("unknown compact-record fields are rejected during hydration", () => {
   assert.throws(
     () => hydrateJobRecord({ ...makeRecord(), logs: [] }),

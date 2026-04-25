@@ -126,3 +126,31 @@ test("applying a stale persisted record keeps runtime log cursor contiguous", ()
   __subagentsTest.dispatchLifecycleEvent(job, { type: "LogEntriesAppended", firstSeq: 72, count: 1 }, 2_000);
   assert.equal(job.nextSeq, 73);
 });
+
+test("live AgentJob lifecycle record persists compact observability", () => {
+  const job = makeLegacyJob({
+    messageCount: 2,
+    nextSeq: 3,
+    latestAssistantText: "latest answer",
+    finalOutput: "final answer",
+    logs: [
+      { seq: 1, timestamp: 2_000, level: "info", text: "started", eventType: "start" },
+      { seq: 2, timestamp: 2_100, level: "assistant", text: "assistant: final answer", eventType: "message_update" },
+    ],
+  });
+  job.record.logCursor.nextSeq = 3;
+
+  const record = __subagentsTest.lifecycleRecordForJob(job);
+  assert.equal(record.observability?.finalOutput, "final answer");
+  assert.equal(record.observability?.latestAssistantText, "latest answer");
+  assert.equal(record.observability?.messageCount, 2);
+  assert.equal(record.observability?.lastLogAt, 2_100);
+  assert.deepEqual(record.observability?.logs?.map((entry) => entry.seq), [1, 2]);
+
+  const reloaded = makeLegacyJob({ logs: [], nextSeq: 1, messageCount: 0, latestAssistantText: "", finalOutput: undefined });
+  __subagentsTest.applyLifecycleRecordToJob(reloaded, record);
+  assert.equal(reloaded.finalOutput, "final answer");
+  assert.equal(reloaded.latestAssistantText, "latest answer");
+  assert.equal(reloaded.messageCount, 2);
+  assert.deepEqual(reloaded.logs.map((entry: { seq: number }) => entry.seq), [1, 2]);
+});

@@ -2,6 +2,7 @@ import { isDeepStrictEqual } from "node:util";
 import {
   JOB_RECORD_SCHEMA_VERSION,
   type CleanupPhase,
+  type DurableLogLevel,
   type JobPhase,
   type JobRecord,
   type JobTransition,
@@ -67,6 +68,7 @@ const JOB_RECORD_KEYS = new Set([
   "worktree",
   "logCursor",
   "usage",
+  "observability",
 ]);
 const LOG_CURSOR_KEYS = new Set(["stdoutOffset", "stderrOffset", "nextSeq"]);
 const SUPERVISOR_INFO_KEYS = new Set(["kind", "pid", "command", "args", "tmuxSession", "stdoutPath", "stderrPath", "exitCodePath"]);
@@ -74,6 +76,9 @@ const WORKTREE_KEYS = new Set(["root", "tempParent", "originalRoot", "originalCw
 const WORKTREE_SCRIPT_KEYS = new Set(["command", "cwd", "optional", "timeoutMs", "failed", "stdout", "stderr"]);
 const TERMINAL_KEYS = new Set(["phase", "reason", "finishedAt", "exitCode", "signal", "message", "error"]);
 const PENDING_TERMINAL_KEYS = new Set(["reason", "requestedAt", "observedAt", "exitCode", "signal", "message", "error"]);
+const OBSERVABILITY_KEYS = new Set(["finalOutput", "latestAssistantText", "logs", "messageCount", "lastLogAt"]);
+const OBSERVABILITY_LOG_KEYS = new Set(["seq", "timestamp", "level", "text", "eventType"]);
+const OBSERVABILITY_LOG_LEVELS = new Set<DurableLogLevel>(["info", "assistant", "tool", "stdout", "stderr", "error"]);
 
 export const RUNTIME_ONLY_KEYS = new Set([
   "proc",
@@ -134,6 +139,7 @@ export function assertJobRecordInvariants(value: unknown): asserts value is JobR
 
   assertLogCursor(value.logCursor);
   assertUsageStats(value.usage);
+  assertObservability(value.observability, isRecord(value.logCursor) ? value.logCursor.nextSeq : undefined);
   assertSupervisorInfo(value.supervisorInfo);
   assertWorktree(value.worktree);
 
@@ -231,6 +237,32 @@ function assertUsageStats(value: unknown): void {
   if (!isRecord(value)) throw invariant("usage must be an object");
   assertAllowedKeys(value, new Set<string>(USAGE_KEYS), "usage");
   for (const key of USAGE_KEYS) assertNonNegativeFinite(value[key], `usage.${key}`);
+}
+
+function assertObservability(value: unknown, nextSeq: unknown): void {
+  if (value === undefined) return;
+  if (!isRecord(value)) throw invariant("observability must be an object");
+  assertAllowedKeys(value, OBSERVABILITY_KEYS, "observability");
+  if (value.finalOutput !== undefined) assertString(value.finalOutput, "observability.finalOutput");
+  if (value.latestAssistantText !== undefined) assertString(value.latestAssistantText, "observability.latestAssistantText");
+  if (value.messageCount !== undefined) assertNonNegativeInteger(value.messageCount, "observability.messageCount");
+  if (value.lastLogAt !== undefined) assertNonNegativeFinite(value.lastLogAt, "observability.lastLogAt");
+  if (value.logs !== undefined) {
+    if (!Array.isArray(value.logs)) throw invariant("observability.logs must be an array");
+    let previousSeq = 0;
+    for (const [index, entry] of value.logs.entries()) {
+      if (!isRecord(entry)) throw invariant(`observability.logs.${index} must be an object`);
+      assertAllowedKeys(entry, OBSERVABILITY_LOG_KEYS, `observability.logs.${index}`);
+      assertPositiveInteger(entry.seq, `observability.logs.${index}.seq`);
+      assertNonNegativeFinite(entry.timestamp, `observability.logs.${index}.timestamp`);
+      if (!OBSERVABILITY_LOG_LEVELS.has(entry.level as DurableLogLevel)) throw invariant(`invalid observability.logs.${index}.level ${String(entry.level)}`);
+      assertString(entry.text, `observability.logs.${index}.text`);
+      if (entry.eventType !== undefined) assertString(entry.eventType, `observability.logs.${index}.eventType`);
+      if (entry.seq <= previousSeq) throw invariant("observability.logs must be sorted by increasing seq");
+      previousSeq = entry.seq as number;
+      if (typeof nextSeq === "number" && entry.seq >= nextSeq) throw invariant("observability log seq cannot exceed logCursor.nextSeq");
+    }
+  }
 }
 
 function assertSupervisorInfo(value: unknown): void {
