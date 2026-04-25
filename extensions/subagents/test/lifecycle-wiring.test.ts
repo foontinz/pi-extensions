@@ -62,6 +62,45 @@ function makeLegacyJob(overrides: Record<string, unknown> = {}) {
   } as any;
 }
 
+test("poll log window metadata reports retained range, truncation, and expired cursors", () => {
+  const job = makeLegacyJob({
+    logs: [
+      { seq: 10, timestamp: 1_010, level: "info", text: "ten" },
+      { seq: 11, timestamp: 1_011, level: "info", text: "eleven" },
+      { seq: 12, timestamp: 1_012, level: "info", text: "twelve" },
+    ],
+    nextSeq: 13,
+  });
+
+  const expired = __subagentsTest.getLogWindow(job, 0, 2);
+  assert.deepEqual(expired.logs.map((entry: any) => entry.seq), [10, 11]);
+  assert.equal(expired.logWindowStartSeq, 10);
+  assert.equal(expired.logWindowEndSeq, 12);
+  assert.equal(expired.logsTruncated, true);
+  assert.equal(expired.cursorExpired, true);
+
+  const current = __subagentsTest.getLogWindow(job, 9, 10);
+  assert.deepEqual(current.logs.map((entry: any) => entry.seq), [10, 11, 12]);
+  assert.equal(current.logsTruncated, false);
+  assert.equal(current.cursorExpired, false);
+});
+
+test("poll formatting clearly mentions expired cursors and log windows", () => {
+  const job = makeLegacyJob({
+    logs: [{ seq: 42, timestamp: 1_042, level: "info", text: "retained" }],
+    nextSeq: 43,
+  });
+  const window = __subagentsTest.getLogWindow(job, 0, 20);
+
+  const compact = __subagentsTest.formatCompactPollResult(job, 0, 42, window);
+  assert.match(compact, /logWindow: 42-42/);
+  assert.match(compact, /warning: sinceSeq 0 predates retained logs/);
+
+  const verbose = __subagentsTest.formatPollResult(job, window.logs, 42, false, window);
+  assert.match(verbose, /cursor expired/);
+  assert.match(verbose, /logWindowStartSeq 42/);
+});
+
 test("live AgentJob lifecycle dispatch uses S2 stop/timeout race policy", () => {
   const job = makeLegacyJob({ phase: "running" });
 

@@ -254,6 +254,10 @@ interface PollDetails {
   job?: ReturnType<typeof summarizeJob>;
   logs?: AgentLogEntry[];
   nextSeq?: number;
+  logWindowStartSeq?: number;
+  logWindowEndSeq?: number;
+  logsTruncated?: boolean;
+  cursorExpired?: boolean;
   finalOutput?: string;
   latestAssistantText?: string;
   hasMoreLogs?: boolean;
@@ -525,8 +529,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
 
       if (verbosity !== "summary") flushAssistantDelta(job);
-      const logs = verbosity === "summary" ? [] : getLogsSince(job, sinceSeq, maxLogEntries);
-      const hasMoreLogs = verbosity !== "summary" && logs.length > 0 && job.logs.some((entry) => entry.seq > logs[logs.length - 1]!.seq);
+      const logWindow = getLogWindow(job, sinceSeq, maxLogEntries);
+      const logs = verbosity === "summary" ? [] : logWindow.logs;
+      const hasMoreLogs = verbosity !== "summary" && logWindow.logsTruncated;
       const nextSeq = verbosity !== "summary" && logs.length > 0 ? logs[logs.length - 1]!.seq : job.nextSeq - 1;
       const summary = summarizeJob(job);
       const details: PollDetails = {
@@ -536,12 +541,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         nextSeq,
         latestAssistantText: job.latestAssistantText ? compactPreview(job.latestAssistantText, 600, 3) : undefined,
         finalOutput: job.finalOutput ? (verbosity === "full" ? truncateForTool(job.finalOutput) : compactPreview(job.finalOutput, 1_000, 6)) : undefined,
+        logWindowStartSeq: logWindow.logWindowStartSeq,
+        logWindowEndSeq: logWindow.logWindowEndSeq,
+        logsTruncated: logWindow.logsTruncated,
+        cursorExpired: logWindow.cursorExpired,
         hasMoreLogs,
       };
 
       const text = verbosity === "summary"
-        ? formatCompactPollResult(job, sinceSeq, nextSeq)
-        : formatPollResult(job, logs, nextSeq, verbosity === "full", hasMoreLogs);
+        ? formatCompactPollResult(job, sinceSeq, nextSeq, logWindow)
+        : formatPollResult(job, logs, nextSeq, verbosity === "full", logWindow);
       return {
         content: [{ type: "text", text: truncateForTool(text) }],
         details,
@@ -3003,8 +3012,30 @@ function createJobId(): string {
   return `agent_${Date.now().toString(36)}_${randomBytes(4).toString("hex")}`;
 }
 
+interface LogWindow {
+  logs: AgentLogEntry[];
+  logWindowStartSeq?: number;
+  logWindowEndSeq?: number;
+  logsTruncated: boolean;
+  cursorExpired: boolean;
+}
+
 function getLogsSince(job: AgentJob, sinceSeq: number, maxLogEntries: number): AgentLogEntry[] {
-  return job.logs.filter((entry) => entry.seq > sinceSeq).slice(0, maxLogEntries);
+  return getLogWindow(job, sinceSeq, maxLogEntries).logs;
+}
+
+function getLogWindow(job: AgentJob, sinceSeq: number, maxLogEntries: number): LogWindow {
+  const retainedLogs = [...job.logs].sort((a, b) => a.seq - b.seq);
+  const logWindowStartSeq = retainedLogs[0]?.seq;
+  const logWindowEndSeq = retainedLogs[retainedLogs.length - 1]?.seq;
+  const availableLogs = retainedLogs.filter((entry) => entry.seq > sinceSeq);
+  return {
+    logs: availableLogs.slice(0, maxLogEntries),
+    logWindowStartSeq,
+    logWindowEndSeq,
+    logsTruncated: availableLogs.length > maxLogEntries,
+    cursorExpired: logWindowStartSeq !== undefined && logWindowStartSeq > 1 && sinceSeq < logWindowStartSeq - 1,
+  };
 }
 
 function summarizeJob(job: AgentJob) {
@@ -3072,9 +3103,15 @@ function formatJobSummaryLine(job: ReturnType<typeof summarizeJob>): string {
   ].filter(Boolean).join(" ");
 }
 
-function formatCompactPollResult(job: AgentJob, sinceSeq: number, nextSeq: number): string {
+function formatCompactPollResult(job: AgentJob, sinceSeq: number, nextSeq: number, logWindow: LogWindow): string {
   const newEventCount = job.logs.filter((entry) => entry.seq > sinceSeq).length;
-  const lines = [formatJobSummaryLine(summarizeJob(job)), `nextSeq: ${nextSeq}; newEvents: ${newEventCount}`];
+  const windowText = logWindow.logWindowStartSeq === undefined
+    ? "empty"
+    : `${logWindow.logWindowStartSeq}-${logWindow.logWindowEndSeq}`;
+  const lines = [formatJobSummaryLine(summarizeJob(job)), `nextSeq: ${nextSeq}; newEvents: ${newEventCount}; logWindow: ${windowText}`];
+  if (logWindow.cursorExpired) {
+    lines.push(`warning: sinceSeq ${sinceSeq} predates retained logs; older events are no longer available. Restart from logWindowStartSeq ${logWindow.logWindowStartSeq}.`);
+  }
 
   if (job.status === "running") {
     const latest = job.latestAssistantText || latestLogPreview(job) || "waiting for output";
@@ -3089,10 +3126,16 @@ function formatCompactPollResult(job: AgentJob, sinceSeq: number, nextSeq: numbe
   return lines.join("\n");
 }
 
-function formatPollResult(job: AgentJob, logs: AgentLogEntry[], nextSeq: number, includeFullOutput: boolean, hasMoreLogs = false): string {
+function formatPollResult(job: AgentJob, logs: AgentLogEntry[], nextSeq: number, includeFullOutput: boolean, logWindow: LogWindow): string {
   const lines: string[] = [];
   lines.push(formatJobSummaryLine(summarizeJob(job)));
-  lines.push(`nextSeq: ${nextSeq}${hasMoreLogs ? " (more logs available; poll again with this sinceSeq)" : ""}`);
+  const windowText = logWindow.logWindowStartSeq === undefined
+    ? "empty"
+    : `${logWindow.logWindowStartSeq}-${logWindow.logWindowEndSeq}`;
+  lines.push(`nextSeq: ${nextSeq}${logWindow.logsTruncated ? " (more logs available; poll again with this sinceSeq)" : ""}; logWindow: ${windowText}`);
+  if (logWindow.cursorExpired) {
+    lines.push(`warning: sinceSeq predates retained logs; cursor expired and older events are no longer available. Restart from logWindowStartSeq ${logWindow.logWindowStartSeq}.`);
+  }
   if (job.errorMessage && job.status !== "running") lines.push(`error: ${job.errorMessage}`);
   lines.push("");
   lines.push(logs.length === 0 ? "(no new logs)" : logs.map(formatLogEntry).join("\n"));
@@ -3321,6 +3364,9 @@ export const __subagentsTest = {
   callbackMarkerPath,
   removeCallbackMarker,
   removePersistedJobFiles,
+  getLogWindow,
+  formatCompactPollResult,
+  formatPollResult,
   flushPendingFinishedCallbacks,
   setCallbackHarness(api: ExtensionAPI | undefined, ctx: ExtensionContext | undefined) {
     extensionApi = api;
