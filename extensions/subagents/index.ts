@@ -899,7 +899,9 @@ async function startAgentJob(
     }
   }
   if (worktreePrep.warning) addLog(job, "error", worktreePrep.warning, "worktree");
-  addLog(job, "info", `starting: ${displayCommand(invocation.command, invocation.args)} (cwd: ${cwd})`, "start");
+  const commandLine = displayCommand(invocation.command, invocation.args);
+  const childCommandLine = `${SUBAGENT_CHILD_ENV}=1 ${commandLine}`;
+  addLog(job, "info", `starting: ${childCommandLine} (cwd: ${cwd})`, "start");
 
   try {
     ensureJobStoreDirs();
@@ -908,8 +910,6 @@ async function startAgentJob(
     fs.rmSync(job.exitCodePath!, { force: true });
 
     const shell = "/bin/sh";
-    const commandLine = displayCommand(invocation.command, invocation.args);
-    const childCommandLine = `${SUBAGENT_CHILD_ENV}=1 ${commandLine}`;
     const script = [
       `umask 077`,
       `${childCommandLine} > ${shellQuote(job.stdoutPath!)} 2> ${shellQuote(job.stderrPath!)}`,
