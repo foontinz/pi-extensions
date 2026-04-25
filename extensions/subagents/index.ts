@@ -3584,6 +3584,9 @@ export const __subagentsTest = {
     clearCallbackFlushTimer();
     clearStatusRefreshTimer();
   },
+  resetTmuxAvailabilityCache() {
+    tmuxAvailabilityCache = undefined;
+  },
   forgetJobForCallbackRetry(id: string) {
     jobs.delete(id);
   },

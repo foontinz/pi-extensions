@@ -37,6 +37,94 @@ function textOf(result: any): string {
   return result.content?.map((part: any) => part.text ?? "").join("\n") ?? "";
 }
 
+function createFakeTmux(config: Record<string, unknown> = {}) {
+  const binDir = fs.mkdtempSync(path.join(tmpRoot, "fake-tmux-bin-"));
+  const statePath = path.join(binDir, "state.json");
+  const initialState = { sessions: {}, sendKeysOk: true, killOk: true, ...config };
+  fs.writeFileSync(statePath, JSON.stringify(initialState), "utf-8");
+  const tmuxPath = path.join(binDir, "tmux");
+  fs.writeFileSync(tmuxPath, `#!/usr/bin/env node
+const fs = require("node:fs");
+const statePath = ${JSON.stringify(statePath)};
+function readState() { return JSON.parse(fs.readFileSync(statePath, "utf-8")); }
+function writeState(state) { fs.writeFileSync(statePath, JSON.stringify(state), "utf-8"); }
+function valueAfter(args, flag) { const index = args.indexOf(flag); return index >= 0 ? args[index + 1] : undefined; }
+function exitPathFromScript(script) {
+  const quoted = [...script.matchAll(/> '([^']+\\.exit)'/g)];
+  if (quoted.length > 0) return quoted[quoted.length - 1][1];
+  const unquoted = [...script.matchAll(/> ([^ ;]+\\.exit)/g)];
+  return unquoted.length > 0 ? unquoted[unquoted.length - 1][1] : undefined;
+}
+const args = process.argv.slice(2);
+const command = args[0];
+let state = readState();
+if (command === "-V") { console.log("tmux 3.4-fake"); process.exit(0); }
+if (command === "new-session") {
+  const session = valueAfter(args, "-s");
+  const cwd = valueAfter(args, "-c");
+  const script = args[args.length - 1] || "";
+  if (!session || state.newSessionOk === false) process.exit(1);
+  state.sessions[session] = { cwd, script, exitCodePath: exitPathFromScript(script) };
+  writeState(state);
+  process.exit(0);
+}
+if (command === "has-session") {
+  const session = valueAfter(args, "-t");
+  process.exit(session && state.sessions[session] ? 0 : 1);
+}
+if (command === "list-sessions") {
+  for (const session of Object.keys(state.sessions)) console.log(session);
+  process.exit(0);
+}
+if (command === "send-keys") {
+  const session = valueAfter(args, "-t");
+  if (!session || !state.sessions[session] || state.sendKeysOk === false) process.exit(1);
+  if (state.exitOnSendKeys) {
+    const exitPath = state.sessions[session].exitCodePath;
+    if (exitPath) fs.writeFileSync(exitPath, String(state.exitOnSendKeysCode ?? 130) + "\\n", "utf-8");
+    delete state.sessions[session];
+    writeState(state);
+  }
+  process.exit(0);
+}
+if (command === "kill-session") {
+  const session = valueAfter(args, "-t");
+  if (!session || !state.sessions[session] || state.killOk === false) process.exit(1);
+  if (state.exitOnKill) {
+    const exitPath = state.sessions[session].exitCodePath;
+    if (exitPath) fs.writeFileSync(exitPath, String(state.exitOnKillCode ?? 137) + "\\n", "utf-8");
+  }
+  delete state.sessions[session];
+  writeState(state);
+  process.exit(0);
+}
+process.exit(1);
+`, { mode: 0o755 });
+  return {
+    binDir,
+    statePath,
+    readState() {
+      return JSON.parse(fs.readFileSync(statePath, "utf-8"));
+    },
+    setState(patch: Record<string, unknown>) {
+      fs.writeFileSync(statePath, JSON.stringify({ ...this.readState(), ...patch }), "utf-8");
+    },
+  };
+}
+
+async function withFakeTmux<T>(config: Record<string, unknown>, action: (fake: ReturnType<typeof createFakeTmux>) => Promise<T>): Promise<T> {
+  const fake = createFakeTmux(config);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${fake.binDir}${path.delimiter}${previousPath ?? ""}`;
+  __subagentsTest.resetTmuxAvailabilityCache();
+  try {
+    return await action(fake);
+  } finally {
+    process.env.PATH = previousPath;
+    __subagentsTest.resetTmuxAvailabilityCache();
+  }
+}
+
 function makeJob(overrides: Record<string, any> = {}) {
   const now = overrides.startedAt ?? 1_700_000_000_000;
   const id = overrides.id ?? "agent_contract_1";
@@ -227,6 +315,7 @@ test("run_agent characterizes public refusal paths before launch", async () => {
 test("run_agent pre-start failure returns a failed job contract when tmux is unavailable", async () => {
   const previousPath = process.env.PATH;
   process.env.PATH = fs.mkdtempSync(path.join(tmpRoot, "empty-path-"));
+  __subagentsTest.resetTmuxAvailabilityCache();
   try {
     const result = await tools.get("run_agent")!.execute("call", { task: "x", label: "no tmux", worktree: false }, new AbortController().signal, () => {}, ctx);
     assert.match(textOf(result), /^Failed to start background agent agent_/);
@@ -239,5 +328,64 @@ test("run_agent pre-start failure returns a failed job contract when tmux is una
     assert.match(result.details.errorMessage, /(tmux is required|spawn tmux ENOENT)/);
   } finally {
     process.env.PATH = previousPath;
+    __subagentsTest.resetTmuxAvailabilityCache();
   }
+});
+
+test("run_agent successful start text/details are characterized with fake tmux", async () => {
+  await withFakeTmux({}, async (fake) => {
+    const result = await tools.get("run_agent")!.execute("call", { task: "successful fake start", label: "fake success", worktree: false, timeoutMs: 0 }, new AbortController().signal, () => {}, ctx);
+    assert.match(textOf(result), /^Started background agent agent_/);
+    assert.match(textOf(result), /Status: running/);
+    assert.match(textOf(result), /Label: fake success/);
+    assert.match(textOf(result), /Supervisor: tmux \(pi-agent_/);
+    assert.match(textOf(result), /Tools: find, grep, ls, read/);
+    assert.match(textOf(result), /Attach: tmux attach -t pi-agent_/);
+    assert.match(textOf(result), new RegExp(`CWD: ${cwd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+    assert.match(textOf(result), /Poll later with: poll_agent\(\{ id: "agent_/);
+    assert.equal(result.details.status, "running");
+    assert.equal(result.details.phase, "running");
+    assert.equal(result.details.label, "fake success");
+    assert.equal(result.details.cwd, cwd);
+    assert.equal(result.details.worktree, undefined);
+    assert.ok(fake.readState().sessions[result.details.tmuxSession]);
+  });
+});
+
+test("stop_agent running job Ctrl-C path finalizes when fake tmux writes an exit code", async () => {
+  await withFakeTmux({ exitOnSendKeys: true, exitOnSendKeysCode: 130 }, async () => {
+    const started = await tools.get("run_agent")!.execute("call", { task: "stop me", label: "stop ctrl-c", worktree: false, timeoutMs: 0 }, new AbortController().signal, () => {}, ctx);
+    const result = await tools.get("stop_agent")!.execute("call", { id: started.details.id, reason: "test stop", waitMs: 100 }, new AbortController().signal, () => {}, ctx);
+    assert.match(textOf(result), /^Stopped agent agent_/);
+    assert.match(textOf(result), /Output drained before finalizing:/);
+    assert.equal(result.details.status, "cancelled");
+    assert.equal(result.details.phase, "cancelled");
+    assert.equal(result.details.exitCode, 130);
+    assert.equal(result.details.stopReason, "test stop");
+  });
+});
+
+test("stop_agent hard-kill fallback after waitMs is characterized", async () => {
+  await withFakeTmux({}, async (fake) => {
+    const started = await tools.get("run_agent")!.execute("call", { task: "hard kill me", label: "hard kill", worktree: false, timeoutMs: 0 }, new AbortController().signal, () => {}, ctx);
+    const result = await tools.get("stop_agent")!.execute("call", { id: started.details.id, reason: "force stop", waitMs: 0 }, new AbortController().signal, () => {}, ctx);
+    assert.match(textOf(result), /^Stopped agent agent_/);
+    assert.equal(result.details.status, "cancelled");
+    assert.equal(result.details.phase, "cancelled");
+    assert.equal(result.details.stopReason, "force stop");
+    assert.equal(fake.readState().sessions[started.details.tmuxSession], undefined);
+  });
+});
+
+test("stop_agent tmux kill failure keeps job running and reports failure text", async () => {
+  await withFakeTmux({ sendKeysOk: false, killOk: false }, async (fake) => {
+    const started = await tools.get("run_agent")!.execute("call", { task: "unstoppable", label: "kill fails", worktree: false, timeoutMs: 0 }, new AbortController().signal, () => {}, ctx);
+    const result = await tools.get("stop_agent")!.execute("call", { id: started.details.id, reason: "cannot stop", waitMs: 0 }, new AbortController().signal, () => {}, ctx);
+    assert.match(textOf(result), /^Failed to stop agent agent_/);
+    assert.match(textOf(result), /it is still marked running/);
+    assert.match(textOf(result), /Check logs and tmux session pi-agent_/);
+    assert.equal(result.details.status, "running");
+    assert.equal(result.details.phase, "stopping");
+    assert.ok(fake.readState().sessions[started.details.tmuxSession]);
+  });
 });
