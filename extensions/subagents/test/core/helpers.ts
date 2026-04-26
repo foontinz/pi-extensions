@@ -13,6 +13,14 @@ export function makeRecord(overrides: Partial<JobRecord> = {}): JobRecord {
   const base: JobRecord = {
     schemaVersion: JOB_RECORD_SCHEMA_VERSION,
     id: "job-1",
+    owner: {
+      version: 1,
+      id: "owner-test",
+      instanceId: "instance-test",
+      sessionId: "session-test",
+      parentPid: process.pid,
+      cwd: "/repo",
+    },
     label: "job",
     task: "do work",
     sourceCwd: "/repo",

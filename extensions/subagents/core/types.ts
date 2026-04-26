@@ -1,6 +1,16 @@
-export const JOB_RECORD_SCHEMA_VERSION = 1 as const;
+export const JOB_RECORD_SCHEMA_VERSION = 2 as const;
 
 export type JobId = string;
+
+export interface JobOwnerInfo {
+  version: 1;
+  id: string;
+  instanceId: string;
+  sessionId: string;
+  sessionFile?: string;
+  parentPid: number;
+  cwd: string;
+}
 
 export type JobPhase =
   | "created"
@@ -121,6 +131,7 @@ export interface JobRecord {
   schemaVersion: typeof JOB_RECORD_SCHEMA_VERSION;
 
   id: JobId;
+  owner: JobOwnerInfo;
   label: string;
   task: string;
 

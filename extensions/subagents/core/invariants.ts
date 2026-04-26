@@ -3,6 +3,7 @@ import {
   JOB_RECORD_SCHEMA_VERSION,
   type CleanupPhase,
   type DurableLogLevel,
+  type JobOwnerInfo,
   type JobPhase,
   type JobRecord,
   type JobTransition,
@@ -51,6 +52,7 @@ const USAGE_KEYS: Array<keyof UsageStats> = ["input", "output", "cacheRead", "ca
 const JOB_RECORD_KEYS = new Set([
   "schemaVersion",
   "id",
+  "owner",
   "label",
   "task",
   "sourceCwd",
@@ -70,6 +72,7 @@ const JOB_RECORD_KEYS = new Set([
   "usage",
   "observability",
 ]);
+const OWNER_KEYS = new Set(["version", "id", "instanceId", "sessionId", "sessionFile", "parentPid", "cwd"]);
 const LOG_CURSOR_KEYS = new Set(["stdoutOffset", "stderrOffset", "nextSeq"]);
 const SUPERVISOR_INFO_KEYS = new Set(["kind", "pid", "command", "args", "tmuxSession", "stdoutPath", "stderrPath", "exitCodePath"]);
 const WORKTREE_KEYS = new Set(["root", "tempParent", "originalRoot", "originalCwd", "configPath", "base", "copied", "postCopy", "keepWorktree", "retained"]);
@@ -122,6 +125,7 @@ export function assertJobRecordInvariants(value: unknown): asserts value is JobR
     throw invariant(`unsupported job record schemaVersion ${String(value.schemaVersion)}`);
   }
   assertNonEmptyString(value.id, "id");
+  assertOwner(value.owner);
   assertString(value.label, "label");
   assertString(value.task, "task");
   assertNonEmptyString(value.sourceCwd, "sourceCwd");
@@ -223,6 +227,18 @@ export function assertNoRuntimeFields(value: unknown, path = "$", seen = new Wea
     }
     assertNoRuntimeFields(child, `${path}.${key}`, seen);
   }
+}
+
+function assertOwner(value: unknown): asserts value is JobOwnerInfo {
+  if (!isRecord(value)) throw invariant("owner must be an object");
+  assertAllowedKeys(value, OWNER_KEYS, "owner");
+  if (value.version !== 1) throw invariant(`invalid owner.version ${String(value.version)}`);
+  assertNonEmptyString(value.id, "owner.id");
+  assertNonEmptyString(value.instanceId, "owner.instanceId");
+  assertNonEmptyString(value.sessionId, "owner.sessionId");
+  if (value.sessionFile !== undefined) assertString(value.sessionFile, "owner.sessionFile");
+  assertNonNegativeInteger(value.parentPid, "owner.parentPid");
+  assertNonEmptyString(value.cwd, "owner.cwd");
 }
 
 function assertLogCursor(value: unknown): void {

@@ -32,7 +32,15 @@ function registerTools(activeTools = ["read", "grep", "find", "ls"]): Map<string
 
 const tools = registerTools();
 const cwd = fs.mkdtempSync(path.join(tmpRoot, "cwd-"));
-const ctx = { cwd, hasUI: false };
+const ctx = {
+  cwd,
+  hasUI: false,
+  sessionManager: {
+    getSessionId: () => "session-contract",
+    getSessionFile: () => path.join(tmpRoot, "session-contract.jsonl"),
+  },
+};
+__subagentsTest.bindOwnerToContext(ctx as any);
 
 function textOf(result: any): string {
   return result.content?.map((part: any) => part.text ?? "").join("\n") ?? "";
@@ -205,6 +213,7 @@ function makeJob(overrides: Record<string, any> = {}) {
   const record = {
     schemaVersion: JOB_RECORD_SCHEMA_VERSION,
     id,
+    owner: overrides.owner ?? __subagentsTest.getCurrentOwner()!,
     label: overrides.label ?? "contract job",
     task: overrides.task ?? "do contract work",
     sourceCwd: overrides.sourceCwd ?? cwd,
@@ -221,6 +230,7 @@ function makeJob(overrides: Record<string, any> = {}) {
   };
   return {
     record,
+    owner: record.owner,
     id,
     label: record.label,
     task: record.task,
@@ -628,7 +638,7 @@ test("stop_agent tmux unavailable during stop reports failure and keeps job runn
 });
 
 test("poll_agent surfaces and quarantines corrupt and unsupported persisted records", async () => {
-  const jobsDir = path.join(process.env.PI_SUBAGENTS_STORE_DIR!, "jobs");
+  const jobsDir = path.dirname(__subagentsTest.callbackMarkerPath("agent_callback"));
   fs.mkdirSync(jobsDir, { recursive: true });
   const corruptPath = path.join(jobsDir, "agent_bad_corrupt.json");
   const unsupportedPath = path.join(jobsDir, "agent_future_schema.json");
@@ -653,7 +663,7 @@ test("poll_agent surfaces and quarantines corrupt and unsupported persisted reco
 });
 
 test("poll_agent surfaces job-specific persisted-record warnings", async () => {
-  const jobsDir = path.join(process.env.PI_SUBAGENTS_STORE_DIR!, "jobs");
+  const jobsDir = path.dirname(__subagentsTest.callbackMarkerPath("agent_specific"));
   fs.mkdirSync(jobsDir, { recursive: true });
   const badPath = path.join(jobsDir, "agent_specific.json");
   fs.writeFileSync(badPath, "{bad", "utf-8");
@@ -701,6 +711,25 @@ test("new session load stops orphan persisted running jobs instead of adopting t
   });
 });
 
+test("session_start for a different session stops old owner jobs before rebinding", async () => {
+  await withFakeTmux({}, async (fake) => {
+    const started = await tools.get("run_agent")!.execute("call", { task: "old owner", label: "old owner", worktree: false, timeoutMs: 0 }, new AbortController().signal, () => {}, ctx);
+    assert.ok(fake.readState().sessions[started.details.tmuxSession]);
+
+    const nextCtx = {
+      ...ctx,
+      sessionManager: {
+        getSessionId: () => "session-contract-next",
+        getSessionFile: () => path.join(tmpRoot, "session-contract-next.jsonl"),
+      },
+    };
+    await __subagentsTest.handleSubagentsSessionStart(nextCtx as any);
+
+    assert.equal(fake.readState().sessions[started.details.tmuxSession], undefined);
+    assert.equal(__subagentsTest.getJob(started.details.id), undefined);
+  });
+});
+
 test("subagent child detection recognizes env marker and json no-session argv", () => {
   const previousEnv = process.env.PI_SUBAGENTS_CHILD;
   const previousArgv = [...process.argv];
@@ -720,4 +749,39 @@ test("subagent child detection recognizes env marker and json no-session argv", 
     else process.env.PI_SUBAGENTS_CHILD = previousEnv;
     process.argv.splice(0, process.argv.length, ...previousArgv);
   }
+});
+
+test("poll_agent does not hydrate persisted jobs from another pi owner", async () => {
+  const activeOwner = __subagentsTest.bindOwnerToContext(ctx as any);
+  const foreignOwner = __subagentsTest.makeTestOwner(`owner_foreign_store_${Date.now()}`);
+
+  __subagentsTest.setOwnerHarness(foreignOwner);
+  const foreignJobsDir = path.dirname(__subagentsTest.callbackMarkerPath("agent_foreign_owner"));
+  fs.mkdirSync(foreignJobsDir, { recursive: true });
+  const foreignJob = makeJob({ id: "agent_foreign_owner", owner: foreignOwner });
+  fs.writeFileSync(path.join(foreignJobsDir, "agent_foreign_owner.json"), JSON.stringify(foreignJob.record), "utf-8");
+
+  __subagentsTest.setOwnerHarness(activeOwner);
+  __subagentsTest.clearJobs();
+
+  const result = await tools.get("poll_agent")!.execute("call", {}, new AbortController().signal, () => {}, ctx);
+  assert.match(textOf(result), /No background agent jobs are known/);
+  assert.equal(result.details.jobs.some((job: any) => job.id === "agent_foreign_owner"), false);
+});
+
+test("legacy unscoped store cleanup removes root-layout files and kills matching tmux sessions", async () => {
+  await withFakeTmux({ sessions: { "pi-agent_legacy_root": { cwd, script: "" } } }, async (fake) => {
+    const legacyJobsDir = path.join(process.env.PI_SUBAGENTS_STORE_DIR!, "jobs");
+    const legacyLogsDir = path.join(process.env.PI_SUBAGENTS_STORE_DIR!, "logs");
+    fs.mkdirSync(legacyJobsDir, { recursive: true });
+    fs.mkdirSync(legacyLogsDir, { recursive: true });
+    fs.writeFileSync(path.join(legacyJobsDir, "agent_legacy_root.json"), JSON.stringify({ legacy: true }), "utf-8");
+    fs.writeFileSync(path.join(legacyLogsDir, "agent_legacy_root.stdout.jsonl"), "", "utf-8");
+
+    __subagentsTest.cleanupLegacyRootStore();
+
+    assert.equal(fs.existsSync(legacyJobsDir), false);
+    assert.equal(fs.existsSync(legacyLogsDir), false);
+    assert.equal(fake.readState().sessions["pi-agent_legacy_root"], undefined);
+  });
 });

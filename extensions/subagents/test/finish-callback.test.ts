@@ -5,8 +5,11 @@ import { __subagentsTest } from "../index.js";
 
 function makeFinishedJob(overrides: Record<string, unknown> = {}) {
   const id = `agent_callback_test_${process.pid}_${Math.random().toString(16).slice(2)}`;
+  const owner = (overrides.owner as any) ?? __subagentsTest.getCurrentOwner() ?? __subagentsTest.makeTestOwner(`owner_callback_${process.pid}`);
+  if (!__subagentsTest.getCurrentOwner()) __subagentsTest.setOwnerHarness(owner);
   return {
     id,
+    owner,
     label: "reviewer",
     task: "review code",
     cwd: "/repo",
@@ -77,6 +80,7 @@ test("finish callback sends a follow-up user message when the main agent is idle
   } finally {
     __subagentsTest.removeCallbackMarker(job.id);
     __subagentsTest.setCallbackHarness(undefined, undefined);
+    __subagentsTest.setOwnerHarness(undefined);
   }
 });
 
@@ -95,6 +99,7 @@ test("finish callback steers while the main agent is busy and deduplicates by ma
   } finally {
     __subagentsTest.removeCallbackMarker(job.id);
     __subagentsTest.setCallbackHarness(undefined, undefined);
+    __subagentsTest.setOwnerHarness(undefined);
   }
 });
 
@@ -114,6 +119,7 @@ test("finish callback wraps injection-like output as untrusted data", () => {
   } finally {
     __subagentsTest.removeCallbackMarker(job.id);
     __subagentsTest.setCallbackHarness(undefined, undefined);
+    __subagentsTest.setOwnerHarness(undefined);
   }
 });
 
@@ -137,6 +143,7 @@ test("finish callbacks are stacked into one main-agent message", () => {
     __subagentsTest.removeCallbackMarker(first.id);
     __subagentsTest.removeCallbackMarker(second.id);
     __subagentsTest.setCallbackHarness(undefined, undefined);
+    __subagentsTest.setOwnerHarness(undefined);
   }
 });
 
@@ -154,6 +161,7 @@ test("finish callback is suppressed when no interactive UI context is available"
   } finally {
     __subagentsTest.removeCallbackMarker(job.id);
     __subagentsTest.setCallbackHarness(undefined, undefined);
+    __subagentsTest.setOwnerHarness(undefined);
   }
 });
 
@@ -179,6 +187,7 @@ test("finish callback keeps pending marker when delivery fails so a later attemp
   } finally {
     __subagentsTest.removeCallbackMarker(job.id);
     __subagentsTest.setCallbackHarness(undefined, undefined);
+    __subagentsTest.setOwnerHarness(undefined);
   }
 });
 
@@ -203,6 +212,7 @@ test("pending finish callback marker is retried after an interrupted delivery", 
     __subagentsTest.forgetJobForCallbackRetry(job.id);
     __subagentsTest.removeCallbackMarker(job.id);
     __subagentsTest.setCallbackHarness(undefined, undefined);
+    __subagentsTest.setOwnerHarness(undefined);
   }
 });
 
@@ -225,5 +235,26 @@ test("removing persisted job files also removes the callback marker", () => {
   } finally {
     __subagentsTest.removeCallbackMarker(job.id);
     __subagentsTest.setCallbackHarness(undefined, undefined);
+    __subagentsTest.setOwnerHarness(undefined);
+  }
+});
+test("finish callback ignores jobs owned by another pi instance/session", () => {
+  const activeOwner = __subagentsTest.makeTestOwner(`owner_active_${process.pid}`);
+  const foreignOwner = __subagentsTest.makeTestOwner(`owner_foreign_${process.pid}`);
+  __subagentsTest.setOwnerHarness(activeOwner);
+  const job = makeFinishedJob({ owner: foreignOwner });
+  const harness = makeHarness(true);
+  try {
+    __subagentsTest.setCallbackHarness(harness.api, harness.ctx);
+
+    __subagentsTest.notifyMainAgentOfFinishedJob(job);
+    __subagentsTest.flushPendingFinishedCallbacks();
+
+    assert.equal(harness.sent.length, 0);
+    assert.equal(__subagentsTest.readCallbackMarker(job.id), undefined);
+  } finally {
+    __subagentsTest.removeCallbackMarker(job.id);
+    __subagentsTest.setCallbackHarness(undefined, undefined);
+    __subagentsTest.setOwnerHarness(undefined);
   }
 });

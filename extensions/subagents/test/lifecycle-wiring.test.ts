@@ -7,6 +7,14 @@ function makeLegacyJob(overrides: Record<string, unknown> = {}) {
   const record = {
     schemaVersion: JOB_RECORD_SCHEMA_VERSION,
     id: "agent_test_1",
+    owner: {
+      version: 1,
+      id: "owner-test",
+      instanceId: "instance-test",
+      sessionId: "session-test",
+      parentPid: process.pid,
+      cwd: "/repo",
+    },
     label: "test",
     task: "task",
     sourceCwd: "/repo",
@@ -29,6 +37,7 @@ function makeLegacyJob(overrides: Record<string, unknown> = {}) {
   };
   return {
     record,
+    owner: record.owner,
     id: "agent_test_1",
     label: "test",
     task: "task",

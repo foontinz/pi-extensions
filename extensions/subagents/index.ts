@@ -35,6 +35,7 @@ import {
   type CleanupPhase,
   type DurableLogEntry,
   type JobEvent,
+  type JobOwnerInfo,
   type JobPhase,
   type JobRecord,
   type PendingTerminalInfo,
@@ -85,16 +86,15 @@ const POST_COPY_PRESERVED_ENV_KEYS = [
   "LC_ALL",
   "TERM",
 ] as const;
-const JOB_STORE_DIR = process.env.PI_SUBAGENTS_STORE_DIR
+const JOB_STORE_ROOT = process.env.PI_SUBAGENTS_STORE_DIR
   ? path.resolve(process.env.PI_SUBAGENTS_STORE_DIR)
   : path.join(os.homedir(), ".pi", "agent", "subagents");
-const JOBS_DIR = path.join(JOB_STORE_DIR, "jobs");
-const LOGS_DIR = path.join(JOB_STORE_DIR, "logs");
+const JOB_OWNERS_DIR = path.join(JOB_STORE_ROOT, "owners");
 const JOB_LOCK_STALE_MS = 5 * 60_000;
 const JOB_LOCK_WAIT_MS = 2_000;
 const WORKTREE_CONFIG_PATH = path.join(".pi", "worktree.json");
 const POST_COPY_TRUST_STORE_PATH_ENV = "PI_SUBAGENTS_POSTCOPY_TRUST_STORE";
-const POST_COPY_TRUST_STORE_PATH = path.join(JOB_STORE_DIR, "trusted-postcopy.json");
+const POST_COPY_TRUST_STORE_PATH = path.join(JOB_STORE_ROOT, "trusted-postcopy.json");
 const DEFAULT_SUBAGENT_TOOLS = ["read", "grep", "find", "ls"] as const;
 const SUBAGENT_CHILD_ENV = "PI_SUBAGENTS_CHILD";
 
@@ -205,6 +205,7 @@ interface WorktreeInfo {
 
 interface AgentJob {
   record: JobRecord;
+  owner: JobOwnerInfo;
   id: string;
   label: string;
   agent?: string;
@@ -288,7 +289,16 @@ interface PollDetails {
   hasMoreLogs?: boolean;
 }
 
+interface JobStorePaths {
+  root: string;
+  jobsDir: string;
+  logsDir: string;
+}
+
+const INSTANCE_ID_SYMBOL = Symbol.for("pi.subagents.instanceId");
 const jobs = new Map<string, AgentJob>();
+let currentOwner: JobOwnerInfo | undefined;
+let currentStorePaths: JobStorePaths | undefined;
 let extensionApi: ExtensionAPI | undefined;
 let statusContext: ExtensionContext | undefined;
 let statusRefreshTimer: NodeJS.Timeout | undefined;
@@ -391,17 +401,127 @@ const StopAgentParams = Type.Object({
   ),
 });
 
+function getSubagentsInstanceId(): string {
+  const globalState = globalThis as typeof globalThis & { [INSTANCE_ID_SYMBOL]?: string };
+  if (!globalState[INSTANCE_ID_SYMBOL]) {
+    globalState[INSTANCE_ID_SYMBOL] = `${process.pid.toString(36)}_${randomBytes(8).toString("hex")}`;
+  }
+  return globalState[INSTANCE_ID_SYMBOL]!;
+}
+
+function ownerIdFor(instanceId: string, sessionId: string): string {
+  const digest = createHash("sha256").update(instanceId).update("\0").update(sessionId).digest("hex").slice(0, 16);
+  return `owner_${digest}`;
+}
+
+function makeOwner(ctx: ExtensionContext): JobOwnerInfo {
+  const instanceId = getSubagentsInstanceId();
+  const sessionId = ctx.sessionManager.getSessionId();
+  return {
+    version: 1,
+    id: ownerIdFor(instanceId, sessionId),
+    instanceId,
+    sessionId,
+    sessionFile: ctx.sessionManager.getSessionFile(),
+    parentPid: process.pid,
+    cwd: ctx.cwd,
+  };
+}
+
+function storePathsForOwner(owner: JobOwnerInfo): JobStorePaths {
+  const root = path.join(JOB_OWNERS_DIR, owner.id);
+  return { root, jobsDir: path.join(root, "jobs"), logsDir: path.join(root, "logs") };
+}
+
+function bindOwner(owner: JobOwnerInfo): JobOwnerInfo {
+  if (currentOwner?.id !== owner.id) {
+    clearInMemoryJobs();
+    currentOwner = owner;
+    currentStorePaths = storePathsForOwner(owner);
+  }
+  return owner;
+}
+
+function bindOwnerToContext(ctx: ExtensionContext): JobOwnerInfo {
+  return bindOwner(makeOwner(ctx));
+}
+
+function requireCurrentOwner(): JobOwnerInfo {
+  if (!currentOwner) throw new Error("subagents owner is not initialized for this Pi session");
+  return currentOwner;
+}
+
+function requireStorePaths(): JobStorePaths {
+  if (!currentStorePaths) throw new Error("subagents job store is not initialized for this Pi session");
+  return currentStorePaths;
+}
+
+function ownerMatchesCurrent(owner: JobOwnerInfo | undefined): boolean {
+  return Boolean(owner && currentOwner && owner.id === currentOwner.id);
+}
+
+function jobBelongsToCurrentOwner(job: AgentJob): boolean {
+  return ownerMatchesCurrent(job.owner);
+}
+
+function clearInMemoryJobs(): void {
+  for (const job of jobs.values()) {
+    if (job.timeout) clearTimeout(job.timeout);
+    if (job.killTimer) clearTimeout(job.killTimer);
+    if (job.monitorTimer) clearInterval(job.monitorTimer);
+  }
+  jobs.clear();
+  storeWarnings.length = 0;
+  pendingFinishedCallbacks.clear();
+  clearCallbackFlushTimer();
+  clearStatusRefreshTimer();
+}
+
+function cleanupLegacyRootStore(): void {
+  const legacyJobsDir = path.join(JOB_STORE_ROOT, "jobs");
+  const legacyLogsDir = path.join(JOB_STORE_ROOT, "logs");
+  if (!fs.existsSync(legacyJobsDir) && !fs.existsSync(legacyLogsDir)) return;
+
+  const ids = new Set<string>();
+  try {
+    for (const fileName of fs.existsSync(legacyJobsDir) ? fs.readdirSync(legacyJobsDir) : []) {
+      if (fileName.endsWith(".json") && !fileName.endsWith(".callback.json")) ids.add(fileName.slice(0, -".json".length));
+    }
+    for (const fileName of fs.existsSync(legacyLogsDir) ? fs.readdirSync(legacyLogsDir) : []) {
+      for (const suffix of [".stdout.jsonl", ".stderr.log", ".exit"] as const) {
+        if (fileName.endsWith(suffix)) ids.add(fileName.slice(0, -suffix.length));
+      }
+    }
+    for (const id of ids) runTmuxSync(["kill-session", "-t", tmuxSessionName(id)]);
+    fs.rmSync(legacyJobsDir, { recursive: true, force: true });
+    fs.rmSync(legacyLogsDir, { recursive: true, force: true });
+    recordStoreWarning({ path: JOB_STORE_ROOT, kind: "persistence", message: `removed legacy unscoped subagent store (${ids.size} possible job(s))` });
+  } catch (error) {
+    recordStoreWarning({ path: JOB_STORE_ROOT, kind: "persistence", message: `failed to remove legacy unscoped subagent store: ${errorMessage(error)}` });
+  }
+}
+
+async function handleSubagentsSessionStart(ctx: ExtensionContext): Promise<void> {
+  if (isSubagentChildProcess()) return;
+  const nextOwner = makeOwner(ctx);
+  if (currentOwner && currentOwner.id !== nextOwner.id) {
+    await stopRunningJobsForOwner(currentOwner.id, "cancelled because subagents are bounded to the parent Pi session and the previous session ended", 0);
+  }
+  bindOwner(nextOwner);
+  statusContext = ctx;
+  cleanupLegacyRootStore();
+  loadPersistedJobs();
+  await stopRunningJobsForSessionBoundary("cancelled because subagents are bounded to the parent Pi session and the previous session ended", 0);
+  refreshRunningTmuxJobs();
+  scheduleRunningJobTimeouts();
+  refreshSubagentStatus();
+}
+
 export default function subagentsExtension(pi: ExtensionAPI) {
   extensionApi = pi;
 
   pi.on("session_start", async (_event, ctx) => {
-    if (isSubagentChildProcess()) return;
-    statusContext = ctx;
-    loadPersistedJobs();
-    await stopRunningJobsForSessionBoundary("cancelled because subagents are bounded to the parent Pi session and the previous session ended", 0);
-    refreshRunningTmuxJobs();
-    scheduleRunningJobTimeouts();
-    refreshSubagentStatus();
+    await handleSubagentsSessionStart(ctx);
   });
 
   pi.registerTool({
@@ -429,6 +549,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     parameters: RunAgentParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      bindOwnerToContext(ctx);
       if (ctx.hasUI) statusContext = ctx;
       loadPersistedJobs();
       refreshRunningTmuxJobs();
@@ -538,13 +659,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     parameters: PollAgentParams,
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      bindOwnerToContext(ctx);
       if (ctx?.hasUI) statusContext = ctx;
       loadPersistedJobs();
       refreshRunningTmuxJobs();
       retryPendingWorktreeCleanups();
       refreshSubagentStatus();
       if (!params.id) {
-        const summaries = [...jobs.values()].map(summarizeJob).sort((a, b) => b.startedAt - a.startedAt);
+        const summaries = [...jobs.values()].filter(jobBelongsToCurrentOwner).map(summarizeJob).sort((a, b) => b.startedAt - a.startedAt);
         const baseText = summaries.length === 0
           ? "No background agent jobs are known in this Pi session."
           : summaries.map(formatJobSummaryLine).join("\n");
@@ -554,12 +676,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
 
       const job = jobs.get(params.id);
-      if (!job) {
-        const known = [...jobs.keys()].join(", ") || "none";
+      if (!job || !jobBelongsToCurrentOwner(job)) {
+        const known = [...jobs.values()].filter(jobBelongsToCurrentOwner).map((job) => job.id).join(", ") || "none";
         const warnings = recentStoreWarnings();
         return {
           content: [{ type: "text", text: appendStoreWarnings(`Unknown agent job id: ${params.id}. Known ids: ${known}`, warnings) }],
-          details: { id: params.id, jobs: [...jobs.values()].map(summarizeJob), warnings } satisfies PollDetails,
+          details: { id: params.id, jobs: [...jobs.values()].filter(jobBelongsToCurrentOwner).map(summarizeJob), warnings } satisfies PollDetails,
         };
       }
 
@@ -633,11 +755,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     parameters: StopAgentParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      bindOwnerToContext(ctx);
       if (ctx?.hasUI) statusContext = ctx;
       loadPersistedJobs();
       const job = jobs.get(params.id);
-      if (!job) {
-        const known = [...jobs.keys()].join(", ") || "none";
+      if (!job || !jobBelongsToCurrentOwner(job)) {
+        const known = [...jobs.values()].filter(jobBelongsToCurrentOwner).map((job) => job.id).join(", ") || "none";
         return { content: [{ type: "text", text: `Unknown agent job id: ${params.id}. Known ids: ${known}` }], details: {} };
       }
 
@@ -671,12 +794,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     // Subagents are bounded to the parent Pi session. Stop live children on
     // graceful shutdown/reload instead of leaving detached tmux work running.
     await stopRunningJobsForSessionBoundary("cancelled because the parent Pi session shut down", DEFAULT_STOP_WAIT_MS);
-    for (const job of jobs.values()) {
-      if (job.monitorTimer) clearInterval(job.monitorTimer);
-      job.monitorTimer = undefined;
-    }
-    clearStatusRefreshTimer();
-    clearCallbackFlushTimer();
+    clearInMemoryJobs();
+    currentOwner = undefined;
+    currentStorePaths = undefined;
     if (ctx.hasUI) ctx.ui.setStatus("subagents", undefined);
     if (ctx.hasUI) ctx.ui.setWidget("subagents", undefined);
     if (statusContext === ctx) statusContext = undefined;
@@ -717,7 +837,7 @@ async function checkSubagentCapacity(sourceCwd: string): Promise<
   | { ok: false; repoKey: string; message: string; details: { running: number; maxRunning: number; runningForRepo: number; maxRunningPerRepo: number; repoKey: string } }
 > {
   const repoKey = await subagentRepoKey(sourceCwd);
-  const runningJobs = [...jobs.values()].filter((job) => job.status === "running");
+  const runningJobs = [...jobs.values()].filter((job) => job.status === "running" && jobBelongsToCurrentOwner(job));
   const running = runningJobs.length;
   const runningForRepo = runningJobs.filter((job) => (job.repoKey ?? job.worktree?.originalRoot ?? job.sourceCwd) === repoKey).length;
   const details = { running, maxRunning: MAX_RUNNING_SUBAGENTS, runningForRepo, maxRunningPerRepo: MAX_RUNNING_SUBAGENTS_PER_REPO, repoKey };
@@ -783,13 +903,19 @@ async function startAgentJob(
   repoKey?: string,
 ): Promise<AgentJob> {
   const id = createJobId();
+  const owner = requireCurrentOwner();
+  const store = storePathsForOwner(owner);
   const preflight = preflightSupervisorRequirements();
-  if (!preflight.ok) return createFailedPreStartJob(id, sourceCwd, params, agent, preflight.message);
+  if (!preflight.ok) return createFailedPreStartJob(id, sourceCwd, params, agent, preflight.message, owner, store);
   let worktreePrep: { cwd: string; worktree?: WorktreeInfo; warning?: string };
   try {
     worktreePrep = await prepareWorktreeForSpawn(sourceCwd, id, ctx, params.worktree);
   } catch (error) {
-    return createFailedPreStartJob(id, sourceCwd, params, agent, error instanceof Error ? error.message : String(error));
+    return createFailedPreStartJob(id, sourceCwd, params, agent, error instanceof Error ? error.message : String(error), owner, store);
+  }
+  if (!ownerMatchesCurrent(owner)) {
+    cleanupWorktreeInfo(worktreePrep.worktree);
+    return createFailedPreStartJob(id, sourceCwd, params, agent, "cancelled before launch because the parent Pi session changed", owner, store);
   }
   const cwd = worktreePrep.cwd;
   const label = params.label?.trim() || agent?.name || `agent-${id}`;
@@ -816,7 +942,12 @@ async function startAgentJob(
   } catch (error) {
     cleanupPromptFiles(tmpPromptPath, tmpPromptDir);
     cleanupWorktreeInfo(worktreePrep.worktree);
-    return createFailedPreStartJob(id, sourceCwd, params, agent, `failed to prepare system prompt: ${error instanceof Error ? error.message : String(error)}`);
+    return createFailedPreStartJob(id, sourceCwd, params, agent, `failed to prepare system prompt: ${error instanceof Error ? error.message : String(error)}`, owner, store);
+  }
+  if (!ownerMatchesCurrent(owner)) {
+    cleanupPromptFiles(tmpPromptPath, tmpPromptDir);
+    cleanupWorktreeInfo(worktreePrep.worktree);
+    return createFailedPreStartJob(id, sourceCwd, params, agent, "cancelled before launch because the parent Pi session changed", owner, store);
   }
 
   args.push(`Task: ${params.task}`);
@@ -826,6 +957,7 @@ async function startAgentJob(
   const record: JobRecord = {
     schemaVersion: JOB_RECORD_SCHEMA_VERSION,
     id,
+    owner,
     label,
     task: params.task,
     sourceCwd,
@@ -843,6 +975,7 @@ async function startAgentJob(
 
   const job: AgentJob = {
     record,
+    owner,
     id,
     label,
     agent: agent?.name,
@@ -875,9 +1008,9 @@ async function startAgentJob(
     timeoutAt,
     supervisor: "tmux",
     tmuxSession: tmuxSessionName(id),
-    stdoutPath: path.join(LOGS_DIR, `${id}.stdout.jsonl`),
-    stderrPath: path.join(LOGS_DIR, `${id}.stderr.log`),
-    exitCodePath: path.join(LOGS_DIR, `${id}.exit`),
+    stdoutPath: jobLogPathForStore(store, id, "stdout"),
+    stderrPath: jobLogPathForStore(store, id, "stderr"),
+    exitCodePath: jobExitCodePathForStore(store, id),
     stdoutOffset: 0,
     stderrOffset: 0,
     waiters: new Set(),
@@ -911,7 +1044,7 @@ async function startAgentJob(
   addLog(job, "info", `starting: ${childCommandLine} (cwd: ${cwd})`, "start");
 
   try {
-    ensureJobStoreDirs();
+    ensureJobStoreDirsFor(store);
     fs.writeFileSync(job.stdoutPath!, "", { encoding: "utf-8", mode: 0o600 });
     fs.writeFileSync(job.stderrPath!, "", { encoding: "utf-8", mode: 0o600 });
     fs.rmSync(job.exitCodePath!, { force: true });
@@ -919,16 +1052,34 @@ async function startAgentJob(
     const shell = "/bin/sh";
     const script = [
       `umask 077`,
-      `${childCommandLine} > ${shellQuote(job.stdoutPath!)} 2> ${shellQuote(job.stderrPath!)}`,
+      `parent_pid=${process.pid}`,
+      `(${childCommandLine}) > ${shellQuote(job.stdoutPath!)} 2> ${shellQuote(job.stderrPath!)} &`,
+      `child_pid=$!`,
+      `(`,
+      `  while kill -0 "$parent_pid" 2>/dev/null; do sleep 2; done`,
+      `  kill -INT "$child_pid" 2>/dev/null || true`,
+      `  sleep 5`,
+      `  kill -TERM "$child_pid" 2>/dev/null || true`,
+      `  sleep 5`,
+      `  kill -KILL "$child_pid" 2>/dev/null || true`,
+      `) &`,
+      `watchdog_pid=$!`,
+      `wait "$child_pid"`,
       `code=$?`,
+      `kill "$watchdog_pid" 2>/dev/null || true`,
+      `wait "$watchdog_pid" 2>/dev/null || true`,
       `printf '%s\\n' "$code" > ${shellQuote(job.exitCodePath!)}`,
       `exit "$code"`,
-    ].join("; ");
+    ].join("\n");
 
     await execFileAsync("tmux", ["new-session", "-d", "-s", job.tmuxSession!, "-c", cwd, shell, "-c", script], {
       timeout: TMUX_COMMAND_TIMEOUT_MS,
       killSignal: "SIGKILL",
     });
+    if (!ownerMatchesCurrent(owner)) {
+      killTmuxJobSession(job, "cancelled because the parent Pi session changed during subagent launch", "stop");
+      return job;
+    }
     dispatchLifecycleEvent(job, {
       type: "SupervisorStarted",
       handle: {
@@ -960,12 +1111,15 @@ function createFailedPreStartJob(
   params: Static<typeof RunAgentParams>,
   agent: AgentConfig | undefined,
   errorMessage: string,
+  owner = requireCurrentOwner(),
+  store = storePathsForOwner(owner),
 ): AgentJob {
   const now = Date.now();
   const label = params.label?.trim() || agent?.name || `agent-${id}`;
   const record: JobRecord = {
     schemaVersion: JOB_RECORD_SCHEMA_VERSION,
     id,
+    owner,
     label,
     task: params.task,
     sourceCwd,
@@ -982,6 +1136,7 @@ function createFailedPreStartJob(
   };
   const job: AgentJob = {
     record,
+    owner,
     id,
     label,
     agent: agent?.name,
@@ -1013,9 +1168,9 @@ function createFailedPreStartJob(
     usage: emptyUsageStats(),
     supervisor: "tmux",
     tmuxSession: tmuxSessionName(id),
-    stdoutPath: path.join(LOGS_DIR, `${id}.stdout.jsonl`),
-    stderrPath: path.join(LOGS_DIR, `${id}.stderr.log`),
-    exitCodePath: path.join(LOGS_DIR, `${id}.exit`),
+    stdoutPath: jobLogPathForStore(store, id, "stdout"),
+    stderrPath: jobLogPathForStore(store, id, "stderr"),
+    exitCodePath: jobExitCodePathForStore(store, id),
     stdoutOffset: 0,
     stderrOffset: 0,
     waiters: new Set(),
@@ -1029,7 +1184,11 @@ function createFailedPreStartJob(
 }
 
 function ensureJobStoreDirs(): void {
-  for (const dir of [JOB_STORE_DIR, JOBS_DIR, LOGS_DIR]) {
+  ensureJobStoreDirsFor(requireStorePaths());
+}
+
+function ensureJobStoreDirsFor(store: JobStorePaths): void {
+  for (const dir of [JOB_STORE_ROOT, JOB_OWNERS_DIR, store.root, store.jobsDir, store.logsDir]) {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     try {
       fs.chmodSync(dir, 0o700);
@@ -1040,7 +1199,27 @@ function ensureJobStoreDirs(): void {
 }
 
 function jobStatePath(id: string): string {
-  return path.join(JOBS_DIR, `${id}.json`);
+  return jobStatePathForStore(requireStorePaths(), id);
+}
+
+function jobStatePathForStore(store: JobStorePaths, id: string): string {
+  return path.join(store.jobsDir, `${id}.json`);
+}
+
+function jobLogPath(id: string, stream: "stdout" | "stderr"): string {
+  return jobLogPathForStore(requireStorePaths(), id, stream);
+}
+
+function jobLogPathForStore(store: JobStorePaths, id: string, stream: "stdout" | "stderr"): string {
+  return path.join(store.logsDir, stream === "stdout" ? `${id}.stdout.jsonl` : `${id}.stderr.log`);
+}
+
+function jobExitCodePath(id: string): string {
+  return jobExitCodePathForStore(requireStorePaths(), id);
+}
+
+function jobExitCodePathForStore(store: JobStorePaths, id: string): string {
+  return path.join(store.logsDir, `${id}.exit`);
 }
 
 function tmuxSessionName(id: string): string {
@@ -1049,9 +1228,10 @@ function tmuxSessionName(id: string): string {
 
 function persistJob(job: AgentJob): void {
   try {
-    ensureJobStoreDirs();
-    withJobFileLock(job.id, () => {
-      const file = jobStatePath(job.id);
+    const store = storePathsForOwner(job.owner);
+    ensureJobStoreDirsFor(store);
+    withJobFileLock(store, job.id, () => {
+      const file = jobStatePathForStore(store, job.id);
       const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
       try {
         fs.writeFileSync(tmp, serializeJobRecord(lifecycleRecordForJob(job)), { encoding: "utf-8", mode: 0o600 });
@@ -1068,6 +1248,7 @@ function persistJob(job: AgentJob): void {
 
 function lifecycleRecordForJob(job: AgentJob): JobRecord {
   const record = structuredClone(job.record);
+  record.owner = structuredClone(job.owner);
   syncDurableObservability(record, job);
   return record;
 }
@@ -1097,6 +1278,7 @@ function jobStatusFromPhase(phase: JobPhase): JobStatus {
 
 function applyLifecycleRecordToJob(job: AgentJob, record: JobRecord): void {
   job.record = structuredClone(record);
+  job.owner = record.owner;
   job.phase = record.phase;
   job.cleanupPhase = record.cleanupPhase;
   job.pendingTerminal = record.pendingTerminal;
@@ -1174,8 +1356,8 @@ function isValidLogEntry(entry: unknown): entry is AgentLogEntry {
   return Boolean(entry && typeof entry === "object" && typeof (entry as AgentLogEntry).seq === "number" && typeof (entry as AgentLogEntry).timestamp === "number" && typeof (entry as AgentLogEntry).level === "string" && typeof (entry as AgentLogEntry).text === "string");
 }
 
-function withJobFileLock<T>(jobId: string, action: () => T): T {
-  const lockPath = `${jobStatePath(jobId)}.lock`;
+function withJobFileLock<T>(store: JobStorePaths, jobId: string, action: () => T): T {
+  const lockPath = `${jobStatePathForStore(store, jobId)}.lock`;
   const started = Date.now();
   while (true) {
     let fd: number | undefined;
@@ -1235,27 +1417,35 @@ function sleepSync(ms: number): void {
 }
 
 function loadPersistedJobs(): void {
+  const owner = requireCurrentOwner();
+  let store: JobStorePaths;
   try {
     ensureJobStoreDirs();
+    store = requireStorePaths();
   } catch (error) {
-    recordStoreWarning({ path: JOB_STORE_DIR, kind: "unreadable", message: `could not ensure subagent store directories: ${errorMessage(error)}` });
+    recordStoreWarning({ path: JOB_STORE_ROOT, kind: "unreadable", message: `could not ensure subagent store directories: ${errorMessage(error)}` });
     return;
   }
 
   let fileNames: string[];
   try {
-    fileNames = fs.readdirSync(JOBS_DIR);
+    fileNames = fs.readdirSync(store.jobsDir);
   } catch (error) {
-    recordStoreWarning({ path: JOBS_DIR, kind: "unreadable", message: `could not read subagent jobs directory: ${errorMessage(error)}` });
+    recordStoreWarning({ path: store.jobsDir, kind: "unreadable", message: `could not read subagent jobs directory: ${errorMessage(error)}` });
     return;
   }
 
   for (const fileName of fileNames) {
     if (!fileName.endsWith(".json") || fileName.endsWith(".callback.json")) continue;
-    const filePath = path.join(JOBS_DIR, fileName);
+    const filePath = path.join(store.jobsDir, fileName);
     try {
       const raw = fs.readFileSync(filePath, "utf-8");
       const record = hydrateJobRecord(raw);
+      if (record.owner.id !== owner.id) {
+        recordStoreWarning({ path: filePath, kind: "corrupt", message: `job record owner ${record.owner.id} does not match active owner ${owner.id}` });
+        quarantineJobRecord(filePath, "corrupt", `job record owner ${record.owner.id} does not match active owner ${owner.id}`);
+        continue;
+      }
       if (fileName !== `${record.id}.json`) {
         recordStoreWarning({ path: filePath, kind: "corrupt", message: `job record id ${record.id} does not match file name ${fileName}` });
         quarantineJobRecord(filePath, "corrupt", `job record id ${record.id} does not match file name ${fileName}`);
@@ -1338,8 +1528,10 @@ function errorMessage(error: unknown): string {
 
 function runtimeJobFromRecord(record: JobRecord): AgentJob {
   const info = record.supervisorInfo ?? {};
+  const store = storePathsForOwner(record.owner);
   const job: AgentJob = {
     record: structuredClone(record),
+    owner: record.owner,
     id: record.id,
     label: record.label,
     task: record.task,
@@ -1376,9 +1568,9 @@ function runtimeJobFromRecord(record: JobRecord): AgentJob {
     timeoutAt: record.timeoutAt,
     supervisor: record.supervisor,
     tmuxSession: info.tmuxSession ?? tmuxSessionName(record.id),
-    stdoutPath: normalizeStorePath(info.stdoutPath, path.join(LOGS_DIR, `${record.id}.stdout.jsonl`)),
-    stderrPath: normalizeStorePath(info.stderrPath, path.join(LOGS_DIR, `${record.id}.stderr.log`)),
-    exitCodePath: normalizeStorePath(info.exitCodePath, path.join(LOGS_DIR, `${record.id}.exit`)),
+    stdoutPath: normalizeStorePath(info.stdoutPath, jobLogPathForStore(store, record.id, "stdout"), store.root),
+    stderrPath: normalizeStorePath(info.stderrPath, jobLogPathForStore(store, record.id, "stderr"), store.root),
+    exitCodePath: normalizeStorePath(info.exitCodePath, jobExitCodePathForStore(store, record.id), store.root),
     stdoutOffset: record.logCursor.stdoutOffset,
     stderrOffset: record.logCursor.stderrOffset,
     cleanupPending: record.cleanupPhase === "pending" || record.cleanupPhase === "running" || record.cleanupPhase === "failed",
@@ -1407,17 +1599,17 @@ function numberOrZero(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
-function normalizeStorePath(value: unknown, fallback: string): string {
+function normalizeStorePath(value: unknown, fallback: string, storeRoot = requireStorePaths().root): string {
   if (typeof value !== "string") return fallback;
   const resolved = path.resolve(value);
-  const relative = path.relative(JOB_STORE_DIR, resolved);
+  const relative = path.relative(storeRoot, resolved);
   if (relative.startsWith("..") || path.isAbsolute(relative)) return fallback;
   return resolved;
 }
 
 function scheduleRunningJobTimeouts(): void {
   for (const job of jobs.values()) {
-    if (job.status === "running") scheduleJobTimeout(job);
+    if (job.status === "running" && jobBelongsToCurrentOwner(job)) scheduleJobTimeout(job);
   }
 }
 
@@ -1449,7 +1641,9 @@ function startTmuxMonitor(job: AgentJob): void {
 
 function refreshRunningTmuxJobs(): void {
   const sessions = listTmuxSessions();
-  for (const job of jobs.values()) refreshTmuxJob(job, sessions);
+  for (const job of jobs.values()) {
+    if (jobBelongsToCurrentOwner(job)) refreshTmuxJob(job, sessions);
+  }
 }
 
 function refreshTmuxJob(job: AgentJob, knownSessions?: Set<string>): void {
@@ -1846,6 +2040,7 @@ function refreshSubagentStatus(): void {
 
   const now = Date.now();
   const visibleJobs = [...jobs.values()]
+    .filter(jobBelongsToCurrentOwner)
     .filter((job) => job.status === "running" || now - (job.finishedAt ?? job.updatedAt) < FINISHED_STATUS_VISIBLE_MS)
     .sort((a, b) => b.startedAt - a.startedAt || a.id.localeCompare(b.id));
 
@@ -1987,10 +2182,15 @@ async function waitForJobUpdate(job: AgentJob, waitMs: number, signal?: AbortSig
 }
 
 async function stopRunningJobsForSessionBoundary(reason: string, waitMs: number): Promise<void> {
+  await stopRunningJobsForOwner(currentOwner?.id, reason, waitMs);
+}
+
+async function stopRunningJobsForOwner(ownerId: string | undefined, reason: string, waitMs: number): Promise<void> {
+  if (!ownerId) return;
   const previousStatusContext = statusContext;
   statusContext = undefined;
   try {
-    for (const job of [...jobs.values()].filter((job) => job.status === "running")) {
+    for (const job of [...jobs.values()].filter((job) => job.status === "running" && job.owner.id === ownerId)) {
       await stopAgentJob(job, reason, waitMs);
     }
   } finally {
@@ -2204,8 +2404,8 @@ function notifyMainAgentOfFinishedJob(job: AgentJob): void {
   try {
     const api = extensionApi;
     const ctx = statusContext;
-    if (!api || !ctx?.hasUI) return;
-    if (!tryCreateCallbackMarker(job.id)) return;
+    if (!api || !ctx?.hasUI || !jobBelongsToCurrentOwner(job)) return;
+    if (!tryCreateCallbackMarker(job)) return;
 
     pendingFinishedCallbacks.set(job.id, job);
     scheduleFinishedCallbackFlush();
@@ -2233,8 +2433,11 @@ function flushPendingFinishedCallbacks(): void {
   const ctx = statusContext;
   if (!api || !ctx?.hasUI || pendingFinishedCallbacks.size === 0) return;
 
-  const callbackJobs = [...pendingFinishedCallbacks.values()].sort((a, b) => (a.finishedAt ?? a.updatedAt) - (b.finishedAt ?? b.updatedAt));
+  const callbackJobs = [...pendingFinishedCallbacks.values()]
+    .filter(jobBelongsToCurrentOwner)
+    .sort((a, b) => (a.finishedAt ?? a.updatedAt) - (b.finishedAt ?? b.updatedAt));
   pendingFinishedCallbacks.clear();
+  if (callbackJobs.length === 0) return;
   const message = formatStackedSubagentFinishedCallback(callbackJobs);
   try {
     api.sendUserMessage(message, { deliverAs: ctx.isIdle() ? "followUp" : "steer" });
@@ -2286,11 +2489,12 @@ function formatSubagentFinishedCallback(job: AgentJob): string {
 }
 
 function callbackMarkerPath(id: string): string {
-  return path.join(JOBS_DIR, `${id}.callback.json`);
+  return path.join(requireStorePaths().jobsDir, `${id}.callback.json`);
 }
 
 interface CallbackMarker {
   id: string;
+  ownerId: string;
   state: "pending" | "delivered";
   pendingAt?: number;
   deliveredAt?: number;
@@ -2299,19 +2503,19 @@ interface CallbackMarker {
   lastAttemptAt?: number;
 }
 
-function tryCreateCallbackMarker(id: string): boolean {
+function tryCreateCallbackMarker(job: AgentJob): boolean {
   let fd: number | undefined;
   try {
     ensureJobStoreDirs();
-    fd = fs.openSync(callbackMarkerPath(id), "wx", 0o600);
-    fs.writeFileSync(fd, JSON.stringify({ id, state: "pending", pendingAt: Date.now(), attempts: 0 } satisfies CallbackMarker) + "\n", "utf-8");
+    fd = fs.openSync(callbackMarkerPath(job.id), "wx", 0o600);
+    fs.writeFileSync(fd, JSON.stringify({ id: job.id, ownerId: job.owner.id, state: "pending", pendingAt: Date.now(), attempts: 0 } satisfies CallbackMarker) + "\n", "utf-8");
     return true;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      const marker = readCallbackMarker(id);
-      return marker?.state === "pending";
+      const marker = readCallbackMarker(job.id);
+      return marker?.state === "pending" && marker.ownerId === job.owner.id;
     }
-    if (fd !== undefined) removeCallbackMarker(id);
+    if (fd !== undefined) removeCallbackMarker(job.id);
     // If marker persistence is unavailable, prefer a best-effort callback over silence.
     return true;
   } finally {
@@ -2324,7 +2528,7 @@ function tryCreateCallbackMarker(id: string): boolean {
 function readCallbackMarker(id: string): CallbackMarker | undefined {
   try {
     const parsed = JSON.parse(fs.readFileSync(callbackMarkerPath(id), "utf-8")) as Partial<CallbackMarker>;
-    if (parsed.id !== id || (parsed.state !== "pending" && parsed.state !== "delivered")) return undefined;
+    if (parsed.id !== id || parsed.ownerId !== currentOwner?.id || (parsed.state !== "pending" && parsed.state !== "delivered")) return undefined;
     return parsed as CallbackMarker;
   } catch {
     return undefined;
@@ -2333,16 +2537,21 @@ function readCallbackMarker(id: string): CallbackMarker | undefined {
 
 function writeCallbackMarker(marker: CallbackMarker): void {
   ensureJobStoreDirs();
+  if (marker.ownerId !== requireCurrentOwner().id) return;
   fs.writeFileSync(callbackMarkerPath(marker.id), JSON.stringify(marker) + "\n", { encoding: "utf-8", mode: 0o600 });
 }
 
+function newCallbackMarker(id: string): CallbackMarker {
+  return { id, ownerId: requireCurrentOwner().id, state: "pending", pendingAt: Date.now(), attempts: 0 };
+}
+
 function markCallbackDelivered(id: string): void {
-  const marker = readCallbackMarker(id) ?? { id, state: "pending", pendingAt: Date.now(), attempts: 0 };
+  const marker = readCallbackMarker(id) ?? newCallbackMarker(id);
   writeCallbackMarker({ ...marker, state: "delivered", deliveredAt: Date.now(), lastError: undefined });
 }
 
 function markCallbackDeliveryFailed(id: string, error: unknown): void {
-  const marker = readCallbackMarker(id) ?? { id, state: "pending", pendingAt: Date.now(), attempts: 0 };
+  const marker = readCallbackMarker(id) ?? newCallbackMarker(id);
   writeCallbackMarker({
     ...marker,
     state: "pending",
@@ -2355,13 +2564,13 @@ function markCallbackDeliveryFailed(id: string, error: unknown): void {
 function retryPendingFinishedCallbacks(): void {
   try {
     ensureJobStoreDirs();
-    for (const fileName of fs.readdirSync(JOBS_DIR)) {
+    for (const fileName of fs.readdirSync(requireStorePaths().jobsDir)) {
       if (!fileName.endsWith(".callback.json")) continue;
       const id = fileName.slice(0, -".callback.json".length);
       const marker = readCallbackMarker(id);
       if (marker?.state !== "pending") continue;
       const job = jobs.get(id);
-      if (!job || job.status === "running") continue;
+      if (!job || job.status === "running" || !jobBelongsToCurrentOwner(job)) continue;
       pendingFinishedCallbacks.set(id, job);
     }
     if (pendingFinishedCallbacks.size > 0) scheduleFinishedCallbackFlush();
@@ -3588,6 +3797,7 @@ function appendCappedText(current: string, chunk: string, maxChars: number): str
 
 function pruneFinishedJobs(): void {
   const pruneable = [...jobs.values()]
+    .filter(jobBelongsToCurrentOwner)
     .filter((job) => job.status !== "running" && !hasUnresolvedCleanup(job))
     .sort((a, b) => (b.finishedAt ?? b.updatedAt) - (a.finishedAt ?? a.updatedAt));
   for (const job of pruneable.slice(MAX_RETAINED_FINISHED_JOBS)) {
@@ -3604,9 +3814,9 @@ function removePersistedJobFiles(id: string): void {
   for (const file of [
     jobStatePath(id),
     callbackMarkerPath(id),
-    path.join(LOGS_DIR, `${id}.stdout.jsonl`),
-    path.join(LOGS_DIR, `${id}.stderr.log`),
-    path.join(LOGS_DIR, `${id}.exit`),
+    jobLogPath(id, "stdout"),
+    jobLogPath(id, "stderr"),
+    jobExitCodePath(id),
   ]) {
     try {
       fs.rmSync(file, { force: true });
@@ -3714,6 +3924,19 @@ export const __subagentsTest = {
   formatCompactPollResult,
   formatPollResult,
   flushPendingFinishedCallbacks,
+  bindOwnerToContext,
+  handleSubagentsSessionStart,
+  cleanupLegacyRootStore,
+  makeTestOwner(id = `owner_test_${process.pid}`): JobOwnerInfo {
+    return { version: 1, id, instanceId: id, sessionId: id, parentPid: process.pid, cwd: "/repo" };
+  },
+  setOwnerHarness(owner: JobOwnerInfo | undefined) {
+    currentOwner = owner;
+    currentStorePaths = owner ? storePathsForOwner(owner) : undefined;
+  },
+  getCurrentOwner() {
+    return currentOwner;
+  },
   setCallbackHarness(api: ExtensionAPI | undefined, ctx: ExtensionContext | undefined) {
     extensionApi = api;
     statusContext = ctx;
