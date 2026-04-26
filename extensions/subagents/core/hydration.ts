@@ -21,18 +21,12 @@ export class UnsupportedJobRecordSchemaError extends JobRecordHydrationError {
   }
 }
 
-export interface HydrateJobRecordOptions {
-  fallbackCwd?: string;
-  now?: number;
-  id?: string;
-}
-
 export function serializeJobRecord(record: JobRecord): string {
   assertDurableJobRecord(record);
   return `${JSON.stringify(record, null, 2)}\n`;
 }
 
-export function hydrateJobRecord(raw: unknown, options: HydrateJobRecordOptions = {}): JobRecord {
+export function hydrateJobRecord(raw: unknown): JobRecord {
   const parsed = parseRaw(raw);
   assertNoRuntimeFields(parsed);
 

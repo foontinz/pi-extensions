@@ -8,6 +8,7 @@
   "scripts": {
     "check": "npm run check --workspaces --if-present",
     "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
     "clean": "npm run clean --workspaces --if-present"
   },
   "dependencies": {

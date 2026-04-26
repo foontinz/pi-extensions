@@ -909,7 +909,7 @@ async function startAgentJob(
   if (!preflight.ok) return createFailedPreStartJob(id, sourceCwd, params, agent, preflight.message, owner, store);
   let worktreePrep: { cwd: string; worktree?: WorktreeInfo; warning?: string };
   try {
-    worktreePrep = await prepareWorktreeForSpawn(sourceCwd, id, ctx, params.worktree);
+    worktreePrep = await prepareWorktreeForSpawn(sourceCwd, ctx, params.worktree);
   } catch (error) {
     return createFailedPreStartJob(id, sourceCwd, params, agent, error instanceof Error ? error.message : String(error), owner, store);
   }
@@ -1578,25 +1578,6 @@ function runtimeJobFromRecord(record: JobRecord): AgentJob {
     closeWaiters: new Set(),
   };
   return job;
-}
-
-function normalizeUsageStats(value: unknown): UsageStats {
-  const fallback: UsageStats = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
-  if (!value || typeof value !== "object" || Array.isArray(value)) return fallback;
-  const source = value as Partial<Record<keyof UsageStats, unknown>>;
-  return {
-    input: numberOrZero(source.input),
-    output: numberOrZero(source.output),
-    cacheRead: numberOrZero(source.cacheRead),
-    cacheWrite: numberOrZero(source.cacheWrite),
-    cost: numberOrZero(source.cost),
-    contextTokens: numberOrZero(source.contextTokens),
-    turns: numberOrZero(source.turns),
-  };
-}
-
-function numberOrZero(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
 function normalizeStorePath(value: unknown, fallback: string, storeRoot = requireStorePaths().root): string {
@@ -2312,29 +2293,6 @@ function signalJob(job: AgentJob, signal: NodeJS.Signals): void {
   }
 }
 
-async function waitForJobCloseOrCleanup(job: AgentJob, timeoutMs: number, reason: string): Promise<void> {
-  if (job.finishedAt) return;
-  await waitForJobClose(job, timeoutMs);
-  if (job.finishedAt) return;
-  signalJob(job, "SIGKILL");
-  finalizeJob(job, "cancelled", undefined, undefined, reason);
-}
-
-async function waitForJobClose(job: AgentJob, timeoutMs: number): Promise<void> {
-  if (job.finishedAt) return;
-  await new Promise<void>((resolve) => {
-    const timer = setTimeout(() => {
-      job.closeWaiters.delete(done);
-      resolve();
-    }, timeoutMs);
-    const done = () => {
-      clearTimeout(timer);
-      resolve();
-    };
-    job.closeWaiters.add(done);
-  });
-}
-
 function finalizeJob(
   job: AgentJob,
   status: JobStatus,
@@ -2630,7 +2588,7 @@ function cleanupPromptFiles(tmpPromptPath: string | undefined, tmpPromptDir: str
   }
 }
 
-async function prepareWorktreeForSpawn(sourceCwd: string, jobId: string, ctx: ExtensionContext, worktreeOverride?: boolean): Promise<{ cwd: string; worktree?: WorktreeInfo; warning?: string }> {
+async function prepareWorktreeForSpawn(sourceCwd: string, ctx: ExtensionContext, worktreeOverride?: boolean): Promise<{ cwd: string; worktree?: WorktreeInfo; warning?: string }> {
   if (worktreeOverride === false) return { cwd: sourceCwd };
 
   const gitRoot = await getGitRootDetailed(sourceCwd);
@@ -3866,7 +3824,8 @@ export const __subagentsTest = {
   normalizeWorktreeEnvConfig,
   readWorktreeConfig,
   getGitRootDetailed,
-  prepareWorktreeForSpawn,
+  prepareWorktreeForSpawn: (sourceCwd: string, _jobId: string, ctx: ExtensionContext, worktreeOverride?: boolean) =>
+    prepareWorktreeForSpawn(sourceCwd, ctx, worktreeOverride),
   formatPostCopyConfirmationDetails,
   buildPostCopyEnv,
   getShellInvocation,
