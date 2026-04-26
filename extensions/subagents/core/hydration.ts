@@ -1,6 +1,5 @@
 import {
   assertDurableJobRecord,
-  assertNoRuntimeFields,
   JobRecordHydrationError,
   RUNTIME_ONLY_KEYS,
 } from "./invariants.js";
@@ -28,7 +27,6 @@ export function serializeJobRecord(record: JobRecord): string {
 
 export function hydrateJobRecord(raw: unknown): JobRecord {
   const parsed = parseRaw(raw);
-  assertNoRuntimeFields(parsed);
 
   if (!isRecord(parsed)) throw new JobRecordHydrationError("job record must be an object");
 

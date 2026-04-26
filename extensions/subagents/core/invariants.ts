@@ -106,7 +106,6 @@ export function assertDurableJobRecord(value: unknown): asserts value is JobReco
 export function assertJobRecordInvariants(value: unknown): asserts value is JobRecord {
   if (!isRecord(value)) throw invariant("job record must be an object");
 
-  assertNoRuntimeFields(value);
   assertAllowedKeys(value, JOB_RECORD_KEYS, "$");
 
   if (value.schemaVersion !== JOB_RECORD_SCHEMA_VERSION) {
