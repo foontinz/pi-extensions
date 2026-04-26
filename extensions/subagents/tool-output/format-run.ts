@@ -12,7 +12,7 @@ export interface RunAgentStartJobView {
   cwd: string;
 }
 
-export function formatRunAgentStartResult(job: RunAgentStartJobView, suggestedPollIntervalMs: number): string {
+export function formatRunAgentStartResult(job: RunAgentStartJobView, _suggestedPollIntervalMs: number): string {
   const lines = [
     job.status === "running" ? `Started background agent ${job.id}.` : `Failed to start background agent ${job.id}.`,
     `Status: ${job.status}`,
@@ -25,6 +25,11 @@ export function formatRunAgentStartResult(job: RunAgentStartJobView, suggestedPo
   } else if (job.errorMessage) {
     lines.push(`Error: ${compactPreview(job.errorMessage, 500, 3)}`);
   }
-  lines.push(`CWD: ${job.cwd}`, "", `Poll later with: poll_agent({ id: "${job.id}", sinceSeq: 0, waitMs: ${suggestedPollIntervalMs} })`);
-  return lines.join("\n");
+  lines.push(
+    `CWD: ${job.cwd}`,
+    "",
+    "The final result will be sent back to this Pi session when the subagent finishes.",
+    job.tmuxSession ? `For live output/debugging, attach with: tmux attach -t ${job.tmuxSession}` : "",
+  );
+  return lines.filter((line) => line !== "").join("\n");
 }

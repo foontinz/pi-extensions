@@ -4,16 +4,19 @@ Non-blocking Pi subagents exposed as tools.
 
 ## Tools
 
-- `run_agent` — starts a session-bounded tmux-supervised `pi --mode json -p --no-session` process and returns a job id immediately. Startup/prep failures return a failed job record when possible so they can be inspected with `poll_agent`. Omit `model` unless the user explicitly requested a specific model; the child Pi will otherwise use its normal/default model configuration.
-- `poll_agent` — polls compact status for a job id. Omit `id` to list jobs. Set `verbosity: "logs"` for recent summarized logs or `verbosity: "full"` to retrieve the final assistant output up to tool output limits.
+- `list_agents` — lists user-owned markdown-backed named agents discoverable by `run_agent` from `~/.pi/agent/agents`.
+- `run_agent` — starts a session-bounded tmux-supervised `pi --mode json -p --no-session` process and returns a job id immediately. Finished subagents report their final output back to the parent Pi session when possible. Omit `model` unless the user explicitly requested a specific model; the child Pi will otherwise use its normal/default model configuration.
 - `stop_agent` — terminates a running background job.
 
-Tool names use underscores for provider/tool-call compatibility; labels render as “Run Agent”, “Poll Agent”, and “Stop Agent”. Running/recent jobs are also shown in Pi’s subagents status/widget with their label, runtime, status, and compact state.
+Tool names use underscores for provider/tool-call compatibility; labels render as “List Agents”, “Run Agent”, and “Stop Agent”. Running/recent jobs are also shown in Pi’s subagents status/widget with their label, runtime, status, and compact state.
 
 ## Basic flow
 
 ```jsonc
-// 1. Start a job
+// 1. Optionally list named agents
+list_agents({})
+
+// 2. Start a job
 run_agent({
   "task": "Search the repo for auth middleware and summarize the relevant files"
 })
@@ -30,15 +33,10 @@ run_agent({
   "worktree": false
 })
 
-// 2. Poll sparingly; default verbosity is a few-line status.
-// Reuse nextSeq from the previous poll and prefer 10-30s waits for running jobs.
-poll_agent({ "id": "agent_...", "sinceSeq": 0, "waitMs": 15000 })
+// 3. The final result is sent back to the parent Pi session when the job finishes.
+// For live output/debugging, attach to the tmux session printed by run_agent.
 
-// 2b. Only when needed, ask for summarized logs or the full final assistant output.
-poll_agent({ "id": "agent_...", "sinceSeq": 12, "verbosity": "logs" })
-poll_agent({ "id": "agent_...", "verbosity": "full" })
-
-// 3. Cancel if no longer needed. stop_agent sends Ctrl-C first, then hard-kills
+// 4. Cancel if no longer needed. stop_agent sends Ctrl-C first, then hard-kills
 // the tmux session after waitMs/default grace if the job has not exited.
 stop_agent({ "id": "agent_...", "reason": "not needed", "waitMs": 5000 })
 ```
@@ -88,12 +86,11 @@ Temp worktrees are removed when Pi observes that the job finished, failed, or wa
 
 ## Named markdown agents
 
-`run_agent` can run named agents from:
+`run_agent` can run named user-owned agents from:
 
-- `~/.pi/agent/agents/*.md` (default `agentScope: "user"`)
-- nearest project `.pi/agents/*.md` when `agentScope` is `"project"` or `"both"`
+- `~/.pi/agent/agents/*.md`
 
-Project agents are repo-controlled prompts and always require interactive confirmation; non-interactive sessions cannot run them.
+Project-local `.pi/agents` prompts are intentionally not discoverable by these tools.
 
 Agent files use YAML frontmatter:
 
@@ -109,14 +106,11 @@ thinking: low
 You are a fast reconnaissance subagent. Find relevant files and return a concise summary.
 ```
 
-Project agents with the same name override user agents when `agentScope: "both"`.
-
 ## Notes
 
 - Jobs are supervised by tmux and persisted under `~/.pi/agent/subagents/`, but running jobs are bounded to the parent Pi session. Graceful `/reload`, session switch, and parent Pi shutdown stop running subagents; the next session also stops recovered orphan running jobs left by an ungraceful exit. `tmux` on `PATH` and executable `/bin/sh` are required before a job is launched. Use `stop_agent` to terminate a running job explicitly; it sends Ctrl-C to the tmux pane first, drains output, then hard-kills the tmux session after the grace period (`waitMs`, default 5000, max 60000) if needed.
 - Attach to a live job with `tmux attach -t <session>`; `run_agent` prints the exact session name.
-- `poll_agent` returns summarized/capped logs and persists a compact final output/recent-log snapshot with the job record so completed results remain pollable after reload. Full raw child process streams are persisted under `~/.pi/agent/subagents/logs/*.stdout.jsonl` and `*.stderr.log` for manual inspection. To prevent unbounded disk growth, a running job is stopped if either raw stream exceeds `PI_SUBAGENTS_MAX_RAW_LOG_BYTES` bytes; the default is 512 MiB per stream, and `0` disables this guard.
-- `poll_agent` defaults to compact summary output to avoid flooding the main model context.
+- Full raw child process streams are persisted under `~/.pi/agent/subagents/logs/*.stdout.jsonl` and `*.stderr.log` for manual inspection. To prevent unbounded disk growth, a running job is stopped if either raw stream exceeds `PI_SUBAGENTS_MAX_RAW_LOG_BYTES` bytes; the default is 512 MiB per stream, and `0` disables this guard.
 - Child tool access is limited to tools active in the parent Pi session. If `tools` is omitted, the child receives only the active safe read-only default tools: `read`, `grep`, `find`, and `ls` when available. Requested agent/tool allowlists must be a subset of parent active tools. Pass tools explicitly to grant write, execute, network, or other higher-risk capabilities.
 - Running job concurrency is capped by default to protect the host: `PI_SUBAGENTS_MAX_RUNNING` defaults to 8 globally and `PI_SUBAGENTS_MAX_RUNNING_PER_REPO` defaults to 4 per repository/path. Set either to `0` to disable that limit.
 - The child process uses `--no-session`: it does not inherit the parent conversation and does not write a normal Pi session file. Put all needed context in the task, named/ad-hoc system prompt, files, or repo context.
