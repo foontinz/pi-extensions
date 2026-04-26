@@ -32,6 +32,7 @@ import { reduceJobEvent } from "./core/state-machine.js";
 import { formatToolCall, formatToolResultMessage, getAssistantText, previewToolResult, textContent } from "./output/message-format.js";
 import { compactPreview } from "./output/preview.js";
 import { formatUsage } from "./output/usage.js";
+import { parseOptionalNonNegativeIntegerEnv } from "./platform/env.js";
 import { getShellInvocation } from "./platform/shell.js";
 import { displayCommand, shellQuote, squashWhitespace, truncateOneLine, truncateString } from "./platform/text.js";
 import { buildPostCopyEnv, getPostCopyBaseEnvKeys } from "./policy/post-copy-env.js";
@@ -100,13 +101,6 @@ const POST_COPY_TRUST_STORE_PATH = path.join(JOB_STORE_ROOT, "trusted-postcopy.j
 const SUBAGENT_CHILD_ENV = "PI_SUBAGENTS_CHILD";
 
 const execFileAsync = promisify(execFile);
-
-function parseOptionalNonNegativeIntegerEnv(name: string, fallback: number): number {
-  const raw = process.env[name];
-  if (raw === undefined || raw.trim() === "") return fallback;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
-}
 
 function isSubagentChildProcess(): boolean {
   if (process.env[SUBAGENT_CHILD_ENV] === "1") return true;
