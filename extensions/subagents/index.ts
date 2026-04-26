@@ -27,6 +27,7 @@ import { Text } from "@mariozechner/pi-tui";
 import { Type, type Static } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents, formatAgentList } from "./agents.js";
 import { hydrateJobRecord, serializeJobRecord, UnsupportedJobRecordSchemaError } from "./core/hydration.js";
+import { createJobId, shortJobId, tmuxSessionName } from "./core/ids.js";
 import { reduceJobEvent } from "./core/state-machine.js";
 import { formatToolCall, formatToolResultMessage, getAssistantText, previewToolResult, textContent } from "./output/message-format.js";
 import { formatUsage } from "./output/usage.js";
@@ -1190,10 +1191,6 @@ function jobExitCodePathForStore(store: JobStorePaths, id: string): string {
   return path.join(store.logsDir, `${id}.exit`);
 }
 
-function tmuxSessionName(id: string): string {
-  return `pi-${id}`.replace(/[^A-Za-z0-9_.:-]/g, "-");
-}
-
 function persistJob(job: AgentJob): void {
   try {
     const store = storePathsForOwner(job.owner);
@@ -2016,11 +2013,6 @@ function formatJobRuntime(job: AgentJob): string {
 
 function padCell(value: string, width: number): string {
   return value.length >= width ? value : value + " ".repeat(width - value.length);
-}
-
-function shortJobId(id: string): string {
-  const match = /^agent_[^_]+_([a-f0-9]+)$/i.exec(id);
-  return match?.[1]?.slice(0, 8) ?? id.slice(-8);
 }
 
 function compactStatusLabel(job: AgentJob): string {
@@ -3378,10 +3370,6 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
   const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
   if (!isGenericRuntime) return { command: process.execPath, args };
   return { command: "pi", args };
-}
-
-function createJobId(): string {
-  return `agent_${Date.now().toString(36)}_${randomBytes(4).toString("hex")}`;
 }
 
 interface LogWindow {
