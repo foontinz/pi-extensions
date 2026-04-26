@@ -1,4 +1,3 @@
-import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { shortJobId } from "../core/ids.js";
 import { truncateOneLine } from "../platform/text.js";
 
@@ -19,9 +18,13 @@ export interface StatusJobView {
   stopReason?: string;
 }
 
+export interface StatusTheme {
+  fg(role: string, text: string): string;
+}
+
 export type LatestLogPreview<T extends StatusJobView = StatusJobView> = (job: T) => string | undefined;
 
-export function formatStatusTable<T extends StatusJobView>(jobs: T[], ctx: ExtensionContext, latestLogPreview: LatestLogPreview<T>): string[] {
+export function formatStatusTable<T extends StatusJobView>(jobs: T[], theme: StatusTheme, latestLogPreview: LatestLogPreview<T>): string[] {
   const visibleRows = jobs.slice(0, 8);
   const idWidth = Math.max("id".length, ...visibleRows.map((job) => shortJobId(job.id).length));
   const labelWidth = Math.min(20, Math.max("agent".length, ...visibleRows.map((job) => compactStatusLabel(job).length)));
@@ -30,9 +33,9 @@ export function formatStatusTable<T extends StatusJobView>(jobs: T[], ctx: Exten
   const durationWidth = "runtime".length;
   const header = `${padCell("id", idWidth)}  ${padCell("agent", labelWidth)}  ${padCell("start", timeWidth)}  ${padCell("runtime", durationWidth)}  ${padCell("status", statusWidth)}  state`;
   const separator = `${"─".repeat(idWidth)}  ${"─".repeat(labelWidth)}  ${"─".repeat(timeWidth)}  ${"─".repeat(durationWidth)}  ${"─".repeat(statusWidth)}  ${"─".repeat(32)}`;
-  const rows = visibleRows.map((job) => formatStatusRow(job, ctx, latestLogPreview, idWidth, labelWidth, timeWidth, durationWidth, statusWidth));
-  if (jobs.length > visibleRows.length) rows.push(ctx.ui.theme.fg("dim", `… ${jobs.length - visibleRows.length} more`));
-  return [ctx.ui.theme.fg("muted", "subagents"), ctx.ui.theme.fg("dim", header), ctx.ui.theme.fg("dim", separator), ...rows];
+  const rows = visibleRows.map((job) => formatStatusRow(job, theme, latestLogPreview, idWidth, labelWidth, timeWidth, durationWidth, statusWidth));
+  if (jobs.length > visibleRows.length) rows.push(theme.fg("dim", `… ${jobs.length - visibleRows.length} more`));
+  return [theme.fg("muted", "subagents"), theme.fg("dim", header), theme.fg("dim", separator), ...rows];
 }
 
 export function compactJobState<T extends StatusJobView>(job: T, latestLogPreview: LatestLogPreview<T>): string {
@@ -56,14 +59,14 @@ export function compactJobState<T extends StatusJobView>(job: T, latestLogPrevie
   return [statusWord, ...words].slice(0, 4).join(" ");
 }
 
-function formatStatusRow<T extends StatusJobView>(job: T, ctx: ExtensionContext, latestLogPreview: LatestLogPreview<T>, idWidth: number, labelWidth: number, timeWidth: number, durationWidth: number, statusWidth: number): string {
+function formatStatusRow<T extends StatusJobView>(job: T, theme: StatusTheme, latestLogPreview: LatestLogPreview<T>, idWidth: number, labelWidth: number, timeWidth: number, durationWidth: number, statusWidth: number): string {
   const color = job.status === "completed" ? "success" : job.status === "running" ? "accent" : job.status === "cancelled" ? "muted" : "warning";
-  const id = ctx.ui.theme.fg("muted", padCell(shortJobId(job.id), idWidth));
-  const label = ctx.ui.theme.fg("muted", padCell(compactStatusLabel(job), labelWidth));
-  const started = ctx.ui.theme.fg("muted", padCell(formatStatusTime(job.startedAt), timeWidth));
-  const duration = ctx.ui.theme.fg("muted", padCell(formatJobRuntime(job), durationWidth));
-  const status = ctx.ui.theme.fg(color, padCell(job.status, statusWidth));
-  const state = ctx.ui.theme.fg(color, compactJobState(job, latestLogPreview));
+  const id = theme.fg("muted", padCell(shortJobId(job.id), idWidth));
+  const label = theme.fg("muted", padCell(compactStatusLabel(job), labelWidth));
+  const started = theme.fg("muted", padCell(formatStatusTime(job.startedAt), timeWidth));
+  const duration = theme.fg("muted", padCell(formatJobRuntime(job), durationWidth));
+  const status = theme.fg(color, padCell(job.status, statusWidth));
+  const state = theme.fg(color, compactJobState(job, latestLogPreview));
   return `${id}  ${label}  ${started}  ${duration}  ${status}  ${state}`;
 }
 

@@ -66,7 +66,55 @@ export interface PollFormatOptions {
   rawLogSizes: { stdout?: number; stderr?: number; total: number };
 }
 
-export function summarizeJob<TLog extends PollLogEntryView>(job: PollJobView<TLog>, options: PollFormatOptions) {
+export interface PollJobSummary {
+  id: string;
+  label: string;
+  agent?: string;
+  agentSource?: string;
+  task: string;
+  effectiveTools: string[];
+  cwd: string;
+  sourceCwd: string;
+  worktree?: {
+    root: string;
+    originalRoot: string;
+    originalCwd: string;
+    configPath?: string;
+    base?: string;
+    copied?: string[];
+    postCopy?: unknown;
+    keepWorktree?: string;
+    retained?: boolean;
+  };
+  pid?: number;
+  supervisor: string;
+  tmuxSession?: string;
+  stdoutPath?: string;
+  stderrPath?: string;
+  rawLogBytes: { stdout?: number; stderr?: number; total: number };
+  rawLogLimitBytes: number;
+  rawLogLimitExceeded?: boolean;
+  status: "running" | "completed" | "failed" | "cancelled";
+  phase: string;
+  cleanupPhase?: string;
+  terminal?: unknown;
+  pendingTerminal?: unknown;
+  startedAt: number;
+  updatedAt: number;
+  finishedAt?: number;
+  exitCode?: number;
+  signal?: string;
+  stopReason?: string;
+  errorMessage?: string;
+  cleanupPending?: boolean;
+  cleanupError?: string;
+  usage: UsageStats;
+  messageCount: number;
+  finalOutputPreview?: string;
+  nextSeq: number;
+}
+
+export function summarizeJob<TLog extends PollLogEntryView>(job: PollJobView<TLog>, options: PollFormatOptions): PollJobSummary {
   return {
     id: job.id,
     label: job.label,
@@ -118,7 +166,7 @@ export function summarizeJob<TLog extends PollLogEntryView>(job: PollJobView<TLo
   };
 }
 
-export function formatJobSummaryLine(job: ReturnType<typeof summarizeJob>): string {
+export function formatJobSummaryLine(job: PollJobSummary): string {
   const age = job.finishedAt ? `${Math.round((job.finishedAt - job.startedAt) / 1000)}s` : `${Math.round((Date.now() - job.startedAt) / 1000)}s`;
   const usage = formatUsage(job.usage);
   return [

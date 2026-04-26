@@ -52,10 +52,10 @@ import {
   latestLogPreview,
   summarizeJob as summarizePollJob,
   type PollFormatOptions,
-} from "./ui/format-poll.js";
-import { formatRunAgentStartResult as renderRunAgentStartResult } from "./ui/format-run.js";
+} from "./tool-output/format-poll.js";
+import { formatRunAgentStartResult as renderRunAgentStartResult } from "./tool-output/format-run.js";
+import { truncateForTool } from "./tool-output/truncate.js";
 import { compactJobState as renderCompactJobState, formatJobRuntime, formatStatusTable as renderStatusTable } from "./ui/status-widget.js";
-import { truncateForTool } from "./ui/truncate.js";
 import {
   defaultWorktreeEnvConfig,
   normalizeRepoRelativePath,
@@ -1906,7 +1906,7 @@ function clearStatusRefreshTimer(): void {
 }
 
 function formatStatusTable(jobs: AgentJob[], ctx: ExtensionContext): string[] {
-  return renderStatusTable(jobs, ctx, latestLogPreview);
+  return renderStatusTable(jobs, ctx.ui.theme, latestLogPreview);
 }
 
 function compactJobState(job: AgentJob): string {

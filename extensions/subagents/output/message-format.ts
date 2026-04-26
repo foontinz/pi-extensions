@@ -40,19 +40,41 @@ export function formatToolCall(toolName: string, args: Record<string, unknown> |
   }
 }
 
-export function previewToolResult(result: any): string {
+export function previewToolResult(result: unknown): string {
   if (!result) return "";
-  if (Array.isArray(result.content)) {
+  if (hasContentArray(result)) {
     return truncateOneLine(
       result.content
-        .map((part: any) => (part?.type === "text" ? part.text : part?.type ? `[${part.type}]` : ""))
+        .map(formatToolResultContentPart)
         .filter(Boolean)
         .join("\n"),
       300,
     );
   }
   if (typeof result === "string") return truncateOneLine(result, 300);
-  return truncateOneLine(JSON.stringify(result), 300);
+  return truncateOneLine(safeJsonStringify(result), 300);
+}
+
+function hasContentArray(value: unknown): value is { content: unknown[] } {
+  return typeof value === "object" && value !== null && Array.isArray((value as { content?: unknown }).content);
+}
+
+function formatToolResultContentPart(part: unknown): string {
+  if (typeof part !== "object" || part === null) return "";
+  const type = (part as { type?: unknown }).type;
+  if (type === "text") {
+    const text = (part as { text?: unknown }).text;
+    return typeof text === "string" ? text : "";
+  }
+  return typeof type === "string" && type ? `[${type}]` : "";
+}
+
+function safeJsonStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
 }
 
 export function formatToolResultMessage(msg: ToolResultMessage): string {
