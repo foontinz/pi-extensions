@@ -56,6 +56,21 @@ import {
 import { formatRunAgentStartResult as renderRunAgentStartResult } from "./ui/format-run.js";
 import { compactJobState as renderCompactJobState, formatJobRuntime, formatStatusTable as renderStatusTable } from "./ui/status-widget.js";
 import { truncateForTool } from "./ui/truncate.js";
+import type {
+  GitRootError,
+  GitRootNotRepo,
+  GitRootOk,
+  GitRootResult,
+  NormalizedWorktreeCopySpec,
+  NormalizedWorktreeEnvConfig,
+  NormalizedWorktreePostCopySpec,
+  WorktreeCopyObject,
+  WorktreeEnvConfig,
+  WorktreeInfo,
+  WorktreeKeepMode,
+  WorktreePostCopyObject,
+  WorktreeScriptResult,
+} from "./workspace/types.js";
 import {
   JOB_RECORD_SCHEMA_VERSION,
   emptyUsageStats,
@@ -134,69 +149,6 @@ interface AgentLogEntry {
   level: LogLevel;
   text: string;
   eventType?: string;
-}
-
-interface WorktreeCopyObject {
-  from: string;
-  to?: string;
-  optional?: boolean;
-}
-
-interface WorktreePostCopyObject {
-  command: string;
-  cwd?: string;
-  optional?: boolean;
-  timeoutMs?: number;
-  env?: Record<string, string>;
-}
-
-type WorktreeKeepMode = "never" | "always" | "onFailure";
-
-interface WorktreeEnvConfig {
-  enabled?: boolean;
-  base?: string;
-  copy?: Array<string | WorktreeCopyObject>;
-  exclude?: string[];
-  exclusions?: string[];
-  postCopy?: Array<string | WorktreePostCopyObject>;
-  postCopyScripts?: Array<string | WorktreePostCopyObject>;
-  keepWorktree?: boolean | WorktreeKeepMode;
-}
-
-interface WorktreeScriptResult {
-  command: string;
-  cwd: string;
-  optional: boolean;
-  timeoutMs: number;
-  stdout?: string;
-  stderr?: string;
-  failed?: boolean;
-}
-
-type NormalizedWorktreeCopySpec = Required<Pick<WorktreeCopyObject, "from" | "optional">> & { to?: string };
-type NormalizedWorktreePostCopySpec = Required<Pick<WorktreePostCopyObject, "command" | "optional" | "timeoutMs">> & Pick<WorktreePostCopyObject, "cwd" | "env">;
-
-interface NormalizedWorktreeEnvConfig {
-  enabled?: boolean;
-  base?: string;
-  copy: NormalizedWorktreeCopySpec[];
-  exclusions: string[];
-  postCopy: NormalizedWorktreePostCopySpec[];
-  keepWorktree: WorktreeKeepMode;
-  configPath?: string;
-}
-
-interface WorktreeInfo {
-  root: string;
-  tempParent: string;
-  originalRoot: string;
-  originalCwd: string;
-  configPath?: string;
-  base: string;
-  copied: string[];
-  postCopy: WorktreeScriptResult[];
-  keepWorktree: WorktreeKeepMode;
-  retained?: boolean;
 }
 
 interface AgentJob {
@@ -835,26 +787,6 @@ async function checkSubagentCapacity(sourceCwd: string): Promise<
 async function subagentRepoKey(sourceCwd: string): Promise<string> {
   return (await getGitRoot(sourceCwd)) ?? path.resolve(sourceCwd);
 }
-
-interface GitRootOk {
-  ok: true;
-  root: string;
-}
-
-interface GitRootNotRepo {
-  ok: false;
-  kind: "not-repo";
-}
-
-interface GitRootError {
-  ok: false;
-  kind: "git-unavailable" | "invalid-cwd" | "git-error";
-  message: string;
-  code?: number | string;
-  stderr?: string;
-}
-
-type GitRootResult = GitRootOk | GitRootNotRepo | GitRootError;
 
 async function startAgentJob(
   sourceCwd: string,
