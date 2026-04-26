@@ -28,6 +28,15 @@ import { Type, type Static } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents, formatAgentList } from "./agents.js";
 import { hydrateJobRecord, serializeJobRecord, UnsupportedJobRecordSchemaError } from "./core/hydration.js";
 import { reduceJobEvent } from "./core/state-machine.js";
+import { displayCommand, shellQuote, squashWhitespace, truncateOneLine, truncateString } from "./platform/text.js";
+import {
+  isTmuxAvailable,
+  listTmuxSessions,
+  resetTmuxAvailabilityCache,
+  runTmuxSync,
+  TMUX_COMMAND_TIMEOUT_MS,
+  tmuxSessionExists,
+} from "./supervisor/tmux-supervisor.js";
 import {
   JOB_RECORD_SCHEMA_VERSION,
   emptyUsageStats,
@@ -68,8 +77,6 @@ const FINISHED_STATUS_VISIBLE_MS = 15 * 1000;
 const ASSISTANT_DELTA_LOG_INTERVAL_MS = 1_250;
 const ASSISTANT_DELTA_LOG_CHARS = 1_200;
 const TMUX_STATUS_INTERVAL_MS = 2_000;
-const TMUX_COMMAND_TIMEOUT_MS = 5_000;
-const TMUX_AVAILABILITY_CACHE_MS = 30_000;
 const GIT_CLEANUP_TIMEOUT_MS = 10_000;
 const POST_COPY_DEFAULT_TIMEOUT_MS = 120_000;
 const POST_COPY_MAX_TIMEOUT_MS = 30 * 60 * 1000;
@@ -304,7 +311,6 @@ let statusContext: ExtensionContext | undefined;
 let statusRefreshTimer: NodeJS.Timeout | undefined;
 const pendingFinishedCallbacks = new Map<string, AgentJob>();
 let callbackFlushTimer: NodeJS.Timeout | undefined;
-let tmuxAvailabilityCache: { checkedAt: number; ok: boolean } | undefined;
 const storeWarnings: StoreDiagnosticWarning[] = [];
 const MAX_STORE_WARNINGS = 50;
 const CALLBACK_STACK_DELAY_MS = 250;
@@ -1733,54 +1739,6 @@ function readFileFromOffset(filePath: string, offset: number): { buffer: Buffer;
     }
   } catch {
     return { buffer: Buffer.alloc(0), offset };
-  }
-}
-
-function isTmuxAvailable(): boolean {
-  const now = Date.now();
-  if (tmuxAvailabilityCache && now - tmuxAvailabilityCache.checkedAt < TMUX_AVAILABILITY_CACHE_MS) {
-    return tmuxAvailabilityCache.ok;
-  }
-  const ok = runTmuxSync(["-V"]).ok;
-  tmuxAvailabilityCache = { checkedAt: now, ok };
-  return ok;
-}
-
-function tmuxSessionExists(sessionName: string | undefined): boolean {
-  if (!sessionName) return false;
-  return runTmuxSync(["has-session", "-t", sessionName]).ok;
-}
-
-function listTmuxSessions(): Set<string> | undefined {
-  if (!isTmuxAvailable()) return undefined;
-  const result = runTmuxCaptureSync(["list-sessions", "-F", "#{session_name}"]);
-  if (!result.ok) return undefined;
-  return new Set(result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
-}
-
-function runTmuxCaptureSync(args: string[]): { ok: true; stdout: string } | { ok: false; error: string } {
-  try {
-    const stdout = execFileSync("tmux", args, {
-      encoding: "utf-8",
-      timeout: TMUX_COMMAND_TIMEOUT_MS,
-      killSignal: "SIGKILL",
-    });
-    return { ok: true, stdout };
-  } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
-  }
-}
-
-function runTmuxSync(args: string[]): { ok: true } | { ok: false; error: string } {
-  try {
-    execFileSync("tmux", args, {
-      stdio: "ignore",
-      timeout: TMUX_COMMAND_TIMEOUT_MS,
-      killSignal: "SIGKILL",
-    });
-    return { ok: true };
-  } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
 }
 
@@ -3797,29 +3755,6 @@ function truncateForTool(text: string): string {
   );
 }
 
-function truncateOneLine(text: string, maxChars: number): string {
-  const oneLine = squashWhitespace(text);
-  return oneLine.length > maxChars ? `${oneLine.slice(0, Math.max(0, maxChars - 1))}…` : oneLine;
-}
-
-function truncateString(text: string, maxChars: number): string {
-  if (text.length <= maxChars) return text;
-  return `${text.slice(0, Math.max(0, maxChars - 1))}…`;
-}
-
-function squashWhitespace(text: string): string {
-  return text.replace(/\s+/g, " ").trim();
-}
-
-function displayCommand(command: string, args: string[]): string {
-  return [command, ...args].map(shellQuote).join(" ");
-}
-
-function shellQuote(value: string): string {
-  if (/^[A-Za-z0-9_./:@=-]+$/.test(value)) return value;
-  return `'${value.replace(/'/g, `'"'"'`)}'`;
-}
-
 export const __subagentsTest = {
   normalizeWorktreeEnvConfig,
   readWorktreeConfig,
@@ -3864,9 +3799,7 @@ export const __subagentsTest = {
     clearCallbackFlushTimer();
     clearStatusRefreshTimer();
   },
-  resetTmuxAvailabilityCache() {
-    tmuxAvailabilityCache = undefined;
-  },
+  resetTmuxAvailabilityCache,
   isSubagentChildProcess,
   refreshSubagentStatus,
   loadPersistedJobs,
