@@ -10,6 +10,7 @@ import {
 import { USAGE_STAT_KEYS } from "./types.js";
 import type {
   JobEvent,
+  JobPhase,
   JobRecord,
   JobTransition,
   JobTransitionEffect,
@@ -44,7 +45,7 @@ export function reduceJobEvent(record: JobRecord, event: JobEvent, options: Redu
     }
 
     case "PrepareFailed": {
-      if (next.phase === "created" || next.phase === "preparing" || next.phase === "starting") {
+      if (isPreStartPhase(next.phase)) {
         enterTerminal(next, {
           phase: "failed",
           reason: "prepare-failed",
@@ -66,7 +67,7 @@ export function reduceJobEvent(record: JobRecord, event: JobEvent, options: Redu
     }
 
     case "SupervisorFailed": {
-      if (next.phase === "created" || next.phase === "preparing" || next.phase === "starting") {
+      if (isPreStartPhase(next.phase)) {
         enterTerminal(next, {
           phase: "failed",
           reason: "supervisor-failed",
@@ -74,7 +75,7 @@ export function reduceJobEvent(record: JobRecord, event: JobEvent, options: Redu
           error: event.error,
           message: event.error,
         }, effects);
-      } else if (next.phase === "running" || next.phase === "stopping") {
+      } else if (isLiveOrStoppingPhase(next.phase)) {
         next.phase = "draining";
         setPendingTerminalIfAbsent(next, {
           reason: "supervisor-failed",
@@ -126,7 +127,7 @@ export function reduceJobEvent(record: JobRecord, event: JobEvent, options: Redu
     }
 
     case "StopRequested": {
-      if (next.phase === "created" || next.phase === "preparing" || next.phase === "starting") {
+      if (isPreStartPhase(next.phase)) {
         enterTerminal(next, {
           phase: "cancelled",
           reason: "stop",
@@ -146,7 +147,7 @@ export function reduceJobEvent(record: JobRecord, event: JobEvent, options: Redu
     }
 
     case "TimeoutElapsed": {
-      if (next.phase === "running" || next.phase === "stopping") {
+      if (isLiveOrStoppingPhase(next.phase)) {
         const message = event.message ?? "timeout elapsed";
         next.phase = "stopping";
         next.timeoutAt = now;
@@ -161,7 +162,7 @@ export function reduceJobEvent(record: JobRecord, event: JobEvent, options: Redu
     }
 
     case "ChildExitObserved": {
-      if (next.phase === "running" || next.phase === "stopping") {
+      if (isLiveOrStoppingPhase(next.phase)) {
         next.phase = "draining";
         setPendingTerminalIfAbsent(next, {
           reason: "natural-exit",
@@ -177,7 +178,7 @@ export function reduceJobEvent(record: JobRecord, event: JobEvent, options: Redu
     }
 
     case "SupervisorGoneObserved": {
-      if (next.phase === "running" || next.phase === "stopping") {
+      if (isLiveOrStoppingPhase(next.phase)) {
         next.phase = "draining";
         setPendingTerminalIfAbsent(next, {
           reason: "supervisor-failed",
@@ -300,6 +301,14 @@ function enterTerminal(record: JobRecord, terminal: TerminalInfo, effects: JobTr
   record.terminal = terminal;
   delete record.pendingTerminal;
   effects.push({ type: "terminal-entered", terminal });
+}
+
+function isPreStartPhase(phase: JobPhase): boolean {
+  return phase === "created" || phase === "preparing" || phase === "starting";
+}
+
+function isLiveOrStoppingPhase(phase: JobPhase): boolean {
+  return phase === "running" || phase === "stopping";
 }
 
 function assertNonNegativeFinite(value: unknown, path: string): asserts value is number {
