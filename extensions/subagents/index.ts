@@ -30,6 +30,7 @@ import { hydrateJobRecord, serializeJobRecord, UnsupportedJobRecordSchemaError }
 import { createJobId, shortJobId, tmuxSessionName } from "./core/ids.js";
 import { reduceJobEvent } from "./core/state-machine.js";
 import { formatToolCall, formatToolResultMessage, getAssistantText, previewToolResult, textContent } from "./output/message-format.js";
+import { compactPreview } from "./output/preview.js";
 import { formatUsage } from "./output/usage.js";
 import { getShellInvocation } from "./platform/shell.js";
 import { displayCommand, shellQuote, squashWhitespace, truncateOneLine, truncateString } from "./platform/text.js";
@@ -3529,16 +3530,6 @@ function latestLogPreview(job: AgentJob): string | undefined {
     return entry.text;
   }
   return undefined;
-}
-
-function compactPreview(text: string, maxChars: number, maxLines: number): string {
-  const joined = text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .slice(0, maxLines)
-    .join(" / ");
-  return truncateOneLine(joined || "(empty)", maxChars);
 }
 
 function formatLogEntry(entry: AgentLogEntry): string {
