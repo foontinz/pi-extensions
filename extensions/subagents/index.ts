@@ -28,6 +28,7 @@ import { Type, type Static } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents, formatAgentList } from "./agents.js";
 import { hydrateJobRecord, serializeJobRecord, UnsupportedJobRecordSchemaError } from "./core/hydration.js";
 import { reduceJobEvent } from "./core/state-machine.js";
+import { formatToolCall, formatToolResultMessage, getAssistantText, previewToolResult, textContent } from "./output/message-format.js";
 import { getShellInvocation } from "./platform/shell.js";
 import { displayCommand, shellQuote, squashWhitespace, truncateOneLine, truncateString } from "./platform/text.js";
 import { buildPostCopyEnv, getPostCopyBaseEnvKeys } from "./policy/post-copy-env.js";
@@ -3563,78 +3564,6 @@ function compactPreview(text: string, maxChars: number, maxLines: number): strin
 function formatLogEntry(entry: AgentLogEntry): string {
   const time = new Date(entry.timestamp).toISOString().slice(11, 19);
   return `${entry.seq.toString().padStart(4, " ")} ${time} ${entry.level.padEnd(9)} ${entry.text}`;
-}
-
-function formatToolCall(toolName: string, args: Record<string, unknown> | undefined): string {
-  const a = args ?? {};
-  const shortenPath = (p: string) => {
-    const home = os.homedir();
-    return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
-  };
-
-  switch (toolName) {
-    case "bash": {
-      const command = String(a.command ?? "...");
-      return `$ ${truncateOneLine(command, 160)}`;
-    }
-    case "read": {
-      const filePath = shortenPath(String(a.path ?? a.file_path ?? "..."));
-      const offset = typeof a.offset === "number" ? a.offset : undefined;
-      const limit = typeof a.limit === "number" ? a.limit : undefined;
-      const suffix = offset !== undefined || limit !== undefined ? `:${offset ?? 1}${limit ? `-${(offset ?? 1) + limit - 1}` : ""}` : "";
-      return `read ${filePath}${suffix}`;
-    }
-    case "write":
-    case "edit": {
-      return `${toolName} ${shortenPath(String(a.path ?? a.file_path ?? "..."))}`;
-    }
-    case "grep": {
-      return `grep /${String(a.pattern ?? "")}/ in ${shortenPath(String(a.path ?? "."))}`;
-    }
-    case "find": {
-      return `find ${String(a.pattern ?? "*")} in ${shortenPath(String(a.path ?? "."))}`;
-    }
-    case "ls": {
-      return `ls ${shortenPath(String(a.path ?? "."))}`;
-    }
-    default: {
-      return `${toolName} ${truncateOneLine(JSON.stringify(a), 200)}`;
-    }
-  }
-}
-
-function previewToolResult(result: any): string {
-  if (!result) return "";
-  if (Array.isArray(result.content)) {
-    return truncateOneLine(
-      result.content
-        .map((part: any) => (part?.type === "text" ? part.text : part?.type ? `[${part.type}]` : ""))
-        .filter(Boolean)
-        .join("\n"),
-      300,
-    );
-  }
-  if (typeof result === "string") return truncateOneLine(result, 300);
-  return truncateOneLine(JSON.stringify(result), 300);
-}
-
-function formatToolResultMessage(msg: ToolResultMessage): string {
-  const text = msg.content
-    .map((part) => (part.type === "text" ? part.text : `[${part.type}]`))
-    .filter(Boolean)
-    .join("\n");
-  return `${msg.isError ? "✗" : "✓"} ${msg.toolName}: ${truncateOneLine(text || "done", 300)}`;
-}
-
-function getAssistantText(msg: AssistantMessage): string {
-  return msg.content
-    .map((part) => (part.type === "text" ? part.text : ""))
-    .filter(Boolean)
-    .join("\n");
-}
-
-function textContent(content: Array<{ type: string; text?: string }>): string {
-  return content.map((part) => (part.type === "text" ? part.text ?? "" : "")).join("\n");
 }
 
 function formatUsage(usage: UsageStats): string {
