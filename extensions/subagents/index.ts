@@ -29,6 +29,7 @@ import { type AgentConfig, type AgentScope, discoverAgents, formatAgentList } fr
 import { hydrateJobRecord, serializeJobRecord, UnsupportedJobRecordSchemaError } from "./core/hydration.js";
 import { reduceJobEvent } from "./core/state-machine.js";
 import { formatToolCall, formatToolResultMessage, getAssistantText, previewToolResult, textContent } from "./output/message-format.js";
+import { formatUsage } from "./output/usage.js";
 import { getShellInvocation } from "./platform/shell.js";
 import { displayCommand, shellQuote, squashWhitespace, truncateOneLine, truncateString } from "./platform/text.js";
 import { buildPostCopyEnv, getPostCopyBaseEnvKeys } from "./policy/post-copy-env.js";
@@ -53,6 +54,7 @@ import {
   type JobRecord,
   type PendingTerminalInfo,
   type TerminalInfo,
+  type UsageStats,
 } from "./core/types.js";
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
@@ -118,16 +120,6 @@ function isSubagentChildProcess(): boolean {
 type JobStatus = "running" | "completed" | "failed" | "cancelled";
 type LogLevel = "info" | "assistant" | "tool" | "stdout" | "stderr" | "error";
 type PollVerbosity = "summary" | "logs" | "full";
-
-interface UsageStats {
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  cost: number;
-  contextTokens: number;
-  turns: number;
-}
 
 interface AgentLogEntry {
   seq: number;
@@ -3564,24 +3556,6 @@ function compactPreview(text: string, maxChars: number, maxLines: number): strin
 function formatLogEntry(entry: AgentLogEntry): string {
   const time = new Date(entry.timestamp).toISOString().slice(11, 19);
   return `${entry.seq.toString().padStart(4, " ")} ${time} ${entry.level.padEnd(9)} ${entry.text}`;
-}
-
-function formatUsage(usage: UsageStats): string {
-  const parts: string[] = [];
-  if (usage.turns) parts.push(`${usage.turns}t`);
-  if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
-  if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
-  if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
-  if (usage.cacheWrite) parts.push(`W${formatTokens(usage.cacheWrite)}`);
-  if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
-  return parts.join(" ");
-}
-
-function formatTokens(count: number): string {
-  if (count < 1_000) return count.toString();
-  if (count < 10_000) return `${(count / 1_000).toFixed(1)}k`;
-  if (count < 1_000_000) return `${Math.round(count / 1_000)}k`;
-  return `${(count / 1_000_000).toFixed(1)}M`;
 }
 
 function appendCappedText(current: string, chunk: string, maxChars: number): string {
