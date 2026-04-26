@@ -8,6 +8,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAgentDir, parseFrontmatter } from "@mariozechner/pi-coding-agent";
+import { parseToolList } from "./policy/tool-selection.js";
 
 export type AgentScope = "user" | "project" | "both";
 
@@ -60,10 +61,8 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
     const description = asString(frontmatter.description);
     if (!name || !description) continue;
 
-    const tools = asString(frontmatter.tools)
-      ?.split(",")
-      .map((tool) => tool.trim())
-      .filter(Boolean);
+    const parsedTools = frontmatter.tools === undefined ? undefined : parseToolList(frontmatter.tools);
+    const tools = parsedTools?.ok && parsedTools.tools.length > 0 ? parsedTools.tools : undefined;
 
     agents.push({
       name,

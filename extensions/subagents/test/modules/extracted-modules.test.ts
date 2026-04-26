@@ -17,7 +17,7 @@ const plainTheme: StatusTheme = { fg: (_role, text) => text };
 test("extracted tool selection module validates default and rejected tools directly", () => {
   const defaultSelection = validateToolSelection(["bash", "find", "ls", "read"], undefined);
   assert.equal(defaultSelection.ok, true);
-  assert.deepEqual(defaultSelection.tools, ["find", "ls", "read"]);
+  assert.deepEqual(defaultSelection.tools, ["read", "find", "ls"]);
 
   const rejected = validateToolSelection(["read"], ["read", "bash"]);
   assert.equal(rejected.ok, false);

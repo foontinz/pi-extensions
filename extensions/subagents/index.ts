@@ -109,8 +109,8 @@ const MAX_STDERR_PARTIAL_BUFFER_CHARS = 1_000_000;
 const MAX_LOG_READ_BYTES = 1_000_000;
 const DEFAULT_MAX_RAW_LOG_BYTES = 512 * 1024 * 1024;
 const MAX_RAW_LOG_BYTES = parseOptionalNonNegativeIntegerEnv("PI_SUBAGENTS_MAX_RAW_LOG_BYTES", DEFAULT_MAX_RAW_LOG_BYTES);
-const DEFAULT_MAX_RUNNING_SUBAGENTS = 8;
-const DEFAULT_MAX_RUNNING_SUBAGENTS_PER_REPO = 4;
+const DEFAULT_MAX_RUNNING_SUBAGENTS = 10;
+const DEFAULT_MAX_RUNNING_SUBAGENTS_PER_REPO = 10;
 const MAX_RUNNING_SUBAGENTS = parseOptionalNonNegativeIntegerEnv("PI_SUBAGENTS_MAX_RUNNING", DEFAULT_MAX_RUNNING_SUBAGENTS);
 const MAX_RUNNING_SUBAGENTS_PER_REPO = parseOptionalNonNegativeIntegerEnv("PI_SUBAGENTS_MAX_RUNNING_PER_REPO", DEFAULT_MAX_RUNNING_SUBAGENTS_PER_REPO);
 const MAX_RETAINED_FINISHED_JOBS = 50;
@@ -234,6 +234,8 @@ interface JobStorePaths {
 
 const INSTANCE_ID_SYMBOL = Symbol.for("pi.subagents.instanceId");
 const jobs = new Map<string, AgentJob>();
+const launchReservations: Array<{ ownerId: string; repoKey: string }> = [];
+let launchCapacityMutex: Promise<void> = Promise.resolve();
 let currentOwner: JobOwnerInfo | undefined;
 let currentStorePaths: JobStorePaths | undefined;
 let extensionApi: ExtensionAPI | undefined;
@@ -266,7 +268,7 @@ const RunAgentParams = Type.Object({
   tools: Type.Optional(
     Type.Array(Type.String(), {
       description:
-        "Optional allowlist of active tools for the subagent, e.g. [\"read\",\"grep\",\"find\",\"ls\"]. Defaults to Pi's normal active tools.",
+        `Optional allowlist of active tools for the subagent, e.g. [\"read\",\"grep\",\"find\",\"ls\"]. Defaults to the active safe read-only tools: ${DEFAULT_SUBAGENT_TOOLS.join(", ")}.`,
       maxItems: 64,
     }),
   ),
@@ -370,6 +372,7 @@ function clearInMemoryJobs(): void {
     if (job.monitorTimer) clearInterval(job.monitorTimer);
   }
   jobs.clear();
+  launchReservations.length = 0;
   storeWarnings.length = 0;
   pendingFinishedCallbacks.clear();
   clearCallbackFlushTimer();
@@ -431,7 +434,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       "Finished subagents report their final output back to the parent Pi session when possible; attach to the tmux session for live output/debugging.",
       "Running subagents are stopped when the parent Pi session shuts down.",
       "When started inside a git repo, the child runs in a temporary detached worktree by default; .pi/worktree.json controls copied files, post-copy setup scripts, and retention. Pass worktree:false to run in-place or worktree:true to require isolation.",
-      "By default, subagents receive only active read-only tools (read/grep/find/ls); pass tools explicitly to grant write, execute, network, or other higher-risk capabilities.",
+      `By default, subagents receive only active read-only tools (${DEFAULT_SUBAGENT_TOOLS.join("/")}); pass tools explicitly to grant write, execute, network, or other higher-risk capabilities. Recursive subagent tools are denied in children by default.`,
       "Can run a named user-owned markdown agent or an ad-hoc subagent with optional systemPrompt/tools and an explicit model override only when requested.",
     ].join(" "),
     promptSnippet: "Start a non-blocking background Pi subagent job and return a job id.",
@@ -439,9 +442,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       "Use run_agent for long-running or parallelizable investigation/implementation tasks that should not block the main agent turn.",
       "Use list_agents first when the user asks what named user-owned agents are available or when you need to choose a named markdown agent.",
       "Finished subagents send a callback to the parent Pi session when possible; use the printed tmux session only for live output/debugging.",
+      "If you need to wait for subagent results, do not block the turn with sleep/polling commands; end the turn and you will be notified when callbacks arrive.",
       "Remember run_agent uses a temporary git worktree when inside a repo unless worktree:false is set; uncommitted/untracked files are visible only if copied by .pi/worktree.json, and dependencies may need postCopy setup.",
       "Subagents are bounded to the current Pi session and will be stopped during session shutdown/reload; let them finish before ending the session if you need callback results.",
-      "Omit tools for the safe read-only default; pass tools explicitly only when the subagent needs additional capabilities.",
+      `Omit tools for the safe read-only default (${DEFAULT_SUBAGENT_TOOLS.join(", ")}); pass tools explicitly only when the subagent needs additional capabilities. Do not grant recursive subagent tools to child agents.`,
       "Do not set the model parameter unless the user explicitly requests a specific model/provider; omit it to use the child Pi default and avoid provider/API-key mismatches.",
       "Subagents do not inherit the parent conversation; include all necessary context in the task, systemPrompt, named agent, files, or repo context.",
     ],
@@ -453,7 +457,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       loadPersistedJobs();
       refreshRunningTmuxJobs();
       refreshSubagentStatus();
-      const sourceCwd = params.cwd ? path.resolve(ctx.cwd, params.cwd) : ctx.cwd;
+      const cwdResolution = resolveAndValidateCwd(ctx.cwd, params.cwd);
+      if (!cwdResolution.ok) {
+        return { content: [{ type: "text", text: cwdResolution.message }], details: { cwd: cwdResolution.cwd } };
+      }
+      const sourceCwd = cwdResolution.cwd;
       const discovery = discoverAgents(sourceCwd, "user");
       const agents = discovery.agents;
       const namedAgent = params.agent ? agents.find((agent) => agent.name === params.agent) : undefined;
@@ -479,7 +487,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
       }
 
-      const capacity = await checkSubagentCapacity(sourceCwd);
+      const capacity = await reserveSubagentCapacity(sourceCwd);
       if (!capacity.ok) {
         return {
           content: [{ type: "text", text: capacity.message }],
@@ -487,7 +495,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
       }
 
-      const job = await startAgentJob(sourceCwd, params, namedAgent, toolSelection.tools, ctx, capacity.repoKey);
+      let job: AgentJob;
+      try {
+        job = await startAgentJob(sourceCwd, params, namedAgent, toolSelection.tools, ctx, capacity.repoKey);
+      } finally {
+        capacity.release();
+      }
       const details = summarizeJob(job);
       const text = formatRunAgentStartResult(job);
 
@@ -654,14 +667,23 @@ function preflightSupervisorRequirements(): { ok: true } | { ok: false; message:
   return { ok: true };
 }
 
-async function checkSubagentCapacity(sourceCwd: string): Promise<
-  | { ok: true; repoKey: string; details: { running: number; maxRunning: number; runningForRepo: number; maxRunningPerRepo: number; repoKey: string } }
-  | { ok: false; repoKey: string; message: string; details: { running: number; maxRunning: number; runningForRepo: number; maxRunningPerRepo: number; repoKey: string } }
-> {
+type CapacityDetails = { running: number; maxRunning: number; runningForRepo: number; maxRunningPerRepo: number; repoKey: string };
+type CapacityResult =
+  | { ok: true; repoKey: string; details: CapacityDetails }
+  | { ok: false; repoKey: string; message: string; details: CapacityDetails };
+
+async function checkSubagentCapacity(sourceCwd: string): Promise<CapacityResult> {
   const repoKey = await subagentRepoKey(sourceCwd);
+  return checkSubagentCapacityForRepo(repoKey);
+}
+
+function checkSubagentCapacityForRepo(repoKey: string): CapacityResult {
+  const owner = requireCurrentOwner();
   const runningJobs = [...jobs.values()].filter((job) => job.status === "running" && jobBelongsToCurrentOwner(job));
-  const running = runningJobs.length;
-  const runningForRepo = runningJobs.filter((job) => (job.repoKey ?? job.worktree?.originalRoot ?? job.sourceCwd) === repoKey).length;
+  const ownerReservations = launchReservations.filter((reservation) => reservation.ownerId === owner.id);
+  const running = runningJobs.length + ownerReservations.length;
+  const runningForRepo = runningJobs.filter((job) => (job.repoKey ?? job.worktree?.originalRoot ?? job.sourceCwd) === repoKey).length
+    + ownerReservations.filter((reservation) => reservation.repoKey === repoKey).length;
   const details = { running, maxRunning: MAX_RUNNING_SUBAGENTS, runningForRepo, maxRunningPerRepo: MAX_RUNNING_SUBAGENTS_PER_REPO, repoKey };
   if (MAX_RUNNING_SUBAGENTS > 0 && running >= MAX_RUNNING_SUBAGENTS) {
     return { ok: false, repoKey, details, message: `Refusing to start subagent: ${running} running jobs already meet PI_SUBAGENTS_MAX_RUNNING=${MAX_RUNNING_SUBAGENTS}. Stop or wait for an existing job, or raise/disable the limit.` };
@@ -672,8 +694,47 @@ async function checkSubagentCapacity(sourceCwd: string): Promise<
   return { ok: true, repoKey, details };
 }
 
+async function reserveSubagentCapacity(sourceCwd: string): Promise<CapacityResult & ({ ok: true; release: () => void } | { ok: false })> {
+  let unlock!: () => void;
+  const previous = launchCapacityMutex;
+  launchCapacityMutex = new Promise<void>((resolve) => { unlock = resolve; });
+  await previous;
+  try {
+    const repoKey = await subagentRepoKey(sourceCwd);
+    const capacity = checkSubagentCapacityForRepo(repoKey);
+    if (!capacity.ok) return capacity;
+    const ownerId = requireCurrentOwner().id;
+    const reservation = { ownerId, repoKey };
+    launchReservations.push(reservation);
+    let released = false;
+    return {
+      ...capacity,
+      release: () => {
+        if (released) return;
+        released = true;
+        const index = launchReservations.indexOf(reservation);
+        if (index >= 0) launchReservations.splice(index, 1);
+      },
+    };
+  } finally {
+    unlock();
+  }
+}
+
 async function subagentRepoKey(sourceCwd: string): Promise<string> {
   return (await getGitRoot(sourceCwd)) ?? path.resolve(sourceCwd);
+}
+
+function resolveAndValidateCwd(baseCwd: string, requestedCwd: string | undefined): { ok: true; cwd: string } | { ok: false; cwd: string; message: string } {
+  const cwd = requestedCwd ? path.resolve(baseCwd, requestedCwd) : baseCwd;
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(cwd);
+  } catch (error) {
+    return { ok: false, cwd, message: `Cannot start subagent: cwd does not exist or is not accessible: ${cwd} (${errorMessage(error)})` };
+  }
+  if (!stat.isDirectory()) return { ok: false, cwd, message: `Cannot start subagent: cwd is not a directory: ${cwd}` };
+  return { ok: true, cwd };
 }
 
 async function startAgentJob(
@@ -2094,7 +2155,11 @@ function formatSubagentFinishedCallback(job: AgentJob): string {
 }
 
 function callbackMarkerPath(id: string): string {
-  return path.join(requireStorePaths().jobsDir, `${id}.callback.json`);
+  return callbackMarkerPathForStore(requireStorePaths(), id);
+}
+
+function callbackMarkerPathForStore(store: JobStorePaths, id: string): string {
+  return path.join(store.jobsDir, `${id}.callback.json`);
 }
 
 interface CallbackMarker {
@@ -2110,17 +2175,18 @@ interface CallbackMarker {
 
 function tryCreateCallbackMarker(job: AgentJob): boolean {
   let fd: number | undefined;
+  const store = storePathsForOwner(job.owner);
   try {
-    ensureJobStoreDirs();
-    fd = fs.openSync(callbackMarkerPath(job.id), "wx", 0o600);
+    ensureJobStoreDirsFor(store);
+    fd = fs.openSync(callbackMarkerPathForStore(store, job.id), "wx", 0o600);
     fs.writeFileSync(fd, JSON.stringify({ id: job.id, ownerId: job.owner.id, state: "pending", pendingAt: Date.now(), attempts: 0 } satisfies CallbackMarker) + "\n", "utf-8");
     return true;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      const marker = readCallbackMarker(job.id);
+      const marker = readCallbackMarkerForOwner(job.owner, job.id);
       return marker?.state === "pending" && marker.ownerId === job.owner.id;
     }
-    if (fd !== undefined) removeCallbackMarker(job.id);
+    if (fd !== undefined) removeCallbackMarkerForOwner(job.owner, job.id);
     // If marker persistence is unavailable, prefer a best-effort callback over silence.
     return true;
   } finally {
@@ -2131,9 +2197,14 @@ function tryCreateCallbackMarker(job: AgentJob): boolean {
 }
 
 function readCallbackMarker(id: string): CallbackMarker | undefined {
+  const owner = currentOwner;
+  return owner ? readCallbackMarkerForOwner(owner, id) : undefined;
+}
+
+function readCallbackMarkerForOwner(owner: JobOwnerInfo, id: string): CallbackMarker | undefined {
   try {
-    const parsed = JSON.parse(fs.readFileSync(callbackMarkerPath(id), "utf-8")) as Partial<CallbackMarker>;
-    if (parsed.id !== id || parsed.ownerId !== currentOwner?.id || (parsed.state !== "pending" && parsed.state !== "delivered")) return undefined;
+    const parsed = JSON.parse(fs.readFileSync(callbackMarkerPathForStore(storePathsForOwner(owner), id), "utf-8")) as Partial<CallbackMarker>;
+    if (parsed.id !== id || parsed.ownerId !== owner.id || (parsed.state !== "pending" && parsed.state !== "delivered")) return undefined;
     return parsed as CallbackMarker;
   } catch {
     return undefined;
@@ -2141,9 +2212,16 @@ function readCallbackMarker(id: string): CallbackMarker | undefined {
 }
 
 function writeCallbackMarker(marker: CallbackMarker): void {
-  ensureJobStoreDirs();
-  if (marker.ownerId !== requireCurrentOwner().id) return;
-  fs.writeFileSync(callbackMarkerPath(marker.id), JSON.stringify(marker) + "\n", { encoding: "utf-8", mode: 0o600 });
+  const owner = currentOwner;
+  if (!owner || marker.ownerId !== owner.id) return;
+  writeCallbackMarkerForOwner(owner, marker);
+}
+
+function writeCallbackMarkerForOwner(owner: JobOwnerInfo, marker: CallbackMarker): void {
+  const store = storePathsForOwner(owner);
+  ensureJobStoreDirsFor(store);
+  if (marker.ownerId !== owner.id) return;
+  fs.writeFileSync(callbackMarkerPathForStore(store, marker.id), JSON.stringify(marker) + "\n", { encoding: "utf-8", mode: 0o600 });
 }
 
 function newCallbackMarker(id: string): CallbackMarker {
@@ -2193,8 +2271,14 @@ function tryNotify(ctx: ExtensionContext, message: string, type: "info" | "warni
 }
 
 function removeCallbackMarker(id: string): void {
+  const owner = currentOwner;
+  if (!owner) return;
+  removeCallbackMarkerForOwner(owner, id);
+}
+
+function removeCallbackMarkerForOwner(owner: JobOwnerInfo, id: string): void {
   try {
-    fs.rmSync(callbackMarkerPath(id), { force: true });
+    fs.rmSync(callbackMarkerPathForStore(storePathsForOwner(owner), id), { force: true });
   } catch {
     // ignore
   }

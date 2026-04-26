@@ -2,10 +2,12 @@
 
 Non-blocking Pi subagents exposed as tools.
 
+Subagent execution is session-bound: running child jobs are stopped when the parent Pi session shuts down or reloads. Persistence is used for terminal summaries, callback delivery/retry, log/debug data, and cleanup retry; it is not a durable detached-execution recovery system.
+
 ## Tools
 
 - `list_agents` — lists user-owned markdown-backed named agents discoverable by `run_agent` from `~/.pi/agent/agents`.
-- `run_agent` — starts a session-bounded tmux-supervised `pi --mode json -p --no-session` process and returns a job id immediately. Finished subagents report their final output back to the parent Pi session when possible. Omit `model` unless the user explicitly requested a specific model; the child Pi will otherwise use its normal/default model configuration.
+- `run_agent` — starts a session-bounded tmux-supervised `pi --mode json -p --no-session` process and returns a job id immediately. Finished subagents report their final output back to the parent Pi session when possible. Omit `model` unless the user explicitly requested a specific model; the child Pi will otherwise use its normal/default model configuration. Recursive subagent tools are denied in child allowlists by default.
 - `stop_agent` — terminates a running background job.
 
 Tool names use underscores for provider/tool-call compatibility; labels render as “List Agents”, “Run Agent”, and “Stop Agent”. Running/recent jobs are also shown in Pi’s subagents status/widget with their label, runtime, status, and compact state.
@@ -34,6 +36,8 @@ run_agent({
 })
 
 // 3. The final result is sent back to the parent Pi session when the job finishes.
+// If you need to wait for results, end the turn rather than blocking with sleep/polling;
+// Pi will wake you up when subagent callbacks arrive.
 // For live output/debugging, attach to the tmux session printed by run_agent.
 
 // 4. Cancel if no longer needed. stop_agent sends Ctrl-C first, then hard-kills
@@ -111,8 +115,8 @@ You are a fast reconnaissance subagent. Find relevant files and return a concise
 - Jobs are supervised by tmux and persisted under `~/.pi/agent/subagents/`, but running jobs are bounded to the parent Pi session. Graceful `/reload`, session switch, and parent Pi shutdown stop running subagents; the next session also stops recovered orphan running jobs left by an ungraceful exit. `tmux` on `PATH` and executable `/bin/sh` are required before a job is launched. Use `stop_agent` to terminate a running job explicitly; it sends Ctrl-C to the tmux pane first, drains output, then hard-kills the tmux session after the grace period (`waitMs`, default 5000, max 60000) if needed.
 - Attach to a live job with `tmux attach -t <session>`; `run_agent` prints the exact session name.
 - Full raw child process streams are persisted under `~/.pi/agent/subagents/logs/*.stdout.jsonl` and `*.stderr.log` for manual inspection. To prevent unbounded disk growth, a running job is stopped if either raw stream exceeds `PI_SUBAGENTS_MAX_RAW_LOG_BYTES` bytes; the default is 512 MiB per stream, and `0` disables this guard.
-- Child tool access is limited to tools active in the parent Pi session. If `tools` is omitted, the child receives only the active safe read-only default tools: `read`, `grep`, `find`, and `ls` when available. Requested agent/tool allowlists must be a subset of parent active tools. Pass tools explicitly to grant write, execute, network, or other higher-risk capabilities.
-- Running job concurrency is capped by default to protect the host: `PI_SUBAGENTS_MAX_RUNNING` defaults to 8 globally and `PI_SUBAGENTS_MAX_RUNNING_PER_REPO` defaults to 4 per repository/path. Set either to `0` to disable that limit.
+- Child tool access is limited to tools active in the parent Pi session. If `tools` is omitted, the child receives only the active safe read-only default tools: `read`, `grep`, `find`, and `ls` when available. Requested agent/tool allowlists must be a subset of parent active tools, and recursive subagent tools (`run_agent`, `list_agents`, `stop_agent`) are denied by default. Pass tools explicitly to grant write, execute, network, or other higher-risk capabilities.
+- Running job concurrency is capped by default to protect the host: `PI_SUBAGENTS_MAX_RUNNING` defaults to 10 globally and `PI_SUBAGENTS_MAX_RUNNING_PER_REPO` defaults to 10 per repository/path. Set either to `0` to disable that limit.
 - The child process uses `--no-session`: it does not inherit the parent conversation and does not write a normal Pi session file. Put all needed context in the task, named/ad-hoc system prompt, files, or repo context.
 - Do not pass a `model` override for routine delegation/review. Only set `model` when the user explicitly asks for that exact model/provider; otherwise the child Pi uses its configured default, avoiding provider/API-key mismatches.
-- Child Pi isolation is intentionally limited: the child process loads normal Pi configuration/extensions, skills, providers, and context files. This means extension side effects still apply in the child, and if subagent tools are active in the child configuration then nested subagent delegation may be possible. Use the `tools` allowlist to constrain tool exposure for each run; there is not currently a minimal-extension or extension-denylist child mode.
+- Child Pi isolation is intentionally limited: the child process loads normal Pi configuration/extensions, skills, providers, and context files. This means extension side effects still apply in the child. Recursive subagent tools are denied in child allowlists by default, and the `tools` allowlist should still be used to constrain tool exposure for each run; there is not currently a minimal-extension or extension-denylist child mode.

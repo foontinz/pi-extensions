@@ -389,7 +389,7 @@ test("run_agent characterizes public refusal paths before launch", async () => {
 
   const invalidTools = await tools.get("run_agent")!.execute("call", { task: "x", tools: ["read", "bash"] }, new AbortController().signal, () => {}, ctx);
   assert.equal(textOf(invalidTools), "Refusing to start subagent with tools not active in the parent session: bash. Active tools: find, grep, ls, read.");
-  assert.deepEqual(invalidTools.details.requestedTools, ["bash", "read"]);
+  assert.deepEqual(invalidTools.details.requestedTools, ["read", "bash"]);
 
   __subagentsTest.putJob(makeJob({ id: "agent_capacity", repoKey: cwd }));
   const capacity = await tools.get("run_agent")!.execute("call", { task: "x" }, new AbortController().signal, () => {}, ctx);
@@ -425,7 +425,7 @@ test("run_agent successful start text/details are characterized with fake tmux",
     assert.match(textOf(result), /Status: running/);
     assert.match(textOf(result), /Label: fake success/);
     assert.match(textOf(result), /Supervisor: tmux \(pi-agent_/);
-    assert.match(textOf(result), /Tools: find, grep, ls, read/);
+    assert.match(textOf(result), /Tools: read, grep, find, ls/);
     assert.match(textOf(result), /Attach: tmux attach -t pi-agent_/);
     assert.match(textOf(result), new RegExp(`CWD: ${escapeRegExp(cwd)}`));
     assert.match(textOf(result), /The final result will be sent back to this Pi session when the subagent finishes\./);
