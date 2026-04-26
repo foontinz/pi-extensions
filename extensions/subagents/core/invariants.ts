@@ -1,6 +1,14 @@
 import { isDeepStrictEqual } from "node:util";
 import {
+  CLEANUP_PHASE_VALUES,
+  DURABLE_LOG_LEVEL_VALUES,
+  JOB_PHASE_VALUES,
   JOB_RECORD_SCHEMA_VERSION,
+  SUPERVISOR_KIND_VALUES,
+  TERMINAL_JOB_PHASE_VALUES,
+  TERMINAL_REASON_VALUES,
+  USAGE_STAT_KEYS,
+  WORKTREE_KEEP_MODE_VALUES,
   type CleanupPhase,
   type DurableLogLevel,
   type JobOwnerInfo,
@@ -9,7 +17,6 @@ import {
   type JobTransition,
   type SupervisorKind,
   type TerminalJobPhase,
-  type UsageStats,
   type WorktreeKeepMode,
 } from "./types.js";
 
@@ -21,34 +28,15 @@ export class JobRecordHydrationError extends Error {
   override name = "JobRecordHydrationError";
 }
 
-export const TERMINAL_JOB_PHASES = new Set<TerminalJobPhase>(["completed", "failed", "cancelled"]);
+export const TERMINAL_JOB_PHASES = new Set<TerminalJobPhase>(TERMINAL_JOB_PHASE_VALUES);
 
-const JOB_PHASES = new Set<JobPhase>([
-  "created",
-  "preparing",
-  "starting",
-  "running",
-  "stopping",
-  "draining",
-  "completed",
-  "failed",
-  "cancelled",
-]);
-
-const CLEANUP_PHASES = new Set<CleanupPhase>(["none", "pending", "running", "complete", "retained", "failed"]);
-const SUPERVISOR_KINDS = new Set<SupervisorKind>(["process", "tmux"]);
-const KEEP_WORKTREE_MODES = new Set<WorktreeKeepMode>(["never", "always", "onFailure"]);
-const PENDING_TERMINAL_REASONS = new Set(["natural-exit", "stop", "timeout", "supervisor-failed", "error"]);
-const TERMINAL_REASONS = new Set([
-  "natural-exit",
-  "stop",
-  "timeout",
-  "prepare-failed",
-  "supervisor-failed",
-  "error",
-]);
-const USAGE_KEYS: Array<keyof UsageStats> = ["input", "output", "cacheRead", "cacheWrite", "cost", "contextTokens", "turns"];
-
+const JOB_PHASES = new Set(JOB_PHASE_VALUES);
+const CLEANUP_PHASES = new Set(CLEANUP_PHASE_VALUES);
+const SUPERVISOR_KINDS = new Set(SUPERVISOR_KIND_VALUES);
+const KEEP_WORKTREE_MODES = new Set(WORKTREE_KEEP_MODE_VALUES);
+const PENDING_TERMINAL_REASONS = new Set<string>(TERMINAL_REASON_VALUES.filter((reason) => reason !== "prepare-failed"));
+const TERMINAL_REASONS = new Set<string>(TERMINAL_REASON_VALUES);
+const USAGE_KEYS = USAGE_STAT_KEYS;
 const JOB_RECORD_KEYS = new Set([
   "schemaVersion",
   "id",
@@ -81,7 +69,7 @@ const TERMINAL_KEYS = new Set(["phase", "reason", "finishedAt", "exitCode", "sig
 const PENDING_TERMINAL_KEYS = new Set(["reason", "requestedAt", "observedAt", "exitCode", "signal", "message", "error"]);
 const OBSERVABILITY_KEYS = new Set(["finalOutput", "latestAssistantText", "logs", "messageCount", "lastLogAt"]);
 const OBSERVABILITY_LOG_KEYS = new Set(["seq", "timestamp", "level", "text", "eventType"]);
-const OBSERVABILITY_LOG_LEVELS = new Set<DurableLogLevel>(["info", "assistant", "tool", "stdout", "stderr", "error"]);
+const OBSERVABILITY_LOG_LEVELS = new Set(DURABLE_LOG_LEVEL_VALUES);
 
 export const RUNTIME_ONLY_KEYS = new Set([
   "proc",

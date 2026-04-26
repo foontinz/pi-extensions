@@ -12,31 +12,20 @@ export interface JobOwnerInfo {
   cwd: string;
 }
 
-export type JobPhase =
-  | "created"
-  | "preparing"
-  | "starting"
-  | "running"
-  | "stopping"
-  | "draining"
-  | "completed"
-  | "failed"
-  | "cancelled";
+export const JOB_PHASE_VALUES = ["created", "preparing", "starting", "running", "stopping", "draining", "completed", "failed", "cancelled"] as const;
+export type JobPhase = typeof JOB_PHASE_VALUES[number];
 
-export type TerminalJobPhase = "completed" | "failed" | "cancelled";
+export const TERMINAL_JOB_PHASE_VALUES = ["completed", "failed", "cancelled"] as const;
+export type TerminalJobPhase = typeof TERMINAL_JOB_PHASE_VALUES[number];
 
-export type CleanupPhase = "none" | "pending" | "running" | "complete" | "retained" | "failed";
+export const CLEANUP_PHASE_VALUES = ["none", "pending", "running", "complete", "retained", "failed"] as const;
+export type CleanupPhase = typeof CLEANUP_PHASE_VALUES[number];
 
-export type SupervisorKind = "process" | "tmux";
+export const SUPERVISOR_KIND_VALUES = ["process", "tmux"] as const;
+export type SupervisorKind = typeof SUPERVISOR_KIND_VALUES[number];
 
-export type TerminalReason =
-  | "natural-exit"
-  | "stop"
-  | "timeout"
-  | "prepare-failed"
-  | "supervisor-failed"
-  | "error";
-
+export const TERMINAL_REASON_VALUES = ["natural-exit", "stop", "timeout", "prepare-failed", "supervisor-failed", "error"] as const;
+export type TerminalReason = typeof TERMINAL_REASON_VALUES[number];
 export interface TerminalInfo {
   phase: TerminalJobPhase;
   reason: TerminalReason;
@@ -73,8 +62,9 @@ export interface UsageStats {
   turns: number;
 }
 
-export type WorktreeKeepMode = "never" | "always" | "onFailure";
-
+export const USAGE_STAT_KEYS = ["input", "output", "cacheRead", "cacheWrite", "cost", "contextTokens", "turns"] as const satisfies ReadonlyArray<keyof UsageStats>;
+export const WORKTREE_KEEP_MODE_VALUES = ["never", "always", "onFailure"] as const;
+export type WorktreeKeepMode = typeof WORKTREE_KEEP_MODE_VALUES[number];
 export interface DurableWorktreeScriptResult {
   command: string;
   cwd?: string;
@@ -109,8 +99,8 @@ export interface DurableSupervisorInfo {
   exitCodePath?: string;
 }
 
-export type DurableLogLevel = "info" | "assistant" | "tool" | "stdout" | "stderr" | "error";
-
+export const DURABLE_LOG_LEVEL_VALUES = ["info", "assistant", "tool", "stdout", "stderr", "error"] as const;
+export type DurableLogLevel = typeof DURABLE_LOG_LEVEL_VALUES[number];
 export interface DurableLogEntry {
   seq: number;
   timestamp: number;

@@ -7,6 +7,7 @@ import {
   shouldRetainWorktree,
   JobRecordInvariantError,
 } from "./invariants.js";
+import { USAGE_STAT_KEYS } from "./types.js";
 import type {
   JobEvent,
   JobRecord,
@@ -17,10 +18,7 @@ import type {
   TerminalInfo,
   TerminalJobPhase,
   TerminalReason,
-  UsageStats,
 } from "./types.js";
-
-const USAGE_KEYS: Array<keyof UsageStats> = ["input", "output", "cacheRead", "cacheWrite", "cost", "contextTokens", "turns"];
 
 export function reduceJobEvent(record: JobRecord, event: JobEvent, options: ReduceOptions = {}): JobTransition {
   const now = options.now ?? Date.now();
@@ -118,7 +116,7 @@ export function reduceJobEvent(record: JobRecord, event: JobEvent, options: Redu
     }
 
     case "UsageUpdated": {
-      for (const key of USAGE_KEYS) {
+      for (const key of USAGE_STAT_KEYS) {
         const value = event.usage[key];
         if (value === undefined) continue;
         assertNonNegativeFinite(value, `UsageUpdated.usage.${key}`);
