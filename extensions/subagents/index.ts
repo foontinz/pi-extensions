@@ -28,7 +28,10 @@ import { Type, type Static } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents, formatAgentList } from "./agents.js";
 import { hydrateJobRecord, serializeJobRecord, UnsupportedJobRecordSchemaError } from "./core/hydration.js";
 import { reduceJobEvent } from "./core/state-machine.js";
+import { getShellInvocation } from "./platform/shell.js";
 import { displayCommand, shellQuote, squashWhitespace, truncateOneLine, truncateString } from "./platform/text.js";
+import { buildPostCopyEnv, getPostCopyBaseEnvKeys } from "./policy/post-copy-env.js";
+import { DEFAULT_SUBAGENT_TOOLS, validateToolSelection } from "./policy/tool-selection.js";
 import {
   isTmuxAvailable,
   listTmuxSessions,
@@ -80,19 +83,6 @@ const TMUX_STATUS_INTERVAL_MS = 2_000;
 const GIT_CLEANUP_TIMEOUT_MS = 10_000;
 const POST_COPY_DEFAULT_TIMEOUT_MS = 120_000;
 const POST_COPY_MAX_TIMEOUT_MS = 30 * 60 * 1000;
-const POST_COPY_PRESERVED_ENV_KEYS = [
-  "PATH",
-  "HOME",
-  "SHELL",
-  "USER",
-  "LOGNAME",
-  "TMPDIR",
-  "TEMP",
-  "TMP",
-  "LANG",
-  "LC_ALL",
-  "TERM",
-] as const;
 const JOB_STORE_ROOT = process.env.PI_SUBAGENTS_STORE_DIR
   ? path.resolve(process.env.PI_SUBAGENTS_STORE_DIR)
   : path.join(os.homedir(), ".pi", "agent", "subagents");
@@ -102,7 +92,6 @@ const JOB_LOCK_WAIT_MS = 2_000;
 const WORKTREE_CONFIG_PATH = path.join(".pi", "worktree.json");
 const POST_COPY_TRUST_STORE_PATH_ENV = "PI_SUBAGENTS_POSTCOPY_TRUST_STORE";
 const POST_COPY_TRUST_STORE_PATH = path.join(JOB_STORE_ROOT, "trusted-postcopy.json");
-const DEFAULT_SUBAGENT_TOOLS = ["read", "grep", "find", "ls"] as const;
 const SUBAGENT_CHILD_ENV = "PI_SUBAGENTS_CHILD";
 
 const execFileAsync = promisify(execFile);
@@ -879,26 +868,6 @@ interface GitRootError {
 }
 
 type GitRootResult = GitRootOk | GitRootNotRepo | GitRootError;
-
-function validateToolSelection(
-  activeTools: string[],
-  requestedTools: string[] | undefined,
-): { ok: true; tools: string[]; activeTools: string[]; requestedTools: string[] } | { ok: false; message: string; activeTools: string[]; requestedTools: string[] } {
-  const active = [...new Set(activeTools)].sort();
-  const activeSet = new Set(active);
-  const defaultTools = DEFAULT_SUBAGENT_TOOLS.filter((tool) => activeSet.has(tool));
-  const requested = [...new Set(requestedTools ?? defaultTools)].sort();
-  const disallowed = requested.filter((tool) => !activeSet.has(tool));
-  if (disallowed.length > 0) {
-    return {
-      ok: false,
-      activeTools: active,
-      requestedTools: requested,
-      message: `Refusing to start subagent with tools not active in the parent session: ${disallowed.join(", ")}. Active tools: ${active.join(", ") || "none"}.`,
-    };
-  }
-  return { ok: true, tools: requested, activeTools: active, requestedTools: requested };
-}
 
 async function startAgentJob(
   sourceCwd: string,
@@ -3172,25 +3141,6 @@ async function runPostCopyScripts(worktreeRoot: string, scripts: NormalizedWorkt
     }
   }
   return results;
-}
-
-function getShellInvocation(command: string): { command: string; args: string[] } {
-  return { command: "/bin/sh", args: ["-c", command] };
-}
-
-function buildPostCopyEnv(extraEnv: Record<string, string> | undefined): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {};
-  for (const key of POST_COPY_PRESERVED_ENV_KEYS) {
-    const value = process.env[key];
-    if (value !== undefined) env[key] = value;
-  }
-  for (const [key, value] of Object.entries(extraEnv ?? {})) env[key] = value;
-  return env;
-}
-
-function getPostCopyBaseEnvKeys(): string[] {
-  const keys = POST_COPY_PRESERVED_ENV_KEYS.filter((key) => process.env[key] !== undefined) as string[];
-  return keys.sort();
 }
 
 function normalizeCopySpec(entry: string | WorktreeCopyObject): NormalizedWorktreeCopySpec {
