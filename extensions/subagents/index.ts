@@ -32,7 +32,6 @@ import { reduceJobEvent } from "./core/state-machine.js";
 import { getLogWindow as buildLogWindow, getLogsSince as buildLogsSince, type LogWindow } from "./output/log-window.js";
 import { formatToolCall, formatToolResultMessage, getAssistantText, previewToolResult, textContent } from "./output/message-format.js";
 import { compactPreview } from "./output/preview.js";
-import { formatUsage } from "./output/usage.js";
 import { parseOptionalNonNegativeIntegerEnv } from "./platform/env.js";
 import { getShellInvocation } from "./platform/shell.js";
 import { displayCommand, shellQuote, squashWhitespace, truncateOneLine, truncateString } from "./platform/text.js";
@@ -46,7 +45,17 @@ import {
   TMUX_COMMAND_TIMEOUT_MS,
   tmuxSessionExists,
 } from "./supervisor/tmux-supervisor.js";
+import {
+  formatCompactPollResult as renderCompactPollResult,
+  formatJobSummaryLine,
+  formatPollResult as renderPollResult,
+  latestLogPreview,
+  summarizeJob as summarizePollJob,
+  type PollFormatOptions,
+} from "./ui/format-poll.js";
+import { formatRunAgentStartResult as renderRunAgentStartResult } from "./ui/format-run.js";
 import { compactJobState as renderCompactJobState, formatJobRuntime, formatStatusTable as renderStatusTable } from "./ui/status-widget.js";
+import { truncateForTool } from "./ui/truncate.js";
 import {
   JOB_RECORD_SCHEMA_VERSION,
   emptyUsageStats,
@@ -790,20 +799,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 }
 
 function formatRunAgentStartResult(job: AgentJob): string {
-  const lines = [
-    job.status === "running" ? `Started background agent ${job.id}.` : `Failed to start background agent ${job.id}.`,
-    `Status: ${job.status}`,
-    `Label: ${job.label}`,
-    `Supervisor: ${job.supervisor}${job.tmuxSession ? ` (${job.tmuxSession})` : ""}`,
-    `Tools: ${job.effectiveTools.length > 0 ? job.effectiveTools.join(", ") : "none"}`,
-  ];
-  if (job.status === "running") {
-    lines.push(job.tmuxSession ? `Attach: tmux attach -t ${job.tmuxSession}` : `PID: ${job.pid ?? "(spawn pending)"}`);
-  } else if (job.errorMessage) {
-    lines.push(`Error: ${compactPreview(job.errorMessage, 500, 3)}`);
-  }
-  lines.push(`CWD: ${job.cwd}`, "", `Poll later with: poll_agent({ id: "${job.id}", sinceSeq: 0, waitMs: ${SUGGESTED_POLL_INTERVAL_MS} })`);
-  return lines.join("\n");
+  return renderRunAgentStartResult(job, SUGGESTED_POLL_INTERVAL_MS);
 }
 
 function preflightSupervisorRequirements(): { ok: true } | { ok: false; message: string } {
@@ -3299,142 +3295,24 @@ function getLogWindow(job: AgentJob, sinceSeq: number, maxLogEntries: number): L
   return buildLogWindow(job.logs, sinceSeq, maxLogEntries);
 }
 
-function summarizeJob(job: AgentJob) {
+function pollFormatOptions(job: AgentJob): PollFormatOptions {
   return {
-    id: job.id,
-    label: job.label,
-    agent: job.agent,
-    agentSource: job.agentSource,
-    task: job.task,
-    effectiveTools: job.effectiveTools,
-    cwd: job.cwd,
-    sourceCwd: job.sourceCwd,
-    worktree: job.worktree
-      ? {
-          root: job.worktree.root,
-          originalRoot: job.worktree.originalRoot,
-          originalCwd: job.worktree.originalCwd,
-          configPath: job.worktree.configPath,
-          base: job.worktree.base,
-          copied: job.worktree.copied,
-          postCopy: job.worktree.postCopy,
-          keepWorktree: job.worktree.keepWorktree,
-          retained: job.worktree.retained,
-        }
-      : undefined,
-    pid: job.pid,
-    supervisor: job.supervisor,
-    tmuxSession: job.tmuxSession,
-    stdoutPath: job.stdoutPath,
-    stderrPath: job.stderrPath,
-    rawLogBytes: rawLogSizes(job),
+    suggestedPollIntervalMs: SUGGESTED_POLL_INTERVAL_MS,
     rawLogLimitBytes: MAX_RAW_LOG_BYTES,
-    rawLogLimitExceeded: job.rawLogLimitExceeded,
-    status: job.status,
-    phase: job.phase ?? job.status,
-    cleanupPhase: job.cleanupPhase,
-    terminal: job.terminal,
-    pendingTerminal: job.pendingTerminal,
-    startedAt: job.startedAt,
-    updatedAt: job.updatedAt,
-    finishedAt: job.finishedAt,
-    exitCode: job.exitCode,
-    signal: job.signal,
-    stopReason: job.stopReason,
-    errorMessage: job.errorMessage,
-    cleanupPending: job.cleanupPending,
-    cleanupError: job.cleanupError,
-    usage: job.usage,
-    messageCount: job.messageCount,
-    finalOutputPreview: job.finalOutput ? truncateOneLine(job.finalOutput, 1_000) : undefined,
-    nextSeq: job.nextSeq - 1,
+    rawLogSizes: rawLogSizes(job),
   };
 }
 
-function formatJobSummaryLine(job: ReturnType<typeof summarizeJob>): string {
-  const age = job.finishedAt ? `${Math.round((job.finishedAt - job.startedAt) / 1000)}s` : `${Math.round((Date.now() - job.startedAt) / 1000)}s`;
-  const usage = formatUsage(job.usage);
-  return [
-    job.id,
-    `[${job.status}]`,
-    job.agent ? `${job.agent}(${job.agentSource})` : "adhoc",
-    `age=${age}`,
-    usage || undefined,
-    `label=${job.label}`,
-  ].filter(Boolean).join(" ");
+function summarizeJob(job: AgentJob) {
+  return summarizePollJob(job, pollFormatOptions(job));
 }
 
 function formatCompactPollResult(job: AgentJob, sinceSeq: number, nextSeq: number, logWindow: LogWindow<AgentLogEntry>): string {
-  const newEventCount = job.logs.filter((entry) => entry.seq > sinceSeq).length;
-  const windowText = logWindow.logWindowStartSeq === undefined
-    ? "empty"
-    : `${logWindow.logWindowStartSeq}-${logWindow.logWindowEndSeq}`;
-  const lines = [formatJobSummaryLine(summarizeJob(job)), `nextSeq: ${nextSeq}; newEvents: ${newEventCount}; logWindow: ${windowText}`];
-  if (logWindow.cursorExpired) {
-    lines.push(`warning: sinceSeq ${sinceSeq} predates retained logs; older events are no longer available. Restart from logWindowStartSeq ${logWindow.logWindowStartSeq}.`);
-  }
-
-  if (job.status === "running") {
-    const latest = job.latestAssistantText || latestLogPreview(job) || "waiting for output";
-    lines.push(`progress: ${compactPreview(latest, 220, 2)}`);
-    lines.push(`next: poll again in ~15-30s or use waitMs:${SUGGESTED_POLL_INTERVAL_MS}; verbosity:"logs" for details.`);
-    return lines.join("\n");
-  }
-
-  if (job.errorMessage) lines.push(`error: ${compactPreview(job.errorMessage, 220, 2)}`);
-  lines.push(`result: ${job.finalOutput ? compactPreview(job.finalOutput, 260, 3) : "(no final assistant output)"}`);
-  if (job.finalOutput && job.finalOutput.length > 260) lines.push(`full: poll_agent({ id: "${job.id}", verbosity: "full" })`);
-  return lines.join("\n");
+  return renderCompactPollResult(job, sinceSeq, nextSeq, logWindow, pollFormatOptions(job));
 }
 
 function formatPollResult(job: AgentJob, logs: AgentLogEntry[], nextSeq: number, includeFullOutput: boolean, logWindow: LogWindow<AgentLogEntry>): string {
-  const lines: string[] = [];
-  lines.push(formatJobSummaryLine(summarizeJob(job)));
-  const windowText = logWindow.logWindowStartSeq === undefined
-    ? "empty"
-    : `${logWindow.logWindowStartSeq}-${logWindow.logWindowEndSeq}`;
-  lines.push(`nextSeq: ${nextSeq}${logWindow.logsTruncated ? " (more logs available; poll again with this sinceSeq)" : ""}; logWindow: ${windowText}`);
-  if (logWindow.cursorExpired) {
-    lines.push(`warning: sinceSeq predates retained logs; cursor expired and older events are no longer available. Restart from logWindowStartSeq ${logWindow.logWindowStartSeq}.`);
-  }
-  if (job.errorMessage && job.status !== "running") lines.push(`error: ${job.errorMessage}`);
-  lines.push("");
-  lines.push(logs.length === 0 ? "(no new logs)" : logs.map(formatLogEntry).join("\n"));
-
-  if (job.status === "running" && job.latestAssistantText) {
-    lines.push("", "Latest assistant text:", compactPreview(job.latestAssistantText, 1_000, 8));
-  }
-
-  if (job.status !== "running") {
-    lines.push(
-      "",
-      includeFullOutput ? "Final output:" : "Final output preview:",
-      job.finalOutput
-        ? includeFullOutput
-          ? truncateForTool(job.finalOutput)
-          : compactPreview(job.finalOutput, 1_000, 8)
-        : "(no final assistant output)",
-    );
-    if (!includeFullOutput && job.finalOutput && job.finalOutput.length > 1_000) {
-      lines.push(`Use poll_agent({ id: "${job.id}", verbosity: "full" }) for the full final output.`);
-    }
-  }
-
-  return lines.join("\n");
-}
-
-function latestLogPreview(job: AgentJob): string | undefined {
-  for (let i = job.logs.length - 1; i >= 0; i--) {
-    const entry = job.logs[i];
-    if (entry.level === "assistant" && entry.text.startsWith("assistant:")) continue;
-    return entry.text;
-  }
-  return undefined;
-}
-
-function formatLogEntry(entry: AgentLogEntry): string {
-  const time = new Date(entry.timestamp).toISOString().slice(11, 19);
-  return `${entry.seq.toString().padStart(4, " ")} ${time} ${entry.level.padEnd(9)} ${entry.text}`;
+  return renderPollResult(job, logs, nextSeq, includeFullOutput, logWindow, pollFormatOptions(job));
 }
 
 function appendCappedText(current: string, chunk: string, maxChars: number): string {
@@ -3472,19 +3350,6 @@ function removePersistedJobFiles(id: string): void {
       // ignore
     }
   }
-}
-
-function truncateForTool(text: string): string {
-  const truncation = truncateTail(text || "(empty)", {
-    maxLines: DEFAULT_MAX_LINES,
-    maxBytes: DEFAULT_MAX_BYTES,
-  });
-  if (!truncation.truncated) return truncation.content;
-  return (
-    truncation.content +
-    `\n\n[Output truncated to ${truncation.outputLines} of ${truncation.totalLines} lines` +
-    ` (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)})]`
-  );
 }
 
 export const __subagentsTest = {
