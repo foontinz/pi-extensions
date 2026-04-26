@@ -29,6 +29,7 @@ import { type AgentConfig, type AgentScope, discoverAgents, formatAgentList } fr
 import { hydrateJobRecord, serializeJobRecord, UnsupportedJobRecordSchemaError } from "./core/hydration.js";
 import { createJobId, shortJobId, tmuxSessionName } from "./core/ids.js";
 import { reduceJobEvent } from "./core/state-machine.js";
+import { getLogWindow as buildLogWindow, getLogsSince as buildLogsSince, type LogWindow } from "./output/log-window.js";
 import { formatToolCall, formatToolResultMessage, getAssistantText, previewToolResult, textContent } from "./output/message-format.js";
 import { compactPreview } from "./output/preview.js";
 import { formatUsage } from "./output/usage.js";
@@ -3290,30 +3291,12 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
   return { command: "pi", args };
 }
 
-interface LogWindow {
-  logs: AgentLogEntry[];
-  logWindowStartSeq?: number;
-  logWindowEndSeq?: number;
-  logsTruncated: boolean;
-  cursorExpired: boolean;
-}
-
 function getLogsSince(job: AgentJob, sinceSeq: number, maxLogEntries: number): AgentLogEntry[] {
-  return getLogWindow(job, sinceSeq, maxLogEntries).logs;
+  return buildLogsSince(job.logs, sinceSeq, maxLogEntries);
 }
 
-function getLogWindow(job: AgentJob, sinceSeq: number, maxLogEntries: number): LogWindow {
-  const retainedLogs = [...job.logs].sort((a, b) => a.seq - b.seq);
-  const logWindowStartSeq = retainedLogs[0]?.seq;
-  const logWindowEndSeq = retainedLogs[retainedLogs.length - 1]?.seq;
-  const availableLogs = retainedLogs.filter((entry) => entry.seq > sinceSeq);
-  return {
-    logs: availableLogs.slice(0, maxLogEntries),
-    logWindowStartSeq,
-    logWindowEndSeq,
-    logsTruncated: availableLogs.length > maxLogEntries,
-    cursorExpired: logWindowStartSeq !== undefined && logWindowStartSeq > 1 && sinceSeq < logWindowStartSeq - 1,
-  };
+function getLogWindow(job: AgentJob, sinceSeq: number, maxLogEntries: number): LogWindow<AgentLogEntry> {
+  return buildLogWindow(job.logs, sinceSeq, maxLogEntries);
 }
 
 function summarizeJob(job: AgentJob) {
@@ -3381,7 +3364,7 @@ function formatJobSummaryLine(job: ReturnType<typeof summarizeJob>): string {
   ].filter(Boolean).join(" ");
 }
 
-function formatCompactPollResult(job: AgentJob, sinceSeq: number, nextSeq: number, logWindow: LogWindow): string {
+function formatCompactPollResult(job: AgentJob, sinceSeq: number, nextSeq: number, logWindow: LogWindow<AgentLogEntry>): string {
   const newEventCount = job.logs.filter((entry) => entry.seq > sinceSeq).length;
   const windowText = logWindow.logWindowStartSeq === undefined
     ? "empty"
@@ -3404,7 +3387,7 @@ function formatCompactPollResult(job: AgentJob, sinceSeq: number, nextSeq: numbe
   return lines.join("\n");
 }
 
-function formatPollResult(job: AgentJob, logs: AgentLogEntry[], nextSeq: number, includeFullOutput: boolean, logWindow: LogWindow): string {
+function formatPollResult(job: AgentJob, logs: AgentLogEntry[], nextSeq: number, includeFullOutput: boolean, logWindow: LogWindow<AgentLogEntry>): string {
   const lines: string[] = [];
   lines.push(formatJobSummaryLine(summarizeJob(job)));
   const windowText = logWindow.logWindowStartSeq === undefined
