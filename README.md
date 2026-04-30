@@ -19,6 +19,12 @@ Included extensions/packages:
 
 This repo uses npm workspaces rooted at `extensions/*`, directly under `~/.pi/agent`.
 
+## Vercel skills
+
+`skills/` contains a minimal Vercel skill set translated from the Vercel Claude plugin so Pi understands linking, env vars, CLI usage, bootstrapping, and deployments.
+
+
+
 ```bash
 npm install
 npm run check
