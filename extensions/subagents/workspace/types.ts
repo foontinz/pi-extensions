@@ -22,7 +22,6 @@ export interface WorktreeEnvConfig {
   exclusions?: string[];
   postCopy?: Array<string | WorktreePostCopyObject>;
   postCopyScripts?: Array<string | WorktreePostCopyObject>;
-  keepWorktree?: boolean | WorktreeKeepMode;
 }
 
 export interface WorktreeScriptResult {

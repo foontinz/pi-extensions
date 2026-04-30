@@ -19,7 +19,6 @@ test("worktree config normalizes postCopy before prompting", () => {
     copy: [{ from: "./src/../src", to: "snapshot/./src", optional: true }],
     exclude: ["./dist/**"],
     postCopy: [{ command: " npm install --ignore-scripts ", cwd: "./", timeoutMs: 1234, optional: true, env: { FOO: "secret" } }],
-    keepWorktree: "onFailure",
   });
 
   assert.deepEqual(normalized.copy, [{ from: "src", to: "snapshot/src", optional: true }]);
@@ -27,7 +26,7 @@ test("worktree config normalizes postCopy before prompting", () => {
   assert.equal(normalized.postCopy[0]?.command, "npm install --ignore-scripts");
   assert.equal(normalized.postCopy[0]?.cwd, ".");
   assert.equal(normalized.postCopy[0]?.timeoutMs, 1234);
-  assert.equal(normalized.keepWorktree, "onFailure");
+  assert.equal(normalized.keepWorktree, "never");
 });
 
 test("postCopy confirmation shows normalized metadata but hides env values", () => {
@@ -106,7 +105,7 @@ test("auto worktree mode warns and runs in-place when git detection errors", asy
   }
 });
 
-test("worktree config is read from .pi/worktree.json only", async () => {
+test("worktree config ignores keepWorktree from .pi/worktree.json", async () => {
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), "subagents-worktree-json-test-"));
   try {
     const repoRoot = path.join(temp, "repo");
@@ -116,7 +115,7 @@ test("worktree config is read from .pi/worktree.json only", async () => {
 
     const config = await __subagentsTest.readWorktreeConfig(repoRoot);
     assert.deepEqual(config.copy, [{ from: "README.md", optional: false }]);
-    assert.equal(config.keepWorktree, "onFailure");
+    assert.equal(config.keepWorktree, "never");
   } finally {
     await fs.rm(temp, { recursive: true, force: true });
   }

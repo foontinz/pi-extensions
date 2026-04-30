@@ -5,7 +5,6 @@ import type {
   NormalizedWorktreePostCopySpec,
   WorktreeCopyObject,
   WorktreeEnvConfig,
-  WorktreeKeepMode,
   WorktreePostCopyObject,
 } from "./types.js";
 
@@ -59,7 +58,7 @@ export function normalizeWorktreeEnvConfig(config: WorktreeEnvConfig, configPath
     copy: (config.copy ?? []).map(normalizeCopySpec),
     exclusions: (config.exclude ?? config.exclusions ?? []).map((entry) => normalizeRepoRelativePath(entry, "exclude")),
     postCopy: (config.postCopy ?? config.postCopyScripts ?? []).map(normalizePostCopySpec),
-    keepWorktree: normalizeKeepWorktree(config.keepWorktree),
+    keepWorktree: "never",
     configPath,
   };
 }
@@ -125,13 +124,6 @@ function normalizeCommand(input: string, fieldName: string): string {
   const command = input.trim();
   if (!command) throw new Error(`${WORKTREE_CONFIG_PATH}: ${fieldName} must be a non-empty command.`);
   return command;
-}
-
-function normalizeKeepWorktree(value: WorktreeEnvConfig["keepWorktree"]): WorktreeKeepMode {
-  if (value === undefined || value === false) return "never";
-  if (value === true) return "always";
-  if (value === "never" || value === "always" || value === "onFailure") return value;
-  throw new Error(`${WORKTREE_CONFIG_PATH}: keepWorktree must be a boolean or one of "never", "always", "onFailure".`);
 }
 
 export function normalizeRepoRelativePath(input: string, fieldName: string): string {

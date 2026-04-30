@@ -253,6 +253,10 @@ const ThinkingSchema = StringEnum(["off", "minimal", "low", "medium", "high", "x
   description: "Optional Pi thinking level for the subagent process.",
 });
 
+const WorktreeKeepSchema = StringEnum(["never", "always", "onFailure"] as const, {
+  description: "Optional temp worktree retention policy for this subagent. Defaults to never. Use onFailure to retain failed/cancelled jobs for inspection, or always to retain regardless of result.",
+});
+
 const RunAgentParams = Type.Object({
   task: Type.String({ description: "Task/prompt to send to the background subagent." }),
   agent: Type.Optional(
@@ -278,9 +282,10 @@ const RunAgentParams = Type.Object({
   worktree: Type.Optional(
     Type.Boolean({
       description:
-        "Override git worktree isolation for this call. true requires and creates a temp worktree; false runs in-place; omitted uses repo config/auto behavior.",
+        "Override git worktree isolation for this call. true requires and creates a temp worktree; false runs in-place; omitted auto-creates a worktree inside git repos unless disabled by .pi/worktree.json.",
     }),
   ),
+  keepWorktree: Type.Optional(WorktreeKeepSchema),
   timeoutMs: Type.Optional(
     Type.Integer({
       description: `Kill the subagent after this many milliseconds. Default ${DEFAULT_TIMEOUT_MS}. Use 0 to disable.`,
@@ -430,7 +435,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       "Start a session-bounded tmux-supervised background Pi subagent in a separate --no-session process and return immediately with a job id.",
       "Finished subagents report their final output back to the parent Pi session when possible; attach to the tmux session for live output/debugging.",
       "Running subagents are stopped when the parent Pi session shuts down.",
-      "When started inside a git repo, the child runs in a temporary detached worktree by default; .pi/worktree.json controls copied files, post-copy setup scripts, and retention. Pass worktree:false to run in-place or worktree:true to require isolation.",
+      "When started inside a git repo, the child runs in a temporary detached worktree by default; .pi/worktree.json controls copied files and post-copy setup scripts. Pass worktree:false to run in-place or worktree:true to require isolation. Pass keepWorktree:'onFailure' or 'always' to retain temp worktrees for inspection.",
       `By default, subagents receive only active read-only tools (${DEFAULT_SUBAGENT_TOOLS.join("/")}); pass tools explicitly to grant write, execute, network, or other higher-risk capabilities. Recursive subagent tools are denied in children by default.`,
       "Can run a named user-owned markdown agent or an ad-hoc subagent with optional systemPrompt/tools and an explicit model override only when requested.",
     ].join(" "),
@@ -440,7 +445,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       "Use list_agents first when the user asks what named user-owned agents are available or when you need to choose a named markdown agent.",
       "Finished subagents send a callback to the parent Pi session when possible; use the printed tmux session only for live output/debugging.",
       "If you need to wait for subagent results, do not block the turn with sleep/polling commands; end the turn and you will be notified when callbacks arrive.",
-      "Remember run_agent uses a temporary git worktree when inside a repo unless worktree:false is set; uncommitted/untracked files are visible only if copied by .pi/worktree.json, and dependencies may need postCopy setup.",
+      "Remember run_agent uses a temporary git worktree when inside a repo unless worktree:false is set; uncommitted/untracked files are visible only if copied by .pi/worktree.json, dependencies may need postCopy setup, and temp worktrees are removed unless keepWorktree requests retention.",
       "Subagents are bounded to the current Pi session and will be stopped during session shutdown/reload; let them finish before ending the session if you need callback results.",
       `Omit tools for the safe read-only default (${DEFAULT_SUBAGENT_TOOLS.join(", ")}); pass tools explicitly only when the subagent needs additional capabilities. Do not grant recursive subagent tools to child agents.`,
       "Do not set the model parameter unless the user explicitly requests a specific model/provider; omit it to use the child Pi default and avoid provider/API-key mismatches.",
@@ -749,7 +754,7 @@ async function startAgentJob(
   if (!preflight.ok) return createFailedPreStartJob(id, sourceCwd, params, agent, preflight.message, owner, store);
   let worktreePrep: { cwd: string; worktree?: WorktreeInfo; warning?: string };
   try {
-    worktreePrep = await prepareWorktreeForSpawn(sourceCwd, ctx, params.worktree);
+    worktreePrep = await prepareWorktreeForSpawn(sourceCwd, ctx, params.worktree, params.keepWorktree ?? "never");
   } catch (error) {
     return createFailedPreStartJob(id, sourceCwd, params, agent, error instanceof Error ? error.message : String(error), owner, store);
   }
@@ -2225,7 +2230,12 @@ function cleanupPromptFiles(tmpPromptPath: string | undefined, tmpPromptDir: str
   }
 }
 
-async function prepareWorktreeForSpawn(sourceCwd: string, ctx: ExtensionContext, worktreeOverride?: boolean): Promise<{ cwd: string; worktree?: WorktreeInfo; warning?: string }> {
+async function prepareWorktreeForSpawn(
+  sourceCwd: string,
+  ctx: ExtensionContext,
+  worktreeOverride?: boolean,
+  keepWorktree: WorktreeKeepMode = "never",
+): Promise<{ cwd: string; worktree?: WorktreeInfo; warning?: string }> {
   if (worktreeOverride === false) return { cwd: sourceCwd };
 
   const gitRoot = await getGitRootDetailed(sourceCwd);
@@ -2246,7 +2256,6 @@ async function prepareWorktreeForSpawn(sourceCwd: string, ctx: ExtensionContext,
   if (config.enabled === false && worktreeOverride !== true) return { cwd: sourceCwd };
 
   const base = config.base ?? "HEAD";
-  const keepWorktree = config.keepWorktree;
   await validateConfiguredCopies(repoRoot, config.copy, config.exclusions);
   await confirmTrustedPostCopyIfNeeded(repoRoot, config.configPath, config.postCopy, ctx);
 
@@ -2909,8 +2918,8 @@ export const __subagentsTest = {
   normalizeWorktreeEnvConfig,
   readWorktreeConfig,
   getGitRootDetailed,
-  prepareWorktreeForSpawn: (sourceCwd: string, _jobId: string, ctx: ExtensionContext, worktreeOverride?: boolean) =>
-    prepareWorktreeForSpawn(sourceCwd, ctx, worktreeOverride),
+  prepareWorktreeForSpawn: (sourceCwd: string, _jobId: string, ctx: ExtensionContext, worktreeOverride?: boolean, keepWorktree?: WorktreeKeepMode) =>
+    prepareWorktreeForSpawn(sourceCwd, ctx, worktreeOverride, keepWorktree),
   formatPostCopyConfirmationDetails,
   buildPostCopyEnv,
   getShellInvocation,

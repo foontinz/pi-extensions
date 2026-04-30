@@ -54,13 +54,12 @@ test("extracted worktree config normalizer is directly importable", () => {
     copy: [{ from: "./src/../src", optional: true }],
     exclude: ["./dist/**"],
     postCopy: [{ command: " npm install ", cwd: ".", timeoutMs: 123 }],
-    keepWorktree: "onFailure",
   });
 
   assert.deepEqual(normalized.copy, [{ from: "src", to: undefined, optional: true }]);
   assert.deepEqual(normalized.exclusions, ["dist/**"]);
   assert.equal(normalized.postCopy[0]?.command, "npm install");
-  assert.equal(normalized.keepWorktree, "onFailure");
+  assert.equal(normalized.keepWorktree, "never");
 });
 
 test("extracted postCopy trust store remembers canonical script configs directly", async () => {

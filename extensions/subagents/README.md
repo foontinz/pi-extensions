@@ -35,6 +35,12 @@ run_agent({
   "worktree": false
 })
 
+// Retain a temp worktree only if the subagent fails or is cancelled/stopped.
+run_agent({
+  "task": "Try the risky migration in isolation",
+  "keepWorktree": "onFailure"
+})
+
 // 3. The final result is sent back to the parent Pi session when the job finishes.
 // If you need to wait for results, end the turn rather than blocking with sleep/polling;
 // Pi will wake you up when subagent callbacks arrive.
@@ -47,7 +53,7 @@ stop_agent({ "id": "agent_...", "reason": "not needed", "waitMs": 5000 })
 
 ## Temporary git worktrees
 
-When `run_agent` starts inside a git repository, it creates a temporary detached git worktree and runs the child agent from the matching path inside that worktree. If the current directory is not inside a git repo, no worktree is created and the child agent runs in the original directory. Per call, `worktree: false` disables isolation and runs in-place; `worktree: true` requires git worktree isolation and fails startup if the cwd is not inside a git repo. Omit `worktree` for the default auto/config behavior.
+When `run_agent` starts inside a git repository, it creates a temporary detached git worktree and runs the child agent from the matching path inside that worktree. If the current directory is not inside a git repo, no worktree is created and the child agent runs in the original directory. Per call, `worktree: false` disables isolation and runs in-place; `worktree: true` requires git worktree isolation and fails startup if the cwd is not inside a git repo. Omit `worktree` for the default auto/config behavior. Per call, `keepWorktree` controls retention: omit it or set `"never"` to remove the temp worktree, set `"onFailure"` to retain failed/cancelled/stopped jobs, or set `"always"` to retain every temp worktree.
 
 The worktree config file is discovered at `.pi/worktree.json` in the git repo root (not in `~/.pi/agent`). All `copy`, `exclude`, and `postCopy.cwd` paths are relative to that repo root. The child process starts from the same repo-relative cwd as the parent `run_agent` call, but inside the temp worktree.
 
@@ -70,8 +76,7 @@ By default the worktree is created from `HEAD`, so uncommitted or untracked file
   "postCopy": [
     "npm install --ignore-scripts --no-audit --no-fund",
     { "command": "./scripts/bootstrap-subagent.sh", "cwd": ".", "timeoutMs": 120000, "optional": true }
-  ],
-  "keepWorktree": "onFailure"
+  ]
 }
 ```
 
@@ -82,11 +87,12 @@ Supported fields:
 - `copy` — optional array of strings or `{ from, to?, optional? }` objects. Paths must be relative to the repo root and may not point at `.git` metadata. Entries may be exact files/directories or glob patterns using `*`, `?`, and `**`. Directory copies are recursive. For glob objects with `to`, matched paths are copied under `to` while preserving their path relative to the glob's non-wildcard base. Symlinks are copied as symlinks only when their target resolves inside the repo root and not into `.git` metadata; outbound or `.git`-targeting symlinks are rejected instead of being copied into the worktree.
 - `exclude` / `exclusions` — optional array of repo-relative exclusion patterns using the same glob syntax. These are aliases; use one or the other, not both. Exclusions are only set here; `!pattern` entries inside `copy` are not supported.
 - `postCopy` / `postCopyScripts` — optional array of shell commands run after `copy` and before the child Pi process starts. These are aliases; use one or the other, not both. Entries can be strings or `{ command, cwd?, timeoutMs?, optional?, env? }` objects. `cwd` is repo-relative and defaults to the worktree root. `timeoutMs` defaults to 120000 and is capped at 1800000. Config is normalized and validated before the temp worktree is created; confirmation shows the normalized command, cwd, timeoutMs, optional flag, and env keys (values hidden). Commands run via `/bin/sh -c` rather than a login/user shell. Because these commands are repo-controlled and are not constrained by the subagent tool allowlist, Pi asks for interactive confirmation before running them. Approval is remembered for the same repository and exact normalized `postCopy` configuration, so non-interactive sessions may run it after one interactive approval. If the commands/configuration changes, Pi prompts again.
-- `keepWorktree` — optional `false`, `true`, `"never"`, `"always"`, or `"onFailure"`. Retained worktrees are useful when a subagent fails before you can inspect artifacts. `"onFailure"` retains failed and cancelled/stopped jobs.
+
+`keepWorktree` is a `run_agent` input, not a `.pi/worktree.json` field. Any `keepWorktree` value in `.pi/worktree.json` is ignored.
 
 Security note: `postCopy` commands are arbitrary shell commands from the repository. Only approve them in trusted repos/configs. Remembered approvals are stored under Pi's subagent state directory and are keyed to the canonical repo path plus an exact hash of the normalized `postCopy` entries, including env values. They run with a minimal inherited environment rather than the full Pi process environment: only common process keys needed for shell/package-manager operation (for example `PATH`, `HOME`, `SHELL`, temp/locale/user keys when present) are preserved, then per-command `env` entries are added. The confirmation dialog lists inherited keys and per-command env keys but never prints env values. Do not put secrets in repo-controlled `.pi/worktree.json`; use public/non-secret `env` values only.
 
-Temp worktrees are removed when Pi observes that the job finished, failed, or was stopped unless `keepWorktree` retains them. Running jobs are bounded to the parent Pi session: on graceful session shutdown or `/reload`, Pi sends Ctrl-C to running subagents and then hard-kills their tmux sessions after the stop grace period. If Pi exits ungracefully and leaves orphan tmux jobs behind, the next session load stops those recovered running jobs instead of adopting them. Cleanup state is persisted and retried if a previous cleanup attempt was interrupted or failed.
+Temp worktrees are removed when Pi observes that the job finished, failed, or was stopped unless the `run_agent` `keepWorktree` input retains them. Running jobs are bounded to the parent Pi session: on graceful session shutdown or `/reload`, Pi sends Ctrl-C to running subagents and then hard-kills their tmux sessions after the stop grace period. If Pi exits ungracefully and leaves orphan tmux jobs behind, the next session load stops those recovered running jobs instead of adopting them. Cleanup state is persisted and retried if a previous cleanup attempt was interrupted or failed.
 
 ## Named markdown agents
 
