@@ -12,6 +12,6 @@
     "clean": "npm run clean --workspaces --if-present"
   },
   "dependencies": {
-    "playwright": "1.57.0"
+    "playwright": "1.59.1"
   }
 }

@@ -14,7 +14,7 @@
     ]
   },
   "dependencies": {
-    "@mariozechner/pi-coding-agent": "^0.71.0",
+    "@mariozechner/pi-coding-agent": "^0.72.1",
     "pi-extension-envvars": "file:../envvars"
   },
   "devDependencies": {
