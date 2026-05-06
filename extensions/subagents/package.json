@@ -15,10 +15,10 @@
     ]
   },
   "dependencies": {
-    "@mariozechner/pi-ai": "^0.72.1",
-    "@mariozechner/pi-coding-agent": "^0.72.1",
-    "@mariozechner/pi-tui": "^0.72.1",
-    "typebox": "^1.1.37"
+    "@mariozechner/pi-ai": "^0.73.0",
+    "@mariozechner/pi-coding-agent": "^0.73.0",
+    "@mariozechner/pi-tui": "^0.73.0",
+    "typebox": "^1.1.38"
   },
   "devDependencies": {
     "@types/node": "^25.6.0",

@@ -14,10 +14,10 @@
     ]
   },
   "dependencies": {
-    "@mariozechner/pi-coding-agent": "^0.72.1",
+    "@mariozechner/pi-coding-agent": "^0.73.0",
     "pi-extension-envvars": "file:../envvars",
     "tsx": "^4.0.0",
-    "typebox": "^1.1.37"
+    "typebox": "^1.1.38"
   },
   "devDependencies": {
     "@types/node": "^25.6.0",
