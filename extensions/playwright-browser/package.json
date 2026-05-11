@@ -14,11 +14,11 @@
     ]
   },
   "dependencies": {
-    "@mariozechner/pi-coding-agent": "^0.73.0",
+    "@earendil-works/pi-coding-agent": "^0.74.0",
     "playwright": "1.59.1"
   },
   "devDependencies": {
-    "@types/node": "^25.6.0",
+    "@types/node": "^25.6.1",
     "typescript": "^5.9.3"
   }
 }

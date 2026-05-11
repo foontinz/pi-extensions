@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { installEnvVarStatus, onEnvVarChanged, registerManagedEnvVar } from "pi-extension-envvars/hooks";
 import { getEnvVar } from "pi-extension-envvars/store";
 
@@ -35,7 +35,7 @@ export default function (pi: ExtensionAPI) {
 			apiKey: apiKey ?? "OPENROUTER_API_KEY",
 			api: "openai-completions",
 			headers: {
-				"HTTP-Referer": "https://github.com/mariozechner/pi-coding-agent",
+				"HTTP-Referer": "https://github.com/earendil-works/pi-mono",
 				"X-Title": "pi openrouter extension",
 			},
 			models: MODELS,

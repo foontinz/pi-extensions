@@ -13,17 +13,17 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
-import type { AssistantMessage, Message, ToolResultMessage } from "@mariozechner/pi-ai";
-import { StringEnum } from "@mariozechner/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { AssistantMessage, Message, ToolResultMessage } from "@earendil-works/pi-ai";
+import { StringEnum } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
   formatSize,
   truncateTail,
   withFileMutationQueue,
-} from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { type AgentConfig, discoverAgents, formatAgentList } from "./agents.js";
 import { hydrateJobRecord, serializeJobRecord, UnsupportedJobRecordSchemaError } from "./core/hydration.js";

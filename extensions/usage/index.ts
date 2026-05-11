@@ -10,13 +10,13 @@
  *   Esc / q   close
  */
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createReadStream } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { matchesKey, Key, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { matchesKey, Key, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 // ─── types ───────────────────────────────────────────────────────────────────
 

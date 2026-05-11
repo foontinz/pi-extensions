@@ -2,8 +2,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { promises as fs } from "node:fs";
 import { randomUUID } from "node:crypto";
-import type { OAuthCredentials, OAuthLoginCallbacks } from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const PROVIDER_NAME = "kimi";
 const KIMI_BASE_URL = "https://api.moonshot.cn/v1";

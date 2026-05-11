@@ -3,7 +3,7 @@ import {
   DEFAULT_MAX_LINES,
   formatSize,
   truncateTail,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 
 export function truncateForTool(text: string): string {
   const truncation = truncateTail(text || "(empty)", {

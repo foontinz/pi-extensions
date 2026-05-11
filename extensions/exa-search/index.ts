@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerCodeHandle } from "../code-runner/hooks";
 import { installEnvVarStatus, registerManagedEnvVar } from "pi-extension-envvars/hooks";
 
