@@ -24,9 +24,13 @@ Workflow:
 3. Read release notes and migration docs before changing code.
    - Read the upstream changelog for the target release and any versions since the current local Pi dependency version:
      `https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/CHANGELOG.md`
-   - Also inspect installed docs when relevant:
-     `/Users/barbos/.nvm/versions/node/v25.8.2/lib/node_modules/@earendil-works/pi-coding-agent/README.md`
-     `/Users/barbos/.nvm/versions/node/v25.8.2/lib/node_modules/@earendil-works/pi-coding-agent/docs`
+   - Also inspect installed docs when relevant. Resolve the coding-agent package root dynamically instead of hardcoding a user-specific Node install path, for example:
+     `PI_DOC_ROOT="$(npm root -g)/@earendil-works/pi-coding-agent"`
+     or use the equivalent local workspace path if Pi is installed locally:
+     `PI_DOC_ROOT="node_modules/@earendil-works/pi-coding-agent"`
+     Then read:
+     `$PI_DOC_ROOT/README.md`
+     `$PI_DOC_ROOT/docs`
    - For breaking changes, follow referenced docs completely enough to understand the required migration.
 
 4. Bump dependency versions.
