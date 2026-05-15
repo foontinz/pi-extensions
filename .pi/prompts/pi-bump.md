@@ -10,7 +10,7 @@ Workflow:
 
 1. Establish the target release.
    - Run `pi --version` to see the installed Pi CLI version.
-   - Run `npm view @mariozechner/pi-coding-agent version` to see the latest published version.
+   - Run `npm view @earendil-works/pi-coding-agent version` to see the latest published version.
    - If `$@` is empty, use the installed Pi version when it is newer than local dependencies; otherwise use the latest published version.
    - If `$@` names a version, use that exact version.
 
@@ -23,18 +23,18 @@ Workflow:
 
 3. Read release notes and migration docs before changing code.
    - Read the upstream changelog for the target release and any versions since the current local Pi dependency version:
-     `https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/CHANGELOG.md`
+     `https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/CHANGELOG.md`
    - Also inspect installed docs when relevant:
-     `/Users/barbos/.nvm/versions/node/v25.8.2/lib/node_modules/@mariozechner/pi-coding-agent/README.md`
-     `/Users/barbos/.nvm/versions/node/v25.8.2/lib/node_modules/@mariozechner/pi-coding-agent/docs`
+     `/Users/barbos/.nvm/versions/node/v25.8.2/lib/node_modules/@earendil-works/pi-coding-agent/README.md`
+     `/Users/barbos/.nvm/versions/node/v25.8.2/lib/node_modules/@earendil-works/pi-coding-agent/docs`
    - For breaking changes, follow referenced docs completely enough to understand the required migration.
 
 4. Bump dependency versions.
    - Update every local workspace dependency on these Pi packages to the target version:
-     - `@mariozechner/pi-coding-agent`
-     - `@mariozechner/pi-ai`
-     - `@mariozechner/pi-agent-core` if present
-     - `@mariozechner/pi-tui`
+     - `@earendil-works/pi-coding-agent`
+     - `@earendil-works/pi-ai`
+     - `@earendil-works/pi-agent-core` if present
+     - `@earendil-works/pi-tui`
    - Update closely-related non-major dependencies shown by `npm outdated --depth=0` when safe, especially `typebox`, while avoiding risky major upgrades such as TypeScript unless the changelog requires it.
    - Preserve intentional exact pins such as Playwright unless they are outdated and were already being kept in sync or the changelog requires an update.
    - Run `npm install` at the workspace root to refresh `package-lock.json`.
@@ -49,7 +49,7 @@ Workflow:
    - Run `npm run check --workspaces --if-present`.
    - If code paths changed, run the smallest relevant build/test command available.
    - Run `npm outdated --depth=0 || true` again and explain any intentionally remaining outdated packages.
-   - Run `npm ls @mariozechner/pi-coding-agent @mariozechner/pi-ai @mariozechner/pi-tui typebox --depth=0` or an equivalent command to show resolved versions.
+   - Run `npm ls @earendil-works/pi-coding-agent @earendil-works/pi-ai @earendil-works/pi-tui typebox --depth=0` or an equivalent command to show resolved versions.
 
 7. Report clearly.
    - Summarize version bumps.

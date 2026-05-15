@@ -16,11 +16,11 @@
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^0.74.0",
     "pi-extension-envvars": "file:../envvars",
-    "tsx": "^4.0.0",
+    "tsx": "^4.22.0",
     "typebox": "^1.1.38"
   },
   "devDependencies": {
-    "@types/node": "^25.6.1",
+    "@types/node": "^25.8.0",
     "typescript": "^5.9.3"
   }
 }
