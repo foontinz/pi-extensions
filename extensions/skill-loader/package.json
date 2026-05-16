@@ -1,0 +1,12 @@
+{
+  "name": "pi-skill-loader-extension",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Pi extension for installing and enabling Agent Skills from GitHub repositories.",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

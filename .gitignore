@@ -24,3 +24,6 @@ bin/
 .handle-registry*.json
 .envvar-registry*.json
 .debug-hooks.log
+
+# Skill Loader local state
+/skill-loader/
