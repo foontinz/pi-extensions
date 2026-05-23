@@ -13,5 +13,8 @@
   },
   "dependencies": {
     "playwright": "1.59.1"
+  },
+  "engines": {
+    "node": ">=22.19.0"
   }
 }

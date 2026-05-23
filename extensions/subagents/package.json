@@ -15,14 +15,17 @@
     ]
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "^0.74.0",
-    "@earendil-works/pi-coding-agent": "^0.74.0",
-    "@earendil-works/pi-tui": "^0.74.0",
+    "@earendil-works/pi-ai": "^0.75.3",
+    "@earendil-works/pi-coding-agent": "^0.75.3",
+    "@earendil-works/pi-tui": "^0.75.3",
     "typebox": "^1.1.38"
   },
   "devDependencies": {
-    "@types/node": "^25.8.0",
-    "tsx": "^4.22.0",
+    "@types/node": "^25.9.0",
+    "tsx": "^4.22.2",
     "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22.19.0"
   }
 }
