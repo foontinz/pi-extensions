@@ -9,7 +9,7 @@ const PREFS_PATH = join(homedir(), ".pi", "agent", "fast-mode.json");
 type SupportedMode =
 	| {
 		provider: "anthropic";
-		id: "claude-opus-4-6" | "claude-opus-4-7";
+		id: "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8";
 		enabledTier: "auto";
 		disabledTier: "standard_only";
 	}
@@ -33,6 +33,7 @@ const DEFAULT_PREFS: FastModePrefs = {
 const SUPPORTED_MODELS: SupportedMode[] = [
 	{ provider: "anthropic", id: "claude-opus-4-6", enabledTier: "auto", disabledTier: "standard_only" },
 	{ provider: "anthropic", id: "claude-opus-4-7", enabledTier: "auto", disabledTier: "standard_only" },
+	{ provider: "anthropic", id: "claude-opus-4-8", enabledTier: "auto", disabledTier: "standard_only" },
 	{ provider: "openai", id: "gpt-5.4", enabledTier: "priority" },
 	{ provider: "openai", id: "gpt-5.5", enabledTier: "priority" },
 	{ provider: "openai-codex", id: "gpt-5.4", enabledTier: "priority" },
@@ -75,13 +76,13 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("fast", {
-		description: "Toggle fast mode for supported models (claude-opus-4-6, claude-opus-4-7, gpt-5.4, gpt-5.5)",
+		description: "Toggle fast mode for supported models (claude-opus-4-6, claude-opus-4-7, claude-opus-4-8, gpt-5.4, gpt-5.5)",
 		handler: async (_args, ctx) => {
 			prefs = await loadPrefs();
 			const supported = getSupportedMode(ctx.model);
 			if (!ctx.model || !supported) {
 				ctx.ui.notify(
-					"Fast mode is only available for anthropic/claude-opus-4-6, anthropic/claude-opus-4-7, openai/gpt-5.4, openai/gpt-5.5, openai-codex/gpt-5.4, and openai-codex/gpt-5.5.",
+					"Fast mode is only available for anthropic/claude-opus-4-6, anthropic/claude-opus-4-7, anthropic/claude-opus-4-8, openai/gpt-5.4, openai/gpt-5.5, openai-codex/gpt-5.4, and openai-codex/gpt-5.5.",
 					"info",
 				);
 				refreshStatus(ctx);

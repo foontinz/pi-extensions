@@ -14,10 +14,10 @@
     ]
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.76.0",
+    "@earendil-works/pi-coding-agent": "^0.78.0",
     "pi-extension-envvars": "file:../envvars",
-    "tsx": "^4.22.3",
-    "typebox": "^1.1.38"
+    "tsx": "^4.22.4",
+    "typebox": "^1.1.39"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",

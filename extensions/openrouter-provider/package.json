@@ -14,7 +14,7 @@
     ]
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.76.0",
+    "@earendil-works/pi-coding-agent": "^0.78.0",
     "pi-extension-envvars": "file:../envvars"
   },
   "devDependencies": {

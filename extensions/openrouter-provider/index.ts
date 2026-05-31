@@ -32,7 +32,7 @@ export default function (pi: ExtensionAPI) {
 		const apiKey = await getEnvVar("OPENROUTER_API_KEY");
 		pi.registerProvider(PROVIDER_NAME, {
 			baseUrl: "https://openrouter.ai/api/v1",
-			apiKey: apiKey ?? "OPENROUTER_API_KEY",
+			apiKey: apiKey ?? "$OPENROUTER_API_KEY",
 			api: "openai-completions",
 			headers: {
 				"HTTP-Referer": "https://github.com/earendil-works/pi-mono",
