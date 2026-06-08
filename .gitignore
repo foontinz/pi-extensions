@@ -12,6 +12,7 @@ node_modules/
 .auth.json
 auth.json
 settings.json
+trust.json
 npm/
 fast-mode.json
 mcp.json

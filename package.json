@@ -1,20 +1,21 @@
 {
-  "name": "pi-extensions",
-  "private": true,
-  "version": "0.1.0",
-  "workspaces": [
-    "extensions/*"
-  ],
-  "scripts": {
-    "check": "npm run check --workspaces --if-present",
-    "build": "npm run build --workspaces --if-present",
-    "test": "npm run test --workspaces --if-present",
-    "clean": "npm run clean --workspaces --if-present"
-  },
-  "dependencies": {
-    "playwright": "1.59.1"
-  },
-  "engines": {
-    "node": ">=22.19.0"
-  }
+	"name": "pi-extensions",
+	"private": true,
+	"version": "0.1.0",
+	"workspaces": [
+		"extensions/*"
+	],
+	"scripts": {
+		"check": "npm run check --workspaces --if-present",
+		"build": "npm run build --workspaces --if-present",
+		"test": "npm run test --workspaces --if-present",
+		"clean": "npm run clean --workspaces --if-present"
+	},
+	"dependencies": {
+		"playwright": "1.59.1"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"devDependencies": {}
 }
