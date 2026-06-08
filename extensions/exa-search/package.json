@@ -14,12 +14,12 @@
     ]
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.78.0",
+    "@earendil-works/pi-coding-agent": "^0.79.0",
     "exa-js": "^2.13.0",
     "pi-extension-envvars": "file:../envvars"
   },
   "devDependencies": {
-    "@types/node": "^25.9.1",
+    "@types/node": "^25.9.2",
     "typescript": "^5.9.3"
   },
   "engines": {
