@@ -38,7 +38,33 @@ interface TokenResponse {
 	scope?: string;
 }
 
+const KIMI_OPENAI_COMPAT = {
+	supportsDeveloperRole: false,
+	supportsReasoningEffort: false,
+	maxTokensField: "max_tokens" as const,
+};
+
 const MODELS = [
+	{
+		id: "kimi-k2.7-code",
+		name: "Kimi K2.7 Code",
+		reasoning: true,
+		input: ["text" as const, "image" as const],
+		cost: { input: 0.95, output: 4, cacheRead: 0.19, cacheWrite: 0 },
+		contextWindow: 262144,
+		maxTokens: 262144,
+		compat: KIMI_OPENAI_COMPAT,
+	},
+	{
+		id: "kimi-k2.7-code-highspeed",
+		name: "Kimi K2.7 Code HighSpeed",
+		reasoning: true,
+		input: ["text" as const, "image" as const],
+		cost: { input: 1.9, output: 8, cacheRead: 0.38, cacheWrite: 0 },
+		contextWindow: 262144,
+		maxTokens: 262144,
+		compat: KIMI_OPENAI_COMPAT,
+	},
 	{
 		id: "kimi-k2.5",
 		name: "Kimi K2.5",
@@ -47,7 +73,7 @@ const MODELS = [
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 262144,
 		maxTokens: 32768,
-		compat: { supportsDeveloperRole: false },
+		compat: KIMI_OPENAI_COMPAT,
 	},
 ];
 
