@@ -65,7 +65,9 @@ export function validateToolSelection(activeTools: string[], requestedTools: str
     return { ok: false, activeTools: active, requestedTools: parsed.requestedTools, message: parsed.message };
   }
   const requested = parsed.tools;
-  const reserved = requested.filter((tool) => (RESERVED_SUBAGENT_TOOLS as readonly string[]).includes(tool));
+  const defaultToolSet = new Set<string>(DEFAULT_SUBAGENT_TOOLS);
+  const effectiveRequested = requested.filter((tool) => activeSet.has(tool) || !defaultToolSet.has(tool));
+  const reserved = effectiveRequested.filter((tool) => (RESERVED_SUBAGENT_TOOLS as readonly string[]).includes(tool));
   if (reserved.length > 0) {
     return {
       ok: false,
@@ -74,7 +76,7 @@ export function validateToolSelection(activeTools: string[], requestedTools: str
       message: `Refusing to start subagent with recursive subagent tools: ${reserved.join(", ")}. Nested subagent delegation is disabled by default.`,
     };
   }
-  const disallowed = requested.filter((tool) => !activeSet.has(tool));
+  const disallowed = effectiveRequested.filter((tool) => !activeSet.has(tool));
   if (disallowed.length > 0) {
     return {
       ok: false,
@@ -83,5 +85,5 @@ export function validateToolSelection(activeTools: string[], requestedTools: str
       message: `Refusing to start subagent with tools not active in the parent session: ${disallowed.join(", ")}. Active tools: ${active.join(", ") || "none"}.`,
     };
   }
-  return { ok: true, tools: requested, activeTools: active, requestedTools: requested };
+  return { ok: true, tools: effectiveRequested, activeTools: active, requestedTools: requested };
 }

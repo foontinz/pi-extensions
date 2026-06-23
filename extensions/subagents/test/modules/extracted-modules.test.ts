@@ -19,6 +19,11 @@ test("extracted tool selection module validates default and rejected tools direc
   assert.equal(defaultSelection.ok, true);
   assert.deepEqual(defaultSelection.tools, ["read", "find", "ls"]);
 
+  const explicitPortableDefaults = validateToolSelection(["bash", "read"], ["read", "grep", "find", "ls", "bash"]);
+  assert.equal(explicitPortableDefaults.ok, true);
+  assert.deepEqual(explicitPortableDefaults.tools, ["read", "bash"]);
+  assert.deepEqual(explicitPortableDefaults.requestedTools, ["read", "grep", "find", "ls", "bash"]);
+
   const rejected = validateToolSelection(["read"], ["read", "bash"]);
   assert.equal(rejected.ok, false);
   assert.match(rejected.message, /not active/);

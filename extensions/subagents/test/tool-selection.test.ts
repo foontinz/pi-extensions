@@ -22,6 +22,17 @@ test("explicit subagent tools may include active higher-risk tools and preserve 
   assert.deepEqual(selection.tools, ["bash", "read"]);
 });
 
+test("explicit unavailable safe defaults are ignored for portability", () => {
+  const selection = validateToolSelection(
+    ["bash", "read"],
+    ["read", "grep", "find", "ls", "bash"],
+  );
+
+  assert.equal(selection.ok, true);
+  assert.deepEqual(selection.tools, ["read", "bash"]);
+  assert.deepEqual(selection.requestedTools, ["read", "grep", "find", "ls", "bash"]);
+});
+
 test("explicit subagent tools must be active in the parent session", () => {
   const selection = validateToolSelection(["read"], ["read", "bash"]);
 

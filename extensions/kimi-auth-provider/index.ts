@@ -6,7 +6,7 @@ import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-a
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const PROVIDER_NAME = "kimi";
-const KIMI_BASE_URL = "https://api.moonshot.cn/v1";
+const KIMI_BASE_URL = "https://api.kimi.com/coding";
 const KIMI_CLIENT_ID = process.env.KIMI_CLIENT_ID || "17e5f671-d194-4dfb-9706-5516cb48c098";
 const KIMI_DEVICE_AUTH_ENDPOINT = "https://auth.kimi.com/api/oauth/device_authorization";
 const KIMI_TOKEN_ENDPOINT = "https://auth.kimi.com/api/oauth/token";
@@ -38,10 +38,10 @@ interface TokenResponse {
 	scope?: string;
 }
 
-const KIMI_OPENAI_COMPAT = {
-	supportsDeveloperRole: false,
-	supportsReasoningEffort: false,
-	maxTokensField: "max_tokens" as const,
+const KIMI_ANTHROPIC_COMPAT = {
+	supportsEagerToolInputStreaming: false,
+	supportsLongCacheRetention: false,
+	supportsCacheControlOnTools: false,
 };
 
 const MODELS = [
@@ -52,8 +52,8 @@ const MODELS = [
 		input: ["text" as const, "image" as const],
 		cost: { input: 0.95, output: 4, cacheRead: 0.19, cacheWrite: 0 },
 		contextWindow: 262144,
-		maxTokens: 262144,
-		compat: KIMI_OPENAI_COMPAT,
+		maxTokens: 32768,
+		compat: KIMI_ANTHROPIC_COMPAT,
 	},
 	{
 		id: "kimi-k2.7-code-highspeed",
@@ -62,8 +62,8 @@ const MODELS = [
 		input: ["text" as const, "image" as const],
 		cost: { input: 1.9, output: 8, cacheRead: 0.38, cacheWrite: 0 },
 		contextWindow: 262144,
-		maxTokens: 262144,
-		compat: KIMI_OPENAI_COMPAT,
+		maxTokens: 32768,
+		compat: KIMI_ANTHROPIC_COMPAT,
 	},
 	{
 		id: "kimi-k2.5",
@@ -73,7 +73,7 @@ const MODELS = [
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 262144,
 		maxTokens: 32768,
-		compat: KIMI_OPENAI_COMPAT,
+		compat: KIMI_ANTHROPIC_COMPAT,
 	},
 ];
 
@@ -235,7 +235,10 @@ async function refreshKimiToken(credentials: KimiCredentials): Promise<KimiCrede
 export default function (pi: ExtensionAPI) {
 	pi.registerProvider(PROVIDER_NAME, {
 		baseUrl: KIMI_BASE_URL,
-		api: "openai-completions",
+		api: "anthropic-messages",
+		headers: {
+			"User-Agent": "KimiCLI/1.5",
+		},
 		models: MODELS,
 		oauth: {
 			name: "Kimi Code Subscription",

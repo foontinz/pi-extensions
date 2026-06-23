@@ -23,10 +23,18 @@ run_agent({
   "task": "Search the repo for auth middleware and summarize the relevant files"
 })
 
+// Omit tools for the portable safe default. Pi will use whichever safe read-only
+// tools are active in the parent session.
+run_agent({
+  "task": "Inspect the repository and summarize likely correctness bugs"
+})
+
 // Pass tools explicitly only when more than the safe read-only default is needed.
+// In Pi sessions where grep/find/ls are not separate active tools, use bash for
+// read-only shell inspection only when shell access is acceptable.
 run_agent({
   "task": "Run the test suite and summarize failures",
-  "tools": ["read", "grep", "find", "ls", "bash"]
+  "tools": ["read", "bash"]
 })
 
 // Disable worktree isolation for read-only/recon work that needs live uncommitted files.
@@ -108,7 +116,8 @@ Agent files use YAML frontmatter:
 ---
 name: scout
 description: Fast read-only repository reconnaissance
-tools: read, grep, find, ls
+# Omit tools for the portable safe read-only default, or specify only tools
+# expected to be active in the parent session, for example: read, bash.
 model: claude-haiku-4-5
 thinking: low
 ---
@@ -121,7 +130,7 @@ You are a fast reconnaissance subagent. Find relevant files and return a concise
 - Jobs are supervised by tmux and persisted under `~/.pi/agent/subagents/`, but running jobs are bounded to the parent Pi session. Graceful `/reload`, session switch, and parent Pi shutdown stop running subagents; the next session also stops recovered orphan running jobs left by an ungraceful exit. `tmux` on `PATH` and executable `/bin/sh` are required before a job is launched. Use `stop_agent` to terminate a running job explicitly; it sends Ctrl-C to the tmux pane first, drains output, then hard-kills the tmux session after the grace period (`waitMs`, default 5000, max 60000) if needed.
 - Attach to a live job with `tmux attach -t <session>`; `run_agent` prints the exact session name.
 - Full raw child process streams are persisted under `~/.pi/agent/subagents/logs/*.stdout.jsonl` and `*.stderr.log` for manual inspection. To prevent unbounded disk growth, a running job is stopped if either raw stream exceeds `PI_SUBAGENTS_MAX_RAW_LOG_BYTES` bytes; the default is 512 MiB per stream, and `0` disables this guard.
-- Child tool access is limited to tools active in the parent Pi session. If `tools` is omitted, the child receives only the active safe read-only default tools: `read`, `grep`, `find`, and `ls` when available. Requested agent/tool allowlists must be a subset of parent active tools, and recursive subagent tools (`run_agent`, `list_agents`, `stop_agent`) are denied by default. Pass tools explicitly to grant write, execute, network, or other higher-risk capabilities.
+- Child tool access is limited to tools active in the parent Pi session. If `tools` is omitted, the child receives only the active safe read-only default tools: `read`, `grep`, `find`, and `ls` when available. For portability, omit `tools` unless extra access is needed; some Pi sessions expose search/list operations through `bash` instead of separate `grep`/`find`/`ls` tools. Explicitly requested unavailable safe-default tools are ignored, but any other unavailable tool is refused. Recursive subagent tools (`run_agent`, `list_agents`, `stop_agent`) are denied by default. Pass tools explicitly to grant write, execute, network, or other higher-risk capabilities.
 - Running job concurrency is capped by default to protect the host: `PI_SUBAGENTS_MAX_RUNNING` defaults to 10 globally and `PI_SUBAGENTS_MAX_RUNNING_PER_REPO` defaults to 10 per repository/path. Set either to `0` to disable that limit.
 - The child process uses `--no-session`: it does not inherit the parent conversation and does not write a normal Pi session file. Put all needed context in the task, named/ad-hoc system prompt, files, or repo context.
 - Do not pass a `model` override for routine delegation/review. Only set `model` when the user explicitly asks for that exact model/provider; otherwise the child Pi uses its configured default, avoiding provider/API-key mismatches.

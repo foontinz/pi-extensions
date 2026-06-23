@@ -274,7 +274,7 @@ const RunAgentParams = Type.Object({
   tools: Type.Optional(
     Type.Array(Type.String(), {
       description:
-        `Optional allowlist of active tools for the subagent, e.g. [\"read\",\"grep\",\"find\",\"ls\"]. Defaults to the active safe read-only tools: ${DEFAULT_SUBAGENT_TOOLS.join(", ")}.`,
+        `Optional allowlist of active tools for the subagent. Omit for the portable safe read-only default (${DEFAULT_SUBAGENT_TOOLS.join(", ")} when active). Use e.g. [\"read\",\"bash\"] only when shell access is acceptable.`,
       maxItems: 64,
     }),
   ),
@@ -436,7 +436,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       "Finished subagents report their final output back to the parent Pi session when possible; attach to the tmux session for live output/debugging.",
       "Running subagents are stopped when the parent Pi session shuts down.",
       "When started inside a git repo, the child runs in a temporary detached worktree by default; .pi/worktree.json controls copied files and post-copy setup scripts. Pass worktree:false to run in-place or worktree:true to require isolation. Pass keepWorktree:'onFailure' or 'always' to retain temp worktrees for inspection.",
-      `By default, subagents receive only active read-only tools (${DEFAULT_SUBAGENT_TOOLS.join("/")}); pass tools explicitly to grant write, execute, network, or other higher-risk capabilities. Recursive subagent tools are denied in children by default.`,
+      `By default, subagents receive only active read-only tools (${DEFAULT_SUBAGENT_TOOLS.join("/")}); omit tools for portable read-only delegation because some sessions do not expose grep/find/ls as separate tools. Pass tools explicitly to grant write, execute, network, or other higher-risk capabilities. Recursive subagent tools are denied in children by default.`,
       "Can run a named user-owned markdown agent or an ad-hoc subagent with optional systemPrompt/tools and an explicit model override only when requested.",
     ].join(" "),
     promptSnippet: "Start a non-blocking background Pi subagent job and return a job id.",
@@ -447,7 +447,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       "If you need to wait for subagent results, do not block the turn with sleep/polling commands; end the turn and you will be notified when callbacks arrive.",
       "Remember run_agent uses a temporary git worktree when inside a repo unless worktree:false is set; uncommitted/untracked files are visible only if copied by .pi/worktree.json, dependencies may need postCopy setup, and temp worktrees are removed unless keepWorktree requests retention.",
       "Subagents are bounded to the current Pi session and will be stopped during session shutdown/reload; let them finish before ending the session if you need callback results.",
-      `Omit tools for the safe read-only default (${DEFAULT_SUBAGENT_TOOLS.join(", ")}); pass tools explicitly only when the subagent needs additional capabilities. Do not grant recursive subagent tools to child agents.`,
+      `Omit tools for the portable safe read-only default (${DEFAULT_SUBAGENT_TOOLS.join(", ")} when active); do not explicitly pass grep/find/ls unless they are active in the parent session. Pass tools explicitly only when the subagent needs additional capabilities, for example read+bash when shell access is acceptable. Do not grant recursive subagent tools to child agents.`,
       "Do not set the model parameter unless the user explicitly requests a specific model/provider; omit it to use the child Pi default and avoid provider/API-key mismatches.",
       "Subagents do not inherit the parent conversation; include all necessary context in the task, systemPrompt, named agent, files, or repo context.",
     ],
