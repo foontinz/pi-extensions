@@ -14,11 +14,11 @@
     ]
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.79.0"
+    "@earendil-works/pi-coding-agent": "^0.80.2"
   },
   "devDependencies": {
-    "@types/node": "^25.9.2",
-    "typescript": "^5.9.3"
+    "@types/node": "^26.0.1",
+    "typescript": "^6.0.3"
   },
   "engines": {
     "node": ">=22.19.0"
