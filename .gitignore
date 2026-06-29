@@ -29,3 +29,5 @@ bin/
 
 # Skill Loader local state
 /skill-loader/
+mcp-npx-cache.json
+npm/
