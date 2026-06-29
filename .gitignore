@@ -31,3 +31,6 @@ bin/
 /skill-loader/
 mcp-npx-cache.json
 npm/
+
+READMELOCAL.md
+.serena/
