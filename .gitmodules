@@ -1,3 +1,0 @@
-[submodule "extensions/pi-mcp-adapter"]
-	path = extensions/pi-mcp-adapter
-	url = https://github.com/foontinz/pi-mcp-adapter.git
