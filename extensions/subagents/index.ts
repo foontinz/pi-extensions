@@ -49,7 +49,7 @@ import { compactPreview } from "./output/preview.js";
 import { parseOptionalNonNegativeIntegerEnv } from "./platform/env.js";
 import { getShellInvocation } from "./platform/shell.js";
 import { displayCommand, shellQuote, squashWhitespace, truncateOneLine, truncateString } from "./platform/text.js";
-import { buildPostCopyEnv, getPostCopyBaseEnvKeys } from "./policy/post-copy-env.js";
+import { buildPostCopyEnv } from "./policy/post-copy-env.js";
 import { DEFAULT_SUBAGENT_TOOLS, validateToolSelection } from "./policy/tool-selection.js";
 import {
   isTmuxAvailable,
@@ -77,11 +77,6 @@ import {
   normalizeWorktreeEnvConfig,
   WORKTREE_CONFIG_PATH,
 } from "./workspace/worktree-config.js";
-import {
-  getPostCopyTrust as loadPostCopyTrust,
-  rememberPostCopyTrust as savePostCopyTrust,
-  type PostCopyTrustDecision,
-} from "./workspace/post-copy-trust.js";
 import type {
   GitRootError,
   GitRootNotRepo,
@@ -108,7 +103,9 @@ import {
   type JobPhase,
   type JobRecord,
   type PendingTerminalInfo,
+  type SubagentResult,
   type TerminalInfo,
+  type TerminalReason,
   type UsageStats,
 } from "./core/types.js";
 
@@ -136,9 +133,14 @@ const ASSISTANT_DELTA_LOG_INTERVAL_MS = 1_250;
 const ASSISTANT_DELTA_LOG_CHARS = 1_200;
 const TMUX_STATUS_INTERVAL_MS = 2_000;
 const GIT_CLEANUP_TIMEOUT_MS = 10_000;
-const POST_COPY_TRUST_STORE_PATH_ENV = "PI_SUBAGENTS_POSTCOPY_TRUST_STORE";
-const POST_COPY_TRUST_STORE_PATH = path.join(JOB_STORE_ROOT, "trusted-postcopy.json");
 const SUBAGENT_CHILD_ENV = "PI_SUBAGENTS_CHILD";
+const DEFAULT_MAX_WORKTREE_CREATIONS = 4;
+const MAX_WORKTREE_CREATIONS = Math.max(1, parseOptionalNonNegativeIntegerEnv("PI_SUBAGENTS_MAX_WORKTREE_CREATIONS", DEFAULT_MAX_WORKTREE_CREATIONS));
+const DEFAULT_JSON_OUTPUT_ADDENDUM = [
+  "Your final output IS the return value to the calling agent, not a conversational message.",
+  "Return only valid JSON: no Markdown, no code fences, no prose, no confirmations like \"Done.\".",
+  "If the task does not specify a JSON shape, use this default shape: {\"output\": string}.",
+].join(" ");
 
 const execFileAsync = promisify(execFile);
 
@@ -196,6 +198,7 @@ interface AgentJob {
   pendingAssistantDelta: string;
   lastAssistantDeltaLogAt: number;
   finalOutput?: string;
+  result?: SubagentResult;
   stopReason?: string;
   errorMessage?: string;
   usage: UsageStats;
@@ -238,6 +241,8 @@ const INSTANCE_ID_SYMBOL = Symbol.for("pi.subagents.instanceId");
 const jobs = new Map<string, AgentJob>();
 const launchReservations: Array<{ ownerId: string; repoKey: string }> = [];
 let launchCapacityMutex: Promise<void> = Promise.resolve();
+let activeWorktreeCreations = 0;
+const worktreeCreationQueue: Array<() => void> = [];
 let currentOwner: JobOwnerInfo | undefined;
 let currentStorePaths: JobStorePaths | undefined;
 let extensionApi: ExtensionAPI | undefined;
@@ -481,7 +486,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
       }
 
-      const toolSelection = validateToolSelection(pi.getActiveTools(), params.tools ?? namedAgent?.tools);
+      const activeTools = pi.getActiveTools();
+      const toolSelection = validateToolSelection(activeTools, params.tools ?? namedAgent?.tools);
       if (!toolSelection.ok) {
         return {
           content: [{ type: "text", text: toolSelection.message }],
@@ -764,7 +770,7 @@ async function startAgentJob(
   }
   const cwd = worktreePrep.cwd;
   const label = params.label?.trim() || agent?.name || `agent-${id}`;
-  const promptParts = [agent?.systemPrompt, params.systemPrompt].filter((part): part is string => Boolean(part?.trim()));
+  const promptParts = [agent?.systemPrompt, params.systemPrompt, DEFAULT_JSON_OUTPUT_ADDENDUM].filter((part): part is string => Boolean(part?.trim()));
   const model = params.model ?? agent?.model;
   const thinking = params.thinking ?? agent?.thinking;
   const timeoutMs = params.timeoutMs === undefined ? DEFAULT_TIMEOUT_MS : params.timeoutMs;
@@ -1021,6 +1027,7 @@ function createFailedPreStartJob(
     waiters: new Set(),
     closeWaiters: new Set(),
   };
+  job.result = buildSubagentResult(job);
   jobs.set(job.id, job);
   addLog(job, "error", `failed before launch: ${errorMessage}`, "start");
   persistJob(job);
@@ -1075,10 +1082,36 @@ function syncDurableObservability(record: JobRecord, job: AgentJob): void {
     }));
   record.observability = {
     finalOutput: job.finalOutput ? truncateString(job.finalOutput, MAX_DURABLE_TEXT_CHARS) : undefined,
+    result: durableSubagentResult(job.result),
     latestAssistantText: job.latestAssistantText ? truncateString(job.latestAssistantText, MAX_DURABLE_TEXT_CHARS) : undefined,
     logs,
     messageCount: job.messageCount,
     lastLogAt: logs.length > 0 ? logs[logs.length - 1]!.timestamp : undefined,
+  };
+}
+
+function durableSubagentResult(result: SubagentResult | undefined): SubagentResult | undefined {
+  if (!result) return undefined;
+  const output = truncateString(result.output, MAX_DURABLE_TEXT_CHARS);
+  const truncated = result.truncated || output.length < result.output.length || undefined;
+  return {
+    output,
+    // Avoid persisting a full parsed duplicate when the text output was capped.
+    structuredOutput: truncated ? undefined : result.structuredOutput,
+    usage: { ...result.usage },
+    error: result.error ? { ...result.error } : undefined,
+    truncated,
+  };
+}
+
+function cloneSubagentResult(result: SubagentResult | undefined): SubagentResult | undefined {
+  if (!result) return undefined;
+  return {
+    output: result.output,
+    structuredOutput: result.structuredOutput,
+    usage: { ...result.usage },
+    error: result.error ? { ...result.error } : undefined,
+    truncated: result.truncated,
   };
 }
 
@@ -1104,7 +1137,8 @@ function applyLifecycleRecordToJob(job: AgentJob, record: JobRecord): void {
   job.logs = mergeLogEntries(job.logs, durableLogs);
   job.messageCount = Math.max(job.messageCount ?? 0, record.observability?.messageCount ?? 0);
   job.latestAssistantText = job.latestAssistantText || record.observability?.latestAssistantText || "";
-  job.finalOutput = job.finalOutput || record.observability?.finalOutput;
+  job.result = job.result || cloneSubagentResult(record.observability?.result);
+  job.finalOutput = job.finalOutput || job.result?.output || record.observability?.finalOutput;
   job.nextSeq = Math.max(job.nextSeq ?? 1, record.logCursor.nextSeq);
   // Existing in-memory jobs may have logs that have not yet made it to the
   // durable record, for example if a best-effort persist failed and a later
@@ -1168,6 +1202,32 @@ function isValidLogEntry(entry: unknown): entry is AgentLogEntry {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withWorktreeCreationSlot<T>(action: () => Promise<T>): Promise<T> {
+  await acquireWorktreeCreationSlot();
+  try {
+    return await action();
+  } finally {
+    releaseWorktreeCreationSlot();
+  }
+}
+
+async function acquireWorktreeCreationSlot(): Promise<void> {
+  if (activeWorktreeCreations < MAX_WORKTREE_CREATIONS) {
+    activeWorktreeCreations += 1;
+    return;
+  }
+  await new Promise<void>((resolve) => worktreeCreationQueue.push(resolve));
+}
+
+function releaseWorktreeCreationSlot(): void {
+  const next = worktreeCreationQueue.shift();
+  if (next) {
+    next();
+    return;
+  }
+  activeWorktreeCreations = Math.max(0, activeWorktreeCreations - 1);
 }
 
 function loadPersistedJobs(): void {
@@ -1317,7 +1377,8 @@ function runtimeJobFromRecord(record: JobRecord): AgentJob {
     latestAssistantText: record.observability?.latestAssistantText ?? "",
     pendingAssistantDelta: "",
     lastAssistantDeltaLogAt: 0,
-    finalOutput: record.observability?.finalOutput,
+    finalOutput: record.observability?.result?.output ?? record.observability?.finalOutput,
+    result: cloneSubagentResult(record.observability?.result),
     usage: { ...record.usage },
     timeoutAt: record.timeoutAt,
     supervisor: record.supervisor,
@@ -1916,6 +1977,41 @@ function signalJob(job: AgentJob, signal: NodeJS.Signals): void {
   }
 }
 
+function buildSubagentResult(job: AgentJob): SubagentResult {
+  const output = job.finalOutput ?? job.latestAssistantText ?? "";
+  const terminalReason = job.terminal?.reason ?? terminalReasonForStatus(job.status);
+  const message = job.errorMessage || job.terminal?.error || job.terminal?.message || defaultTerminalMessage(job);
+  return {
+    output,
+    structuredOutput: parseJsonOutput(output),
+    usage: { ...job.usage },
+    error: job.status === "completed" && !job.errorMessage ? undefined : { reason: terminalReason, message },
+  };
+}
+
+function parseJsonOutput(output: string): unknown | undefined {
+  if (!output.trim()) return undefined;
+  try {
+    return JSON.parse(output) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+function terminalReasonForStatus(status: JobStatus): TerminalReason {
+  if (status === "cancelled") return "stop";
+  if (status === "completed") return "natural-exit";
+  return "error";
+}
+
+function defaultTerminalMessage(job: AgentJob): string {
+  if (job.status === "completed") return "completed";
+  if (job.status === "cancelled") return job.stopReason ?? "cancelled";
+  if (job.exitCode !== undefined) return `subagent failed with exit code ${job.exitCode}`;
+  if (job.signal) return `subagent failed with signal ${job.signal}`;
+  return "subagent failed";
+}
+
 function finalizeJob(
   job: AgentJob,
   status: JobStatus,
@@ -1967,6 +2063,8 @@ function finalizeJob(
   }
   if (errorMessage) job.errorMessage = errorMessage;
   if (job.status === "failed" && !job.errorMessage && job.stderr.trim()) job.errorMessage = job.stderr.trim();
+  job.result = buildSubagentResult(job);
+  if (!job.finalOutput && job.result.output) job.finalOutput = job.result.output;
   cleanupWorktree(job, job.status);
 
   const parts = [`finished: ${job.status}`];
@@ -2257,52 +2355,53 @@ async function prepareWorktreeForSpawn(
 
   const base = config.base ?? "HEAD";
   await validateConfiguredCopies(repoRoot, config.copy, config.exclusions);
-  await confirmTrustedPostCopyIfNeeded(repoRoot, config.configPath, config.postCopy, ctx);
 
-  const tempParent = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-worktree-"));
-  const worktreeRoot = path.join(tempParent, "worktree");
+  return await withWorktreeCreationSlot(async () => {
+    const tempParent = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-worktree-"));
+    const worktreeRoot = path.join(tempParent, "worktree");
 
-  try {
-    await execFileAsync("git", ["-C", repoRoot, "worktree", "add", "--detach", "--quiet", worktreeRoot, base]);
-
-    const copied = await copyConfiguredFiles(repoRoot, worktreeRoot, config.copy, config.exclusions);
-    const postCopy = await runPostCopyScripts(worktreeRoot, config.postCopy);
-    const relativeCwd = path.relative(repoRoot, sourceCwd);
-    const childCwd = relativeCwd ? path.resolve(worktreeRoot, relativeCwd) : worktreeRoot;
-    assertInside(worktreeRoot, childCwd, "cwd");
-    await fs.promises.mkdir(childCwd, { recursive: true });
-
-    return {
-      cwd: childCwd,
-      worktree: {
-        root: worktreeRoot,
-        tempParent,
-        originalRoot: repoRoot,
-        originalCwd: sourceCwd,
-        configPath: config.configPath,
-        base,
-        copied,
-        postCopy,
-        keepWorktree,
-      },
-    };
-  } catch (error) {
-    if ((keepWorktree === "always" || keepWorktree === "onFailure") && fs.existsSync(worktreeRoot)) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`${message}\nRetained failed-prep worktree for inspection: ${worktreeRoot}`);
-    }
     try {
-      execFileSync("git", ["-C", repoRoot, "worktree", "remove", "--force", worktreeRoot], { stdio: "ignore", timeout: GIT_CLEANUP_TIMEOUT_MS, killSignal: "SIGKILL" });
-    } catch {
-      // ignore cleanup failures
+      await execFileAsync("git", ["-C", repoRoot, "worktree", "add", "--detach", "--quiet", worktreeRoot, base]);
+
+      const copied = await copyConfiguredFiles(repoRoot, worktreeRoot, config.copy, config.exclusions);
+      const postCopy = await runPostCopyScripts(worktreeRoot, config.postCopy);
+      const relativeCwd = path.relative(repoRoot, sourceCwd);
+      const childCwd = relativeCwd ? path.resolve(worktreeRoot, relativeCwd) : worktreeRoot;
+      assertInside(worktreeRoot, childCwd, "cwd");
+      await fs.promises.mkdir(childCwd, { recursive: true });
+
+      return {
+        cwd: childCwd,
+        worktree: {
+          root: worktreeRoot,
+          tempParent,
+          originalRoot: repoRoot,
+          originalCwd: sourceCwd,
+          configPath: config.configPath,
+          base,
+          copied,
+          postCopy,
+          keepWorktree,
+        },
+      };
+    } catch (error) {
+      if ((keepWorktree === "always" || keepWorktree === "onFailure") && fs.existsSync(worktreeRoot)) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`${message}\nRetained failed-prep worktree for inspection: ${worktreeRoot}`);
+      }
+      try {
+        execFileSync("git", ["-C", repoRoot, "worktree", "remove", "--force", worktreeRoot], { stdio: "ignore", timeout: GIT_CLEANUP_TIMEOUT_MS, killSignal: "SIGKILL" });
+      } catch {
+        // ignore cleanup failures
+      }
+      try {
+        fs.rmSync(tempParent, { recursive: true, force: true });
+      } catch {
+        // ignore cleanup failures
+      }
+      throw error;
     }
-    try {
-      fs.rmSync(tempParent, { recursive: true, force: true });
-    } catch {
-      // ignore cleanup failures
-    }
-    throw error;
-  }
+  });
 }
 
 async function getGitRoot(cwd: string): Promise<string | undefined> {
@@ -2347,71 +2446,6 @@ async function readWorktreeConfig(repoRoot: string): Promise<NormalizedWorktreeE
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return defaultWorktreeEnvConfig();
     throw error;
   }
-}
-
-async function confirmTrustedPostCopyIfNeeded(
-  repoRoot: string,
-  configPath: string | undefined,
-  scripts: NormalizedWorktreePostCopySpec[],
-  ctx: ExtensionContext,
-): Promise<void> {
-  if (scripts.length === 0) return;
-
-  const trust = await getPostCopyTrust(repoRoot, scripts);
-  if (trust.trusted) return;
-
-  const details = formatPostCopyConfirmationDetails(configPath, scripts);
-  if (!ctx.hasUI) {
-    throw new Error(
-      `${WORKTREE_CONFIG_PATH}: postCopy contains repo-controlled shell commands that have not been approved for this repository/configuration, ` +
-      `and this session cannot ask for confirmation. Remove postCopy or approve it once from an interactive Pi session.\n\n${details}`,
-    );
-  }
-  const ok = await ctx.ui.confirm(
-    "Run subagent worktree postCopy commands?",
-    `${details}\n\nApproving will remember this repository and exact normalized postCopy configuration, so Pi will not ask again unless it changes.`,
-  );
-  if (!ok) throw new Error(`${WORKTREE_CONFIG_PATH}: postCopy commands were not approved.`);
-  await rememberPostCopyTrust(trust);
-}
-
-function postCopyTrustOptions() {
-  return { defaultStorePath: POST_COPY_TRUST_STORE_PATH, envPathKey: POST_COPY_TRUST_STORE_PATH_ENV };
-}
-
-async function getPostCopyTrust(repoRoot: string, scripts: NormalizedWorktreePostCopySpec[]): Promise<PostCopyTrustDecision> {
-  return loadPostCopyTrust(repoRoot, scripts, postCopyTrustOptions());
-}
-
-async function rememberPostCopyTrust(decision: PostCopyTrustDecision): Promise<void> {
-  return savePostCopyTrust(decision, postCopyTrustOptions());
-}
-
-function formatPostCopyConfirmationDetails(
-  configPath: string | undefined,
-  scripts: NormalizedWorktreePostCopySpec[],
-): string {
-  const preservedKeys = getPostCopyBaseEnvKeys();
-  const commandDetails = scripts.map((script, index) => {
-    const envKeys = Object.keys(script.env ?? {}).sort();
-    return [
-      `${index + 1}. command: ${script.command}`,
-      `   cwd: ${script.cwd ?? "."}`,
-      `   timeoutMs: ${script.timeoutMs}`,
-      `   optional: ${script.optional}`,
-      `   env keys: ${envKeys.length > 0 ? envKeys.join(", ") : "none"} (values hidden)`,
-    ].join("\n");
-  }).join("\n\n");
-
-  return [
-    `Source: ${configPath ?? WORKTREE_CONFIG_PATH}`,
-    "",
-    "These repo-controlled commands run before the subagent starts and are not limited by the subagent tool allowlist. Only continue for trusted repositories.",
-    "",
-    `Environment: commands run with a minimal inherited environment. Preserved keys present in Pi's environment: ${preservedKeys.length > 0 ? preservedKeys.join(", ") : "none"}. No other Pi/process environment variables are inherited. Per-command env keys below are added or override preserved keys; values are hidden here but come from the repo config.`,
-    "",
-    commandDetails,
-  ].join("\n");
 }
 
 async function validateConfiguredCopies(
@@ -2920,11 +2954,8 @@ export const __subagentsTest = {
   getGitRootDetailed,
   prepareWorktreeForSpawn: (sourceCwd: string, _jobId: string, ctx: ExtensionContext, worktreeOverride?: boolean, keepWorktree?: WorktreeKeepMode) =>
     prepareWorktreeForSpawn(sourceCwd, ctx, worktreeOverride, keepWorktree),
-  formatPostCopyConfirmationDetails,
   buildPostCopyEnv,
   getShellInvocation,
-  getPostCopyTrust,
-  rememberPostCopyTrust,
   assertSymlinkTargetInsideRepo,
   validateToolSelection,
   hasUnresolvedCleanup,

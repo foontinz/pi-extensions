@@ -62,6 +62,14 @@ export interface UsageStats {
   turns: number;
 }
 
+export interface SubagentResult {
+  output: string;
+  structuredOutput?: unknown;
+  usage: UsageStats;
+  error?: { reason: TerminalReason; message: string };
+  truncated?: boolean;
+}
+
 export const USAGE_STAT_KEYS = ["input", "output", "cacheRead", "cacheWrite", "cost", "contextTokens", "turns"] as const satisfies ReadonlyArray<keyof UsageStats>;
 export const WORKTREE_KEEP_MODE_VALUES = ["never", "always", "onFailure"] as const;
 export type WorktreeKeepMode = typeof WORKTREE_KEEP_MODE_VALUES[number];
@@ -111,6 +119,7 @@ export interface DurableLogEntry {
 
 export interface DurableObservabilityState {
   finalOutput?: string;
+  result?: SubagentResult;
   latestAssistantText?: string;
   logs?: DurableLogEntry[];
   messageCount?: number;

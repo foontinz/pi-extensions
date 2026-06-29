@@ -44,7 +44,7 @@ Non-blockers / spikes tracked in "What's left" below.
 - **`subagents` ext:** in-process spawn-and-await primitive (`createAgentSession`
   with `tools`, `cwd`, `SessionManager.inMemory()`, minimal `ResourceLoader`) →
   `await prompt(task)` → capture `state.messages` + `getLastAssistantUsage` +
-  abort/stall; raw-output addendum (P1.1); typed result envelope (P1.2);
+  abort/stall; JSON final-output addendum (P1.1); typed result envelope (P1.2);
   worktree-creation parallelism (P1.3); lean default tools (P1.4).
 - **`workflows` ext:** `Workflow` tool `{script | name | scriptPath, args}` (no
   `resumeFromRunId`); VM runner (main thread, codegen-disabled, **no** determinism
@@ -62,20 +62,23 @@ Non-blockers / spikes tracked in "What's left" below.
 > that's Phase 3 / pi core). They make subagents **more usable** and shave edges.
 > Do them in order; #10 and #8 are the highest value-per-line.
 
-### P1.1 — Raw/quiet output addendum (was #10)
+### P1.1 — JSON final-output addendum (was #10)
 **Effort:** trivial. **Value:** high (reliable parsing).
 
 The spawn already assembles `promptParts = [agent?.systemPrompt, params.systemPrompt]`
-and passes them via `--append-system-prompt`. Add a constant addendum (only when the
-job is workflow-internal / "raw" mode):
+and passes them via `--append-system-prompt`. Add a constant addendum for every
+subagent spawn:
 
-> Your final output IS the return value to the calling script — not a message to a
-> human. Return the literal result (raw text or JSON only — no code fences, no prose,
-> no confirmations like "Done."). Be concise; the caller parses your output.
+> Your final output IS the return value to the calling agent, not a conversational
+> message. Return only valid JSON: no Markdown, no code fences, no prose, no
+> confirmations like "Done.". If the task does not specify a JSON shape, use this
+> default shape: {"output": string}.
 
-- Implementation: a `WORKFLOW_RAW_ADDENDUM` constant; append to `promptParts` when a
-  `raw: true` (or `quiet: true`) param/flag is set on the spawn.
-- No behavior change for normal `run_agent` calls.
+- Implementation: a `DEFAULT_JSON_OUTPUT_ADDENDUM` constant appended to `promptParts`
+  for all `run_agent` spawns.
+- The transport remains `--mode json`; this addendum controls the child assistant's
+  final text. The typed result envelope parses that text into `structuredOutput`
+  when valid JSON.
 
 ### P1.2 — Typed terminal result envelope (was #8)
 **Effort:** cheap-ish. **Value:** high (usage aggregation + clean error/`null` handling).
@@ -111,17 +114,17 @@ pays ~200–500 ms × N of pure serial setup before any real work.
 ### P1.4 — Lean default tools for workflow agents (was #6)
 **Effort:** ~free. **Value:** low–medium (faster boot, smaller prompt, less cost).
 
-The `--tools csv` / `--no-tools` knob already exists. This is really an **engine
-default**, not a subagent code change: the workflow engine should pass a minimal
+The `--tools csv` / `--no-tools` knob already exists. This remains an **engine
+default**, not a `run_agent` default: the workflow engine should pass a minimal
 toolset per `agent()` (e.g. `read,bash`) unless the call's `opts`/`agentType` ask for
-more.
+more. Normal `run_agent` omitted-tools behavior stays the portable read-only default.
 
 - Action item: document the recommended minimal default; ensure `--no-tools` and tiny
   allowlists boot cleanly and fast.
 
 ### Phase 1 acceptance
 - A workflow-internal spawn returns a **typed result** with usage + error.
-- Workflow agents emit **raw, parseable** output by default.
+- Subagents are instructed to emit **valid JSON final output** by default.
 - N isolated agents provision worktrees **concurrently** (pool of 2–4).
 - Workflow agents run with a **minimal toolset** unless overridden.
 

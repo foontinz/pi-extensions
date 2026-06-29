@@ -1,7 +1,4 @@
 import assert from "node:assert/strict";
-import * as fs from "node:fs/promises";
-import * as os from "node:os";
-import * as path from "node:path";
 import test from "node:test";
 import { getLogWindow } from "../../output/log-window.js";
 import { previewToolResult } from "../../output/message-format.js";
@@ -9,7 +6,6 @@ import { parseOptionalNonNegativeIntegerEnv } from "../../platform/env.js";
 import { validateToolSelection } from "../../policy/tool-selection.js";
 import { formatJobSummaryLine, summarizeJob } from "../../tool-output/format-poll.js";
 import { compactJobState, formatStatusTable, type StatusTheme } from "../../ui/status-widget.js";
-import { getPostCopyTrust, rememberPostCopyTrust } from "../../workspace/post-copy-trust.js";
 import { normalizeWorktreeEnvConfig } from "../../workspace/worktree-config.js";
 
 const plainTheme: StatusTheme = { fg: (_role, text) => text };
@@ -65,28 +61,6 @@ test("extracted worktree config normalizer is directly importable", () => {
   assert.deepEqual(normalized.exclusions, ["dist/**"]);
   assert.equal(normalized.postCopy[0]?.command, "npm install");
   assert.equal(normalized.keepWorktree, "never");
-});
-
-test("extracted postCopy trust store remembers canonical script configs directly", async () => {
-  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "subagents-direct-trust-test-"));
-  try {
-    const repoRoot = path.join(temp, "repo");
-    await fs.mkdir(repoRoot);
-    const options = { defaultStorePath: path.join(temp, "trust.json") };
-    const first = await getPostCopyTrust(repoRoot, [
-      { command: "npm install", cwd: ".", timeoutMs: 120_000, optional: false, env: { B: "2", A: "1" } },
-    ], options);
-    assert.equal(first.trusted, false);
-
-    await rememberPostCopyTrust(first, options);
-
-    const second = await getPostCopyTrust(repoRoot, [
-      { command: "npm install", cwd: ".", timeoutMs: 120_000, optional: false, env: { A: "1", B: "2" } },
-    ], options);
-    assert.equal(second.trusted, true);
-  } finally {
-    await fs.rm(temp, { recursive: true, force: true });
-  }
 });
 
 test("extracted poll formatter exposes a named summary contract", () => {

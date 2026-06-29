@@ -9,7 +9,7 @@ import { __subagentsTest } from "../index.js";
 
 const execFile = promisify(execFileCallback);
 
-test("worktree config normalizes postCopy before prompting", () => {
+test("worktree config normalizes postCopy", () => {
   assert.throws(
     () => __subagentsTest.normalizeWorktreeEnvConfig({ postCopy: [{ command: "   " }] }),
     /postCopy\.command must be a non-empty command/,
@@ -27,20 +27,6 @@ test("worktree config normalizes postCopy before prompting", () => {
   assert.equal(normalized.postCopy[0]?.cwd, ".");
   assert.equal(normalized.postCopy[0]?.timeoutMs, 1234);
   assert.equal(normalized.keepWorktree, "never");
-});
-
-test("postCopy confirmation shows normalized metadata but hides env values", () => {
-  const details = __subagentsTest.formatPostCopyConfirmationDetails("/repo/.pi/worktree.json", [
-    { command: "npm install", cwd: ".", timeoutMs: 120_000, optional: false, env: { NPM_TOKEN: "super-secret" } },
-  ]);
-
-  assert.match(details, /command: npm install/);
-  assert.match(details, /cwd: \./);
-  assert.match(details, /timeoutMs: 120000/);
-  assert.match(details, /optional: false/);
-  assert.match(details, /env keys: NPM_TOKEN/);
-  assert.doesNotMatch(details, /super-secret/);
-  assert.match(details, /minimal inherited environment/);
 });
 
 test("postCopy environment is minimal plus explicit env", () => {
@@ -117,38 +103,6 @@ test("worktree config ignores keepWorktree from .pi/worktree.json", async () => 
     assert.deepEqual(config.copy, [{ from: "README.md", optional: false }]);
     assert.equal(config.keepWorktree, "never");
   } finally {
-    await fs.rm(temp, { recursive: true, force: true });
-  }
-});
-
-test("postCopy trust is remembered for the same repo and exact normalized scripts", async () => {
-  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "subagents-postcopy-trust-test-"));
-  const previousStore = process.env.PI_SUBAGENTS_POSTCOPY_TRUST_STORE;
-  process.env.PI_SUBAGENTS_POSTCOPY_TRUST_STORE = path.join(temp, "trust.json");
-  try {
-    const repoRoot = path.join(temp, "repo");
-    await fs.mkdir(repoRoot);
-    const scripts = [
-      { command: "npm install --ignore-scripts", cwd: ".", timeoutMs: 120_000, optional: false, env: { B: "2", A: "1" } },
-    ];
-
-    const before = await __subagentsTest.getPostCopyTrust(repoRoot, scripts);
-    assert.equal(before.trusted, false);
-
-    await __subagentsTest.rememberPostCopyTrust(before);
-
-    const after = await __subagentsTest.getPostCopyTrust(repoRoot, [
-      { command: "npm install --ignore-scripts", cwd: ".", timeoutMs: 120_000, optional: false, env: { A: "1", B: "2" } },
-    ]);
-    assert.equal(after.trusted, true);
-
-    const changed = await __subagentsTest.getPostCopyTrust(repoRoot, [
-      { command: "npm install", cwd: ".", timeoutMs: 120_000, optional: false, env: { A: "1", B: "2" } },
-    ]);
-    assert.equal(changed.trusted, false);
-  } finally {
-    if (previousStore === undefined) delete process.env.PI_SUBAGENTS_POSTCOPY_TRUST_STORE;
-    else process.env.PI_SUBAGENTS_POSTCOPY_TRUST_STORE = previousStore;
     await fs.rm(temp, { recursive: true, force: true });
   }
 });

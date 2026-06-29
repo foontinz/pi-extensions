@@ -15,6 +15,7 @@ import {
   type JobPhase,
   type JobRecord,
   type JobTransition,
+  type SubagentResult,
   type SupervisorKind,
   type TerminalJobPhase,
   type WorktreeKeepMode,
@@ -67,7 +68,9 @@ const WORKTREE_KEYS = new Set(["root", "tempParent", "originalRoot", "originalCw
 const WORKTREE_SCRIPT_KEYS = new Set(["command", "cwd", "optional", "timeoutMs", "failed", "stdout", "stderr"]);
 const TERMINAL_KEYS = new Set(["phase", "reason", "finishedAt", "exitCode", "signal", "message", "error"]);
 const PENDING_TERMINAL_KEYS = new Set(["reason", "requestedAt", "observedAt", "exitCode", "signal", "message", "error"]);
-const OBSERVABILITY_KEYS = new Set(["finalOutput", "latestAssistantText", "logs", "messageCount", "lastLogAt"]);
+const OBSERVABILITY_KEYS = new Set(["finalOutput", "result", "latestAssistantText", "logs", "messageCount", "lastLogAt"]);
+const SUBAGENT_RESULT_KEYS = new Set(["output", "structuredOutput", "usage", "error", "truncated"]);
+const SUBAGENT_RESULT_ERROR_KEYS = new Set(["reason", "message"]);
 const OBSERVABILITY_LOG_KEYS = new Set(["seq", "timestamp", "level", "text", "eventType"]);
 const OBSERVABILITY_LOG_LEVELS = new Set(DURABLE_LOG_LEVEL_VALUES);
 
@@ -242,11 +245,51 @@ function assertUsageStats(value: unknown): void {
   for (const key of USAGE_KEYS) assertNonNegativeFinite(value[key], `usage.${key}`);
 }
 
+function assertSubagentResult(value: unknown, path: string): asserts value is SubagentResult {
+  if (!isRecord(value)) throw invariant(`${path} must be an object`);
+  assertAllowedKeys(value, SUBAGENT_RESULT_KEYS, path);
+  assertString(value.output, `${path}.output`);
+  assertUsageStatsAt(value.usage, `${path}.usage`);
+  if (value.error !== undefined) {
+    if (!isRecord(value.error)) throw invariant(`${path}.error must be an object`);
+    assertAllowedKeys(value.error, SUBAGENT_RESULT_ERROR_KEYS, `${path}.error`);
+    if (!TERMINAL_REASONS.has(value.error.reason as string)) throw invariant(`invalid ${path}.error.reason ${String(value.error.reason)}`);
+    assertString(value.error.message, `${path}.error.message`);
+  }
+  if (value.truncated !== undefined && typeof value.truncated !== "boolean") throw invariant(`${path}.truncated must be boolean`);
+  if (value.structuredOutput !== undefined) assertJsonCompatible(value.structuredOutput, `${path}.structuredOutput`);
+}
+
+function assertUsageStatsAt(value: unknown, path: string): void {
+  if (!isRecord(value)) throw invariant(`${path} must be an object`);
+  assertAllowedKeys(value, new Set<string>(USAGE_KEYS), path);
+  for (const key of USAGE_KEYS) assertNonNegativeFinite(value[key], `${path}.${key}`);
+}
+
+function assertJsonCompatible(value: unknown, path: string): void {
+  if (value === null) return;
+  const kind = typeof value;
+  if (kind === "string" || kind === "number" || kind === "boolean") {
+    if (kind === "number" && !Number.isFinite(value as number)) throw invariant(`${path} must be JSON-compatible`);
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => assertJsonCompatible(entry, `${path}.${index}`));
+    return;
+  }
+  if (isRecord(value)) {
+    for (const [key, child] of Object.entries(value)) assertJsonCompatible(child, `${path}.${key}`);
+    return;
+  }
+  throw invariant(`${path} must be JSON-compatible`);
+}
+
 function assertObservability(value: unknown, nextSeq: unknown): void {
   if (value === undefined) return;
   if (!isRecord(value)) throw invariant("observability must be an object");
   assertAllowedKeys(value, OBSERVABILITY_KEYS, "observability");
   if (value.finalOutput !== undefined) assertString(value.finalOutput, "observability.finalOutput");
+  if (value.result !== undefined) assertSubagentResult(value.result, "observability.result");
   if (value.latestAssistantText !== undefined) assertString(value.latestAssistantText, "observability.latestAssistantText");
   if (value.messageCount !== undefined) assertNonNegativeInteger(value.messageCount, "observability.messageCount");
   if (value.lastLogAt !== undefined) assertNonNegativeFinite(value.lastLogAt, "observability.lastLogAt");

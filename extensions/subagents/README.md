@@ -37,6 +37,12 @@ run_agent({
   "tools": ["read", "bash"]
 })
 
+// Final subagent output is always requested as JSON. If you need a specific
+// shape, state it in the task; otherwise the child uses {"output": string}.
+run_agent({
+  "task": "Return JSON with the top three suspect files"
+})
+
 // Disable worktree isolation for read-only/recon work that needs live uncommitted files.
 run_agent({
   "task": "Inspect my current working tree and summarize unstaged changes",
@@ -50,6 +56,9 @@ run_agent({
 })
 
 // 3. The final result is sent back to the parent Pi session when the job finishes.
+// Terminal job details include `result: { output, usage, error?, truncated? }`
+// alongside the legacy `finalOutput` preview fields. `output` is the final
+// assistant text, which subagents are instructed to make valid JSON.
 // If you need to wait for results, end the turn rather than blocking with sleep/polling;
 // Pi will wake you up when subagent callbacks arrive.
 // For live output/debugging, attach to the tmux session printed by run_agent.
@@ -94,11 +103,11 @@ Supported fields:
 - `base` — optional non-empty git revision for `git worktree add`; defaults to `HEAD`.
 - `copy` — optional array of strings or `{ from, to?, optional? }` objects. Paths must be relative to the repo root and may not point at `.git` metadata. Entries may be exact files/directories or glob patterns using `*`, `?`, and `**`. Directory copies are recursive. For glob objects with `to`, matched paths are copied under `to` while preserving their path relative to the glob's non-wildcard base. Symlinks are copied as symlinks only when their target resolves inside the repo root and not into `.git` metadata; outbound or `.git`-targeting symlinks are rejected instead of being copied into the worktree.
 - `exclude` / `exclusions` — optional array of repo-relative exclusion patterns using the same glob syntax. These are aliases; use one or the other, not both. Exclusions are only set here; `!pattern` entries inside `copy` are not supported.
-- `postCopy` / `postCopyScripts` — optional array of shell commands run after `copy` and before the child Pi process starts. These are aliases; use one or the other, not both. Entries can be strings or `{ command, cwd?, timeoutMs?, optional?, env? }` objects. `cwd` is repo-relative and defaults to the worktree root. `timeoutMs` defaults to 120000 and is capped at 1800000. Config is normalized and validated before the temp worktree is created; confirmation shows the normalized command, cwd, timeoutMs, optional flag, and env keys (values hidden). Commands run via `/bin/sh -c` rather than a login/user shell. Because these commands are repo-controlled and are not constrained by the subagent tool allowlist, Pi asks for interactive confirmation before running them. Approval is remembered for the same repository and exact normalized `postCopy` configuration, so non-interactive sessions may run it after one interactive approval. If the commands/configuration changes, Pi prompts again.
+- `postCopy` / `postCopyScripts` — optional array of shell commands run after `copy` and before the child Pi process starts. These are aliases; use one or the other, not both. Entries can be strings or `{ command, cwd?, timeoutMs?, optional?, env? }` objects. `cwd` is repo-relative and defaults to the worktree root. `timeoutMs` defaults to 120000 and is capped at 1800000. Config is normalized and validated before the temp worktree is created. Commands run via `/bin/sh -c` rather than a login/user shell. Because these commands are repo-controlled and are not constrained by the subagent tool allowlist, only use `postCopy` in trusted repos.
 
 `keepWorktree` is a `run_agent` input, not a `.pi/worktree.json` field. Any `keepWorktree` value in `.pi/worktree.json` is ignored.
 
-Security note: `postCopy` commands are arbitrary shell commands from the repository. Only approve them in trusted repos/configs. Remembered approvals are stored under Pi's subagent state directory and are keyed to the canonical repo path plus an exact hash of the normalized `postCopy` entries, including env values. They run with a minimal inherited environment rather than the full Pi process environment: only common process keys needed for shell/package-manager operation (for example `PATH`, `HOME`, `SHELL`, temp/locale/user keys when present) are preserved, then per-command `env` entries are added. The confirmation dialog lists inherited keys and per-command env keys but never prints env values. Do not put secrets in repo-controlled `.pi/worktree.json`; use public/non-secret `env` values only.
+Security note: `postCopy` commands are arbitrary shell commands from the repository. They run without an interactive approval prompt, with a minimal inherited environment rather than the full Pi process environment: only common process keys needed for shell/package-manager operation (for example `PATH`, `HOME`, `SHELL`, temp/locale/user keys when present) are preserved, then per-command `env` entries are added. Do not put secrets in repo-controlled `.pi/worktree.json`; use public/non-secret `env` values only.
 
 Temp worktrees are removed when Pi observes that the job finished, failed, or was stopped unless the `run_agent` `keepWorktree` input retains them. Running jobs are bounded to the parent Pi session: on graceful session shutdown or `/reload`, Pi sends Ctrl-C to running subagents and then hard-kills their tmux sessions after the stop grace period. If Pi exits ungracefully and leaves orphan tmux jobs behind, the next session load stops those recovered running jobs instead of adopting them. Cleanup state is persisted and retried if a previous cleanup attempt was interrupted or failed.
 
@@ -131,7 +140,7 @@ You are a fast reconnaissance subagent. Find relevant files and return a concise
 - Attach to a live job with `tmux attach -t <session>`; `run_agent` prints the exact session name.
 - Full raw child process streams are persisted under `~/.pi/agent/subagents/logs/*.stdout.jsonl` and `*.stderr.log` for manual inspection. To prevent unbounded disk growth, a running job is stopped if either raw stream exceeds `PI_SUBAGENTS_MAX_RAW_LOG_BYTES` bytes; the default is 512 MiB per stream, and `0` disables this guard.
 - Child tool access is limited to tools active in the parent Pi session. If `tools` is omitted, the child receives only the active safe read-only default tools: `read`, `grep`, `find`, and `ls` when available. For portability, omit `tools` unless extra access is needed; some Pi sessions expose search/list operations through `bash` instead of separate `grep`/`find`/`ls` tools. Explicitly requested unavailable safe-default tools are ignored, but any other unavailable tool is refused. Recursive subagent tools (`run_agent`, `list_agents`, `stop_agent`) are denied by default. Pass tools explicitly to grant write, execute, network, or other higher-risk capabilities.
-- Running job concurrency is capped by default to protect the host: `PI_SUBAGENTS_MAX_RUNNING` defaults to 10 globally and `PI_SUBAGENTS_MAX_RUNNING_PER_REPO` defaults to 10 per repository/path. Set either to `0` to disable that limit.
+- Running job concurrency is capped by default to protect the host: `PI_SUBAGENTS_MAX_RUNNING` defaults to 10 globally and `PI_SUBAGENTS_MAX_RUNNING_PER_REPO` defaults to 10 per repository/path. Set either to `0` to disable that limit. Temporary worktree provisioning is also bounded (`PI_SUBAGENTS_MAX_WORKTREE_CREATIONS`, default 4).
 - The child process uses `--no-session`: it does not inherit the parent conversation and does not write a normal Pi session file. Put all needed context in the task, named/ad-hoc system prompt, files, or repo context.
 - Do not pass a `model` override for routine delegation/review. Only set `model` when the user explicitly asks for that exact model/provider; otherwise the child Pi uses its configured default, avoiding provider/API-key mismatches.
 - Child Pi isolation is intentionally limited: the child process loads normal Pi configuration/extensions, skills, providers, and context files. This means extension side effects still apply in the child. Recursive subagent tools are denied in child allowlists by default, and the `tools` allowlist should still be used to constrain tool exposure for each run; there is not currently a minimal-extension or extension-denylist child mode.

@@ -440,9 +440,26 @@ test("run_agent successful start text/details are characterized with fake tmux",
   });
 });
 
+test("run_agent always appends JSON final-output instructions", async () => {
+  await withFakeTmux({}, async (fake) => {
+    const result = await tools.get("run_agent")!.execute("call", { task: "json result", label: "json", worktree: false, timeoutMs: 0 }, new AbortController().signal, () => {}, ctx);
+    assert.match(textOf(result), /Tools: read, grep, find, ls/);
+    assert.deepEqual(result.details.effectiveTools, ["read", "grep", "find", "ls"]);
+    const session = fake.readState().sessions[result.details.tmuxSession];
+    assert.ok(session);
+    const promptArg = session.script.match(/--append-system-prompt\s+([^\s]+)/)?.[1];
+    const promptPath = promptArg?.replace(/^'|'$/g, "");
+    assert.ok(promptPath);
+    const prompt = fs.readFileSync(promptPath, "utf-8");
+    assert.match(prompt, /Return only valid JSON/);
+    assert.match(prompt, /\{"output": string\}/);
+  });
+});
+
 test("stop_agent running job Ctrl-C path finalizes when fake tmux writes an exit code", async () => {
   await withFakeTmux({ exitOnSendKeys: true, exitOnSendKeysCode: 130 }, async () => {
     const started = await tools.get("run_agent")!.execute("call", { task: "stop me", label: "stop ctrl-c", worktree: false, timeoutMs: 0 }, new AbortController().signal, () => {}, ctx);
+    appendJsonl(jobFor(started.details.id).stdoutPath, [assistantEndEvent('{"output":"answer before stop"}')]);
     const result = await tools.get("stop_agent")!.execute("call", { id: started.details.id, reason: "test stop", waitMs: 100 }, new AbortController().signal, () => {}, ctx);
     assert.match(textOf(result), /^Stopped agent agent_/);
     assert.match(textOf(result), /Output drained before finalizing:/);
@@ -450,6 +467,11 @@ test("stop_agent running job Ctrl-C path finalizes when fake tmux writes an exit
     assert.equal(result.details.phase, "cancelled");
     assert.equal(result.details.exitCode, 130);
     assert.equal(result.details.stopReason, "test stop");
+    assert.equal(result.details.result.output, '{"output":"answer before stop"}');
+    assert.deepEqual(result.details.result.structuredOutput, { output: "answer before stop" });
+    assert.equal(result.details.result.usage.input, 3);
+    assert.equal(result.details.result.error.reason, "stop");
+    assert.equal(result.details.result.error.message, "test stop");
   });
 });
 

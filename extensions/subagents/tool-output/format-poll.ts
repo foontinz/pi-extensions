@@ -3,7 +3,7 @@ import { compactPreview } from "../output/preview.js";
 import { formatUsage } from "../output/usage.js";
 import { truncateOneLine } from "../platform/text.js";
 import { truncateForTool } from "./truncate.js";
-import type { UsageStats } from "../core/types.js";
+import type { SubagentResult, UsageStats } from "../core/types.js";
 
 export interface PollLogEntryView {
   seq: number;
@@ -53,6 +53,7 @@ export interface PollJobView<TLog extends PollLogEntryView = PollLogEntryView> {
   cleanupPending?: boolean;
   cleanupError?: string;
   usage: UsageStats;
+  result?: SubagentResult;
   messageCount: number;
   finalOutput?: string;
   latestAssistantText?: string;
@@ -109,6 +110,7 @@ export interface PollJobSummary {
   cleanupPending?: boolean;
   cleanupError?: string;
   usage: UsageStats;
+  result?: SubagentResult;
   messageCount: number;
   finalOutputPreview?: string;
   nextSeq: number;
@@ -160,6 +162,7 @@ export function summarizeJob<TLog extends PollLogEntryView>(job: PollJobView<TLo
     cleanupPending: job.cleanupPending,
     cleanupError: job.cleanupError,
     usage: job.usage,
+    result: job.result,
     messageCount: job.messageCount,
     finalOutputPreview: job.finalOutput ? truncateOneLine(job.finalOutput, 1_000) : undefined,
     nextSeq: job.nextSeq - 1,
