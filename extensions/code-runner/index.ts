@@ -3,7 +3,6 @@ import {
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
   formatSize,
-  truncateTail,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { executeCode } from "./executor";
@@ -20,17 +19,55 @@ export default function (pi: ExtensionAPI) {
   });
 }
 
+function sliceBytesHead(s: string, maxBytes: number): string {
+  const buf = Buffer.from(s, "utf8");
+  return buf.length <= maxBytes ? s : buf.subarray(0, maxBytes).toString("utf8");
+}
+
+function sliceBytesTail(s: string, maxBytes: number): string {
+  const buf = Buffer.from(s, "utf8");
+  return buf.length <= maxBytes
+    ? s
+    : buf.subarray(buf.length - maxBytes).toString("utf8");
+}
+
+/**
+ * Truncate large output by keeping BOTH the head and the tail, eliding the
+ * middle. This preserves early results (e.g. a value printed before a long
+ * loop) as well as final output, instead of dropping the head entirely.
+ */
 function truncateText(text: string): string {
-  const t = truncateTail(text || "(no output)", {
-    maxLines: DEFAULT_MAX_LINES,
-    maxBytes: DEFAULT_MAX_BYTES,
-  });
-  if (!t.truncated) return t.content;
-  return (
-    t.content +
-    `\n\n[Output truncated to ${t.outputLines} of ${t.totalLines} lines` +
-    ` (${formatSize(t.outputBytes)} of ${formatSize(t.totalBytes)})]`
-  );
+  const content = text || "(no output)";
+  const maxLines = DEFAULT_MAX_LINES;
+  const maxBytes = DEFAULT_MAX_BYTES;
+
+  const totalBytes = Buffer.byteLength(content, "utf8");
+  const lines = content.split("\n");
+  const totalLines = lines.length;
+
+  if (totalLines <= maxLines && totalBytes <= maxBytes) return content;
+
+  const headLines = Math.ceil(maxLines / 2);
+  const tailLines = Math.floor(maxLines / 2);
+  let headStr = lines.slice(0, headLines).join("\n");
+  let tailStr = lines.slice(Math.max(headLines, totalLines - tailLines)).join("\n");
+
+  // Split the byte budget between head and tail.
+  const halfBytes = Math.floor(maxBytes / 2);
+  headStr = sliceBytesHead(headStr, halfBytes);
+  tailStr = sliceBytesTail(tailStr, halfBytes);
+
+  const shownLines =
+    headStr.split("\n").length + tailStr.split("\n").length;
+  const shownBytes =
+    Buffer.byteLength(headStr, "utf8") + Buffer.byteLength(tailStr, "utf8");
+  const omittedLines = Math.max(0, totalLines - shownLines);
+
+  const elision =
+    `\n\n… [omitted ${omittedLines} of ${totalLines} lines, ` +
+    `${formatSize(totalBytes - shownBytes)} of ${formatSize(totalBytes)}] …\n\n`;
+
+  return headStr + elision + tailStr;
 }
 
 function registerTools(pi: ExtensionAPI): void {
@@ -47,6 +84,8 @@ function registerTools(pi: ExtensionAPI): void {
       "Pre-initialized handles are available as ready-to-use top-level variables — no import needed.",
       "If you are unsure which handles or SDKs are available for a task, call `search_spec` first.",
       "You may also import packages that exist in ~/.pi/agent/node_modules/.",
+      "Code is type-checked with tsc before running; type errors are returned without executing. Pass typecheck:false to skip the check.",
+      "Relative file paths resolve to a throwaway temp dir that is deleted after the run; write to an absolute path to persist files.",
     ].join("\n"),
     promptSnippet:
       "Execute TypeScript code in Node.js using available pre-initialized handles and console.log for output.",
@@ -70,6 +109,12 @@ function registerTools(pi: ExtensionAPI): void {
           maximum: 120_000,
         }),
       ),
+      typecheck: Type.Optional(
+        Type.Boolean({
+          description:
+            "Type-check the code with tsc before running (default: true). Set false to skip and run even if there are type errors.",
+        }),
+      ),
     }),
 
     async execute(_id, params, signal, onUpdate) {
@@ -83,6 +128,7 @@ function registerTools(pi: ExtensionAPI): void {
       const result = await executeCode(params.code, handles, {
         timeout: params.timeout,
         signal,
+        typecheck: params.typecheck,
       });
 
       const parts: string[] = [];
