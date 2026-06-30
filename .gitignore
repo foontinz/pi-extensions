@@ -15,6 +15,7 @@ settings.json
 trust.json
 npm/
 fast-mode.json
+tool-view.json
 mcp.json
 mcp-cache.json
 mcp-oauth/
