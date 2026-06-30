@@ -1,5 +1,8 @@
 # Subagents Improvement Path
 
+> **Handoff:** current architecture, status, and how to continue are in
+> `docs/subagents-workflows-handoff.md`. Start there.
+
 Improvements to the `extensions/subagents` runtime so it can serve the **dynamic
 workflows** use case (many subagents fanned out / pipelined; see
 `docs/claude-dynamic-workflows-spec.md`). Today each `agent()` would be a full
@@ -39,6 +42,49 @@ changes.
 
 Out of scope (decided earlier): token **budget** accounting.
 Non-blockers / spikes tracked in "What's left" below.
+
+### Subprocess → in-process migration (DONE; subprocess path removed)
+`run_agent` runs **in-process** only. The subprocess+tmux supervisor and all its dead
+code have been deleted (no `PI_SUBAGENTS_SUPERVISOR` flag): removed the tmux module
+(`supervisor/tmux-supervisor.ts`), `tmuxSessionName`, the tmux launch/monitor/kill paths,
+stdout/stderr JSONL parsing + raw-log limiting, temp-prompt files + `getPiInvocation`,
+child-process signaling, and the now-dead `AgentJob` fields/constants/formatter branches
+(~450 lines net out of `index.ts`). tmux characterization tests were replaced with
+in-process equivalents using an injectable launcher seam.
+- New `supervisor/in-process-supervisor.ts` drives a nested `AgentSession` and forwards
+  its live `AgentSessionEvent` stream into the existing `processEvent` → log/status/
+  usage/callback machinery (the event shapes match the old `--mode json` stdout).
+- `startAgentJob` branches on supervisor kind: in-process skips CLI args/temp prompt
+  file/tmux script; the combined prompt is passed as **appendSystemPrompt** to a bare
+  `ResourceLoader` (so pi's default coding prompt is preserved, no extensions/skills
+  reloaded). `supervisor: "process"` records carry no tmux/exit-code paths.
+- `stop_agent`/`terminateJob` abort the in-process session (`session.abort()`); timeouts
+  map through the state machine to `failed`/`timeout`; shutdown aborts in-flight jobs.
+- Hydration: a persisted in-process job that was still "running" is marked **failed** on
+  reload (in-process work cannot survive a parent restart; tmux jobs are still re-monitored).
+- Caps, worktree (cwd) isolation, waiters/polling, status widget, background callbacks,
+  and the typed result envelope are all preserved and shared across both paths.
+- Tests: tmux characterization tests pinned via `PI_SUBAGENTS_SUPERVISOR=tmux`; added
+  in-process start/completion, stop→cancel, and timeout→failed characterizations (96
+  pass). Validated live end-to-end through the real `run_agent` tool.
+
+### v1 implementation status (in this repo)
+- **Done:** P1.1 JSON addendum; P1.2 typed `SubagentResult`; P1.3 parallel worktree
+  creation (pool 4); P1.4 lean default tools. In-process primitive
+  (`subagents/core/in-process-runner.ts`, `createAgentSession` + bare `ResourceLoader`
+  + `SessionManager.inMemory` + per-agent abort/timeout + usage capture + shared
+  process-wide `AuthStorage`/`ModelRegistry`). New `workflows` ext with `Workflow` tool
+  + `agent/parallel/pipeline/workflow/phase/log/args/failures` hooks, concurrency cap
+  (8) + agent cap (100), 429 backoff, stall watchdog, schema validate+retry, usage
+  rollup envelope, `script`/`scriptPath`/`name` sources + inline-script persistence,
+  per-agent `cwd`, **background-task delivery** (idle-aware completion notification +
+  session-shutdown abort), injectable executor + unit tests. Spikes A/B/E validated
+  live (concurrent in-process sessions, re-entrancy from the tool's `call()`, shared
+  auth/model under concurrency).
+- **Not yet (intentionally deferred):** per-agent git **worktree** isolation (agents
+  share the workflow cwd; lightweight `agent` `cwd` knob provided); shared **MCP**
+  gateway proxy (P3.3); **resume**/journal (v2); VM **sandboxing** (dropped per
+  decision).
 
 ### v1 build scope (derived from the decisions)
 - **`subagents` ext:** in-process spawn-and-await primitive (`createAgentSession`

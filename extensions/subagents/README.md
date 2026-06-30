@@ -2,12 +2,22 @@
 
 Non-blocking Pi subagents exposed as tools.
 
+**Execution model:** `run_agent` runs subagents **in-process**, via the SDK
+`createAgentSession` (no `pi` subprocess, no tmux). The job starts asynchronously and returns a
+job id immediately; live `AgentSession` events stream into the log/status/callback machinery,
+and the final result is delivered back to the parent session on completion. The legacy
+tmux/subprocess supervisor has been removed.
+
+In-process subagents are bound to the parent process: they are aborted on session shutdown/
+reload and **cannot be recovered after a restart** (a persisted record that was still running is
+marked failed on reload).
+
 Subagent execution is session-bound: running child jobs are stopped when the parent Pi session shuts down or reloads. Persistence is used for terminal summaries, callback delivery/retry, log/debug data, and cleanup retry; it is not a durable detached-execution recovery system.
 
 ## Tools
 
 - `list_agents` — lists user-owned markdown-backed named agents discoverable by `run_agent` from `~/.pi/agent/agents`.
-- `run_agent` — starts a session-bounded tmux-supervised `pi --mode json -p --no-session` process and returns a job id immediately. Finished subagents report their final output back to the parent Pi session when possible. Omit `model` unless the user explicitly requested a specific model; the child Pi will otherwise use its normal/default model configuration. Recursive subagent tools are denied in child allowlists by default.
+- `run_agent` — starts a session-bounded **in-process** subagent and returns a job id immediately. Finished subagents report their final output back to the parent Pi session when possible. Omit `model` unless the user explicitly requested a specific model; the subagent otherwise uses your default model configuration. Recursive subagent tools are denied in child allowlists by default.
 - `stop_agent` — terminates a running background job.
 
 Tool names use underscores for provider/tool-call compatibility; labels render as “List Agents”, “Run Agent”, and “Stop Agent”. Running/recent jobs are also shown in Pi’s subagents status/widget with their label, runtime, status, and compact state.

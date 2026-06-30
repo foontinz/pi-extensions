@@ -6,12 +6,11 @@
  * with a job id. stop_agent terminates a running job.
  */
 
-import { execFile, execFileSync, type ChildProcess } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 import type { AssistantMessage, Message, ToolResultMessage } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -19,15 +18,13 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import {
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
-  formatSize,
   truncateTail,
-  withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { type AgentConfig, discoverAgents, formatAgentList } from "./agents.js";
 import { hydrateJobRecord, serializeJobRecord, UnsupportedJobRecordSchemaError } from "./core/hydration.js";
-import { createJobId, shortJobId, tmuxSessionName } from "./core/ids.js";
+import { createJobId, shortJobId } from "./core/ids.js";
 import {
   callbackMarkerPathForStore,
   ensureJobStoreDirsFor,
@@ -43,22 +40,15 @@ import {
   type JobStorePaths,
 } from "./core/job-store.js";
 import { reduceJobEvent } from "./core/state-machine.js";
+import { startInProcessAgent, type InProcessHandle, type InProcessOutcome } from "./supervisor/in-process-supervisor.js";
 import { getLogWindow as buildLogWindow, getLogsSince as buildLogsSince, type LogWindow } from "./output/log-window.js";
 import { formatToolCall, formatToolResultMessage, getAssistantText, previewToolResult, textContent } from "./output/message-format.js";
 import { compactPreview } from "./output/preview.js";
 import { parseOptionalNonNegativeIntegerEnv } from "./platform/env.js";
 import { getShellInvocation } from "./platform/shell.js";
-import { displayCommand, shellQuote, squashWhitespace, truncateOneLine, truncateString } from "./platform/text.js";
+import { squashWhitespace, truncateOneLine, truncateString } from "./platform/text.js";
 import { buildPostCopyEnv } from "./policy/post-copy-env.js";
 import { DEFAULT_SUBAGENT_TOOLS, validateToolSelection } from "./policy/tool-selection.js";
-import {
-  isTmuxAvailable,
-  listTmuxSessions,
-  resetTmuxAvailabilityCache,
-  runTmuxSync,
-  TMUX_COMMAND_TIMEOUT_MS,
-  tmuxSessionExists,
-} from "./supervisor/tmux-supervisor.js";
 import {
   formatCompactPollResult as renderCompactPollResult,
   formatJobSummaryLine,
@@ -114,9 +104,6 @@ const MAX_TIMEOUT_MS = 12 * 60 * 60 * 1000;
 const MAX_STORED_LOG_ENTRIES = 5_000;
 const MAX_DURABLE_LOG_ENTRIES = 500;
 const MAX_DURABLE_TEXT_CHARS = 256_000;
-const MAX_STORED_STDERR_CHARS = 100_000;
-const MAX_STDOUT_LINE_CHARS = 64 * 1024 * 1024;
-const MAX_STDERR_PARTIAL_BUFFER_CHARS = 1_000_000;
 const MAX_LOG_READ_BYTES = 1_000_000;
 const DEFAULT_MAX_RAW_LOG_BYTES = 512 * 1024 * 1024;
 const MAX_RAW_LOG_BYTES = parseOptionalNonNegativeIntegerEnv("PI_SUBAGENTS_MAX_RAW_LOG_BYTES", DEFAULT_MAX_RAW_LOG_BYTES);
@@ -131,9 +118,7 @@ const MAX_STOP_WAIT_MS = 60_000;
 const FINISHED_STATUS_VISIBLE_MS = 15 * 1000;
 const ASSISTANT_DELTA_LOG_INTERVAL_MS = 1_250;
 const ASSISTANT_DELTA_LOG_CHARS = 1_200;
-const TMUX_STATUS_INTERVAL_MS = 2_000;
 const GIT_CLEANUP_TIMEOUT_MS = 10_000;
-const SUBAGENT_CHILD_ENV = "PI_SUBAGENTS_CHILD";
 const DEFAULT_MAX_WORKTREE_CREATIONS = 4;
 const MAX_WORKTREE_CREATIONS = Math.max(1, parseOptionalNonNegativeIntegerEnv("PI_SUBAGENTS_MAX_WORKTREE_CREATIONS", DEFAULT_MAX_WORKTREE_CREATIONS));
 const DEFAULT_JSON_OUTPUT_ADDENDUM = [
@@ -143,17 +128,6 @@ const DEFAULT_JSON_OUTPUT_ADDENDUM = [
 ].join(" ");
 
 const execFileAsync = promisify(execFile);
-
-function isSubagentChildProcess(): boolean {
-  if (process.env[SUBAGENT_CHILD_ENV] === "1") return true;
-  // Defensive fallback: subagent children are launched as `pi --mode json -p --no-session`.
-  // If a wrapper/re-exec path drops PI_SUBAGENTS_CHILD, still avoid running parent
-  // session-boundary recovery inside the child process.
-  const args = process.argv.slice(2);
-  const modeIndex = args.indexOf("--mode");
-  const hasJsonMode = args.includes("--mode=json") || (modeIndex >= 0 && args[modeIndex + 1] === "json");
-  return hasJsonMode && args.includes("--no-session");
-}
 
 type JobStatus = "running" | "completed" | "failed" | "cancelled";
 type LogLevel = "info" | "assistant" | "tool" | "stdout" | "stderr" | "error";
@@ -186,14 +160,9 @@ interface AgentJob {
   status: JobStatus;
   exitCode?: number;
   signal?: NodeJS.Signals;
-  pid?: number;
-  proc?: ChildProcess;
   messageCount: number;
   logs: AgentLogEntry[];
   nextSeq: number;
-  stderr: string;
-  stdoutBuffer: string;
-  stderrBuffer: string;
   latestAssistantText: string;
   pendingAssistantDelta: string;
   lastAssistantDeltaLogAt: number;
@@ -202,24 +171,12 @@ interface AgentJob {
   stopReason?: string;
   errorMessage?: string;
   usage: UsageStats;
-  tmpPromptDir?: string;
-  tmpPromptPath?: string;
   timeout?: NodeJS.Timeout;
   timeoutAt?: number;
-  killTimer?: NodeJS.Timeout;
   supervisor: "process" | "tmux";
-  tmuxSession?: string;
-  stdoutPath?: string;
-  stderrPath?: string;
-  exitCodePath?: string;
-  stdoutOffset: number;
-  stderrOffset: number;
-  monitorTimer?: NodeJS.Timeout;
-  stdoutDecoder?: StringDecoder;
-  stderrDecoder?: StringDecoder;
+  inProcessHandle?: InProcessHandle;
   cleanupPending?: boolean;
   cleanupError?: string;
-  rawLogLimitExceeded?: boolean;
   repoKey?: string;
   phase?: JobPhase;
   cleanupPhase?: CleanupPhase;
@@ -375,8 +332,6 @@ function jobBelongsToCurrentOwner(job: AgentJob): boolean {
 function clearInMemoryJobs(): void {
   for (const job of jobs.values()) {
     if (job.timeout) clearTimeout(job.timeout);
-    if (job.killTimer) clearTimeout(job.killTimer);
-    if (job.monitorTimer) clearInterval(job.monitorTimer);
   }
   jobs.clear();
   launchReservations.length = 0;
@@ -401,7 +356,6 @@ function cleanupLegacyRootStore(): void {
         if (fileName.endsWith(suffix)) ids.add(fileName.slice(0, -suffix.length));
       }
     }
-    for (const id of ids) runTmuxSync(["kill-session", "-t", tmuxSessionName(id)]);
     fs.rmSync(legacyJobsDir, { recursive: true, force: true });
     fs.rmSync(legacyLogsDir, { recursive: true, force: true });
     recordStoreWarning({ path: JOB_STORE_ROOT, kind: "persistence", message: `removed legacy unscoped subagent store (${ids.size} possible job(s))` });
@@ -411,7 +365,6 @@ function cleanupLegacyRootStore(): void {
 }
 
 async function handleSubagentsSessionStart(ctx: ExtensionContext): Promise<void> {
-  if (isSubagentChildProcess()) return;
   const nextOwner = makeOwner(ctx);
   if (currentOwner && currentOwner.id !== nextOwner.id) {
     await stopRunningJobsForOwner(currentOwner.id, "cancelled because subagents are bounded to the parent Pi session and the previous session ended", 0);
@@ -421,7 +374,6 @@ async function handleSubagentsSessionStart(ctx: ExtensionContext): Promise<void>
   cleanupLegacyRootStore();
   loadPersistedJobs();
   await stopRunningJobsForSessionBoundary("cancelled because subagents are bounded to the parent Pi session and the previous session ended", 0);
-  refreshRunningTmuxJobs();
   scheduleRunningJobTimeouts();
   refreshSubagentStatus();
 }
@@ -437,9 +389,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     name: "run_agent",
     label: "Run Agent",
     description: [
-      "Start a session-bounded tmux-supervised background Pi subagent in a separate --no-session process and return immediately with a job id.",
-      "Finished subagents report their final output back to the parent Pi session when possible; attach to the tmux session for live output/debugging.",
-      "Running subagents are stopped when the parent Pi session shuts down.",
+      "Start a session-bounded background Pi subagent that runs in-process and return immediately with a job id.",
+      "Finished subagents report their final output back to the parent Pi session when possible.",
+      "Running subagents are stopped when the parent Pi session shuts down and cannot be recovered after a restart.",
       "When started inside a git repo, the child runs in a temporary detached worktree by default; .pi/worktree.json controls copied files and post-copy setup scripts. Pass worktree:false to run in-place or worktree:true to require isolation. Pass keepWorktree:'onFailure' or 'always' to retain temp worktrees for inspection.",
       `By default, subagents receive only active read-only tools (${DEFAULT_SUBAGENT_TOOLS.join("/")}); omit tools for portable read-only delegation because some sessions do not expose grep/find/ls as separate tools. Pass tools explicitly to grant write, execute, network, or other higher-risk capabilities. Recursive subagent tools are denied in children by default.`,
       "Can run a named user-owned markdown agent or an ad-hoc subagent with optional systemPrompt/tools and an explicit model override only when requested.",
@@ -448,7 +400,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use run_agent for long-running or parallelizable investigation/implementation tasks that should not block the main agent turn.",
       "Use list_agents first when the user asks what named user-owned agents are available or when you need to choose a named markdown agent.",
-      "Finished subagents send a callback to the parent Pi session when possible; use the printed tmux session only for live output/debugging.",
+      "Finished subagents send a callback to the parent Pi session when possible.",
       "If you need to wait for subagent results, do not block the turn with sleep/polling commands; end the turn and you will be notified when callbacks arrive.",
       "Remember run_agent uses a temporary git worktree when inside a repo unless worktree:false is set; uncommitted/untracked files are visible only if copied by .pi/worktree.json, dependencies may need postCopy setup, and temp worktrees are removed unless keepWorktree requests retention.",
       "Subagents are bounded to the current Pi session and will be stopped during session shutdown/reload; let them finish before ending the session if you need callback results.",
@@ -462,7 +414,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       bindOwnerToContext(ctx);
       if (ctx.hasUI) statusContext = ctx;
       loadPersistedJobs();
-      refreshRunningTmuxJobs();
       refreshSubagentStatus();
       const cwdResolution = resolveAndValidateCwd(ctx.cwd, params.cwd);
       if (!cwdResolution.ok) {
@@ -602,7 +553,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return { content: [{ type: "text", text: `Unknown agent job id: ${params.id}. Known ids: ${known}` }], details: {} };
       }
 
-      refreshTmuxJob(job);
       if (job.status !== "running") {
         return {
           content: [{ type: "text", text: `Agent ${job.id} is already ${job.status}.` }],
@@ -619,7 +569,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         ? currentStatus === "cancelled"
           ? `Stopped agent ${job.id}. Output drained before finalizing: ${job.pendingAssistantDelta ? "partial" : "yes"}.`
           : `Agent ${job.id} is ${currentStatus}; it appears to have finished before stop completed.`
-        : `Failed to stop agent ${job.id}; it is still marked ${currentStatus}. Check logs and tmux session ${job.tmuxSession ?? "(unknown)"}.`;
+        : `Failed to stop agent ${job.id}; it is still marked ${currentStatus}. Check the job logs.`;
       return {
         content: [{ type: "text", text: previousStatus === "running" ? text : `Agent ${job.id} is already ${currentStatus}.` }],
         details: summarizeJob(job),
@@ -628,9 +578,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
-    if (isSubagentChildProcess()) return;
-    // Subagents are bounded to the parent Pi session. Stop live children on
-    // graceful shutdown/reload instead of leaving detached tmux work running.
+    // Subagents are bounded to the parent Pi session. Stop live in-process children
+    // on graceful shutdown/reload.
     await stopRunningJobsForSessionBoundary("cancelled because the parent Pi session shut down", DEFAULT_STOP_WAIT_MS);
     clearInMemoryJobs();
     currentOwner = undefined;
@@ -661,18 +610,6 @@ function formatListAgentsResult(agents: AgentConfig[]): string {
     lines.push(`- ${agent.name}: ${agent.description}${extras ? ` [${extras}]` : ""}`);
   }
   return lines.join("\n");
-}
-
-function preflightSupervisorRequirements(): { ok: true } | { ok: false; message: string } {
-  if (!isTmuxAvailable()) {
-    return { ok: false, message: "Cannot start subagent: tmux is required but was not found or did not respond on PATH." };
-  }
-  try {
-    fs.accessSync("/bin/sh", fs.constants.X_OK);
-  } catch {
-    return { ok: false, message: "Cannot start subagent: /bin/sh is required to launch the tmux-supervised child process." };
-  }
-  return { ok: true };
 }
 
 type CapacityDetails = { running: number; maxRunning: number; runningForRepo: number; maxRunningPerRepo: number; repoKey: string };
@@ -756,8 +693,6 @@ async function startAgentJob(
   const id = createJobId();
   const owner = requireCurrentOwner();
   const store = storePathsForOwner(owner);
-  const preflight = preflightSupervisorRequirements();
-  if (!preflight.ok) return createFailedPreStartJob(id, sourceCwd, params, agent, preflight.message, owner, store);
   let worktreePrep: { cwd: string; worktree?: WorktreeInfo; warning?: string };
   try {
     worktreePrep = await prepareWorktreeForSpawn(sourceCwd, ctx, params.worktree, params.keepWorktree ?? "never");
@@ -771,38 +706,16 @@ async function startAgentJob(
   const cwd = worktreePrep.cwd;
   const label = params.label?.trim() || agent?.name || `agent-${id}`;
   const promptParts = [agent?.systemPrompt, params.systemPrompt, DEFAULT_JSON_OUTPUT_ADDENDUM].filter((part): part is string => Boolean(part?.trim()));
+  const combinedPrompt = promptParts.join("\n\n");
   const model = params.model ?? agent?.model;
   const thinking = params.thinking ?? agent?.thinking;
   const timeoutMs = params.timeoutMs === undefined ? DEFAULT_TIMEOUT_MS : params.timeoutMs;
 
-  const args: string[] = ["--mode", "json", "-p", "--no-session"];
-  if (model) args.push("--model", model);
-  if (thinking) args.push("--thinking", thinking);
-  if (effectiveTools.length > 0) args.push("--tools", effectiveTools.join(","));
-  else args.push("--no-tools");
-
-  let tmpPromptDir: string | undefined;
-  let tmpPromptPath: string | undefined;
-  try {
-    if (promptParts.length > 0) {
-      const tmp = await writePromptToTempFile(id, promptParts.join("\n\n"));
-      tmpPromptDir = tmp.dir;
-      tmpPromptPath = tmp.filePath;
-      args.push("--append-system-prompt", tmpPromptPath);
-    }
-  } catch (error) {
-    cleanupPromptFiles(tmpPromptPath, tmpPromptDir);
-    cleanupWorktreeInfo(worktreePrep.worktree);
-    return createFailedPreStartJob(id, sourceCwd, params, agent, `failed to prepare system prompt: ${error instanceof Error ? error.message : String(error)}`, owner, store);
-  }
   if (!ownerMatchesCurrent(owner)) {
-    cleanupPromptFiles(tmpPromptPath, tmpPromptDir);
     cleanupWorktreeInfo(worktreePrep.worktree);
     return createFailedPreStartJob(id, sourceCwd, params, agent, "cancelled before launch because the parent Pi session changed", owner, store);
   }
 
-  args.push(`Task: ${params.task}`);
-  const invocation = getPiInvocation(args);
   const createdAt = Date.now();
   const timeoutAt = timeoutMs && timeoutMs > 0 ? createdAt + timeoutMs : undefined;
   const record: JobRecord = {
@@ -815,7 +728,7 @@ async function startAgentJob(
     cwd: sourceCwd,
     phase: "created",
     cleanupPhase: "none",
-    supervisor: "tmux",
+    supervisor: "process",
     createdAt,
     updatedAt: createdAt,
     timeoutAt,
@@ -837,8 +750,8 @@ async function startAgentJob(
     cwd,
     sourceCwd,
     worktree: worktreePrep.worktree,
-    command: invocation.command,
-    args: invocation.args,
+    command: "<in-process>",
+    args: [],
     startedAt: createdAt,
     updatedAt: createdAt,
     status: "running",
@@ -847,23 +760,12 @@ async function startAgentJob(
     messageCount: 0,
     logs: [],
     nextSeq: 1,
-    stderr: "",
-    stdoutBuffer: "",
-    stderrBuffer: "",
     latestAssistantText: "",
     pendingAssistantDelta: "",
     lastAssistantDeltaLogAt: 0,
     usage: emptyUsageStats(),
-    tmpPromptDir,
-    tmpPromptPath,
     timeoutAt,
-    supervisor: "tmux",
-    tmuxSession: tmuxSessionName(id),
-    stdoutPath: jobLogPathForStore(store, id, "stdout"),
-    stderrPath: jobLogPathForStore(store, id, "stderr"),
-    exitCodePath: jobExitCodePathForStore(store, id),
-    stdoutOffset: 0,
-    stderrOffset: 0,
+    supervisor: "process",
     waiters: new Set(),
     closeWaiters: new Set(),
   };
@@ -890,70 +792,55 @@ async function startAgentJob(
     }
   }
   if (worktreePrep.warning) addLog(job, "error", worktreePrep.warning, "worktree");
-  const commandLine = displayCommand(invocation.command, invocation.args);
-  const childCommandLine = `${SUBAGENT_CHILD_ENV}=1 ${commandLine}`;
-  addLog(job, "info", `starting: ${childCommandLine} (cwd: ${cwd})`, "start");
 
+  launchInProcessJob(job, { combinedPrompt, model, thinking });
+  return job;
+}
+
+// Seam so unit tests can drive the in-process supervisor without a live model.
+let inProcessLauncher: typeof startInProcessAgent = startInProcessAgent;
+
+function launchInProcessJob(job: AgentJob, opts: { combinedPrompt: string; model?: string; thinking?: string }): void {
+  addLog(job, "info", `starting in-process subagent session (cwd: ${job.cwd})`, "start");
+  dispatchLifecycleEvent(job, {
+    type: "SupervisorStarted",
+    handle: { kind: "process", command: "<in-process>", args: [] },
+  });
+  persistJob(job);
+  scheduleJobTimeout(job);
   try {
-    ensureJobStoreDirsFor(store);
-    fs.writeFileSync(job.stdoutPath!, "", { encoding: "utf-8", mode: 0o600 });
-    fs.writeFileSync(job.stderrPath!, "", { encoding: "utf-8", mode: 0o600 });
-    fs.rmSync(job.exitCodePath!, { force: true });
-
-    const shell = "/bin/sh";
-    const script = [
-      `umask 077`,
-      `parent_pid=${process.pid}`,
-      `(${childCommandLine}) > ${shellQuote(job.stdoutPath!)} 2> ${shellQuote(job.stderrPath!)} &`,
-      `child_pid=$!`,
-      `(`,
-      `  while kill -0 "$parent_pid" 2>/dev/null; do sleep 2; done`,
-      `  kill -INT "$child_pid" 2>/dev/null || true`,
-      `  sleep 5`,
-      `  kill -TERM "$child_pid" 2>/dev/null || true`,
-      `  sleep 5`,
-      `  kill -KILL "$child_pid" 2>/dev/null || true`,
-      `) &`,
-      `watchdog_pid=$!`,
-      `wait "$child_pid"`,
-      `code=$?`,
-      `kill "$watchdog_pid" 2>/dev/null || true`,
-      `wait "$watchdog_pid" 2>/dev/null || true`,
-      `printf '%s\\n' "$code" > ${shellQuote(job.exitCodePath!)}`,
-      `exit "$code"`,
-    ].join("\n");
-
-    await execFileAsync("tmux", ["new-session", "-d", "-s", job.tmuxSession!, "-c", cwd, shell, "-c", script], {
-      timeout: TMUX_COMMAND_TIMEOUT_MS,
-      killSignal: "SIGKILL",
-    });
-    if (!ownerMatchesCurrent(owner)) {
-      killTmuxJobSession(job, "cancelled because the parent Pi session changed during subagent launch", "stop");
-      return job;
-    }
-    dispatchLifecycleEvent(job, {
-      type: "SupervisorStarted",
-      handle: {
-        kind: "tmux",
-        command: invocation.command,
-        args: invocation.args,
-        tmuxSession: job.tmuxSession,
-        stdoutPath: job.stdoutPath,
-        stderrPath: job.stderrPath,
-        exitCodePath: job.exitCodePath,
+    job.inProcessHandle = inProcessLauncher({
+      cwd: job.cwd,
+      task: job.task,
+      tools: job.effectiveTools,
+      model: opts.model,
+      thinking: opts.thinking,
+      appendSystemPrompt: opts.combinedPrompt || undefined,
+      onEvent: (event) => {
+        processEvent(job, event as any);
+        refreshSubagentStatus();
       },
+      onDone: (outcome) => finalizeInProcessJob(job, outcome),
     });
-    addLog(job, "info", `started tmux session ${job.tmuxSession}; attach: tmux attach -t ${job.tmuxSession}`, "start");
-    persistJob(job);
-    startTmuxMonitor(job);
-
-    scheduleJobTimeout(job);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    finalizeJob(job, "failed", undefined, undefined, `failed to start tmux subagent: ${message}`);
+    finalizeJob(job, "failed", undefined, undefined, `failed to start in-process subagent: ${message}`);
   }
+}
 
-  return job;
+function finalizeInProcessJob(job: AgentJob, outcome: InProcessOutcome): void {
+  if (job.finishedAt) return;
+  if (outcome.error) {
+    finalizeJob(job, "failed", undefined, undefined, outcome.error);
+    return;
+  }
+  if (outcome.aborted) {
+    finalizeJob(job, "cancelled", undefined, undefined, job.errorMessage ?? "aborted");
+    return;
+  }
+  // Natural completion: derive status from the last assistant stopReason.
+  const failedReason = job.stopReason === "error" || job.stopReason === "aborted";
+  finalizeJob(job, failedReason ? "failed" : "completed", failedReason ? undefined : 0, undefined);
 }
 
 function createFailedPreStartJob(
@@ -977,7 +864,7 @@ function createFailedPreStartJob(
     cwd: sourceCwd,
     phase: "failed",
     cleanupPhase: "none",
-    supervisor: "tmux",
+    supervisor: "process",
     createdAt: now,
     updatedAt: now,
     startedAt: now,
@@ -997,7 +884,7 @@ function createFailedPreStartJob(
     repoKey: sourceCwd,
     cwd: sourceCwd,
     sourceCwd,
-    command: "",
+    command: "<in-process>",
     args: [],
     startedAt: now,
     updatedAt: now,
@@ -1009,21 +896,12 @@ function createFailedPreStartJob(
     messageCount: 0,
     logs: [],
     nextSeq: 1,
-    stderr: "",
-    stdoutBuffer: "",
-    stderrBuffer: "",
     latestAssistantText: "",
     pendingAssistantDelta: "",
     lastAssistantDeltaLogAt: 0,
     errorMessage,
     usage: emptyUsageStats(),
-    supervisor: "tmux",
-    tmuxSession: tmuxSessionName(id),
-    stdoutPath: jobLogPathForStore(store, id, "stdout"),
-    stderrPath: jobLogPathForStore(store, id, "stderr"),
-    exitCodePath: jobExitCodePathForStore(store, id),
-    stdoutOffset: 0,
-    stderrOffset: 0,
+    supervisor: "process",
     waiters: new Set(),
     closeWaiters: new Set(),
   };
@@ -1131,8 +1009,6 @@ function applyLifecycleRecordToJob(job: AgentJob, record: JobRecord): void {
   job.updatedAt = record.updatedAt;
   job.startedAt = record.startedAt ?? record.createdAt;
   job.timeoutAt = record.timeoutAt;
-  job.stdoutOffset = record.logCursor.stdoutOffset;
-  job.stderrOffset = record.logCursor.stderrOffset;
   const durableLogs = durableLogsToRuntime(record.observability?.logs);
   job.logs = mergeLogEntries(job.logs, durableLogs);
   job.messageCount = Math.max(job.messageCount ?? 0, record.observability?.messageCount ?? 0);
@@ -1268,13 +1144,13 @@ function loadPersistedJobs(): void {
       const existing = jobs.get(record.id);
       if (existing) {
         applyLifecycleRecordToJob(existing, record);
-        if (existing.status === "running") startTmuxMonitor(existing);
+        if (existing.status === "running") reattachOrAbandonHydratedJob(existing);
         if (existing.cleanupPending) void retryWorktreeCleanup(existing);
         continue;
       }
       const job = runtimeJobFromRecord(record);
       jobs.set(job.id, job);
-      if (job.status === "running") startTmuxMonitor(job);
+      if (job.status === "running") reattachOrAbandonHydratedJob(job);
       if (job.cleanupPending) void retryWorktreeCleanup(job);
     } catch (error) {
       const kind = classifyHydrationFailure(error);
@@ -1284,6 +1160,15 @@ function loadPersistedJobs(): void {
   }
   retryPendingFinishedCallbacks();
   pruneFinishedJobs();
+}
+
+// In-process subagents live in the parent process and cannot be recovered after a
+// reload/restart. A hydrated record that still says "running" but has no live
+// in-process handle means the previous process died mid-flight, so mark it failed
+// rather than pretending it is live. Jobs still live in this process are left alone.
+function reattachOrAbandonHydratedJob(job: AgentJob): void {
+  if (job.inProcessHandle) return;
+  finalizeJob(job, "failed", undefined, undefined, "in-process subagent did not survive the parent Pi session restart");
 }
 
 function classifyHydrationFailure(error: unknown): StoreDiagnosticWarning["kind"] {
@@ -1371,9 +1256,6 @@ function runtimeJobFromRecord(record: JobRecord): AgentJob {
     messageCount: record.observability?.messageCount ?? 0,
     logs: durableLogsToRuntime(record.observability?.logs),
     nextSeq: record.logCursor.nextSeq,
-    stderr: "",
-    stdoutBuffer: "",
-    stderrBuffer: "",
     latestAssistantText: record.observability?.latestAssistantText ?? "",
     pendingAssistantDelta: "",
     lastAssistantDeltaLogAt: 0,
@@ -1382,25 +1264,11 @@ function runtimeJobFromRecord(record: JobRecord): AgentJob {
     usage: { ...record.usage },
     timeoutAt: record.timeoutAt,
     supervisor: record.supervisor,
-    tmuxSession: info.tmuxSession ?? tmuxSessionName(record.id),
-    stdoutPath: normalizeStorePath(info.stdoutPath, jobLogPathForStore(store, record.id, "stdout"), store.root),
-    stderrPath: normalizeStorePath(info.stderrPath, jobLogPathForStore(store, record.id, "stderr"), store.root),
-    exitCodePath: normalizeStorePath(info.exitCodePath, jobExitCodePathForStore(store, record.id), store.root),
-    stdoutOffset: record.logCursor.stdoutOffset,
-    stderrOffset: record.logCursor.stderrOffset,
     cleanupPending: record.cleanupPhase === "pending" || record.cleanupPhase === "running" || record.cleanupPhase === "failed",
     waiters: new Set(),
     closeWaiters: new Set(),
   };
   return job;
-}
-
-function normalizeStorePath(value: unknown, fallback: string, storeRoot = requireStorePaths().root): string {
-  if (typeof value !== "string") return fallback;
-  const resolved = path.resolve(value);
-  const relative = path.relative(storeRoot, resolved);
-  if (relative.startsWith("..") || path.isAbsolute(relative)) return fallback;
-  return resolved;
 }
 
 function scheduleRunningJobTimeouts(): void {
@@ -1414,191 +1282,14 @@ function scheduleJobTimeout(job: AgentJob): void {
   const remaining = job.timeoutAt - Date.now();
   const timeoutReason = `timeout at ${new Date(job.timeoutAt).toISOString()}`;
   if (remaining <= 0) {
-    refreshTmuxJob(job);
     if (job.status === "running") terminateJob(job, timeoutReason, "timeout");
     return;
   }
   job.timeout = setTimeout(() => {
     job.timeout = undefined;
-    refreshTmuxJob(job);
     if (job.status === "running") terminateJob(job, timeoutReason, "timeout");
   }, remaining);
   job.timeout.unref?.();
-}
-
-function startTmuxMonitor(job: AgentJob): void {
-  if (job.supervisor !== "tmux" || job.monitorTimer || job.status !== "running") return;
-  job.monitorTimer = setInterval(() => {
-    refreshTmuxJob(job);
-    refreshSubagentStatus();
-  }, TMUX_STATUS_INTERVAL_MS);
-  job.monitorTimer.unref?.();
-}
-
-function refreshRunningTmuxJobs(): void {
-  const sessions = listTmuxSessions();
-  for (const job of jobs.values()) {
-    if (jobBelongsToCurrentOwner(job)) refreshTmuxJob(job, sessions);
-  }
-}
-
-function refreshTmuxJob(job: AgentJob, knownSessions?: Set<string>): void {
-  if (job.supervisor !== "tmux") return;
-  refreshTmuxJobOutput(job);
-  if (job.status !== "running") return;
-  if (enforceRawLogLimit(job)) return;
-
-  const exitCode = readExitCode(job.exitCodePath);
-  if (exitCode !== undefined) {
-    const inferredStatus = exitCode === 0 && job.stopReason !== "error" && job.stopReason !== "aborted" ? "completed" : "failed";
-    finalizeJob(job, inferredStatus, exitCode, undefined);
-    return;
-  }
-
-  startTmuxMonitor(job);
-  if (!isTmuxAvailable()) {
-    if (!latestLogPreview(job)?.includes("tmux unavailable")) addLog(job, "error", "tmux unavailable; cannot refresh subagent status", "tmux");
-    return;
-  }
-  if (knownSessions ? Boolean(job.tmuxSession && knownSessions.has(job.tmuxSession)) : tmuxSessionExists(job.tmuxSession)) return;
-
-  finalizeJob(job, "failed", undefined, undefined, "tmux session ended before writing exit code");
-}
-
-function refreshTmuxJobOutput(job: AgentJob, options: { drain?: boolean } = {}): void {
-  let readMore = false;
-  let cursorChanged = false;
-  do {
-    readMore = false;
-    if (job.stdoutPath) {
-      const result = readFileFromOffset(job.stdoutPath, job.stdoutOffset);
-      if (result.buffer.length > 0) {
-        readMore = true;
-        job.stdoutDecoder ??= new StringDecoder("utf8");
-        processStdout(job, job.stdoutDecoder.write(result.buffer));
-      }
-      if (result.offset > job.stdoutOffset) {
-        dispatchLifecycleEvent(job, { type: "OutputChunkRead", stream: "stdout", bytes: result.buffer.length, offsetAfter: result.offset });
-        cursorChanged = true;
-      }
-    }
-    if (job.stderrPath) {
-      const result = readFileFromOffset(job.stderrPath, job.stderrOffset);
-      if (result.buffer.length > 0) {
-        readMore = true;
-        job.stderrDecoder ??= new StringDecoder("utf8");
-        processStderr(job, job.stderrDecoder.write(result.buffer));
-      }
-      if (result.offset > job.stderrOffset) {
-        dispatchLifecycleEvent(job, { type: "OutputChunkRead", stream: "stderr", bytes: result.buffer.length, offsetAfter: result.offset });
-        cursorChanged = true;
-      }
-    }
-  } while (options.drain && readMore);
-  if (cursorChanged) persistJob(job);
-}
-
-function rawLogSizes(job: AgentJob): { stdout?: number; stderr?: number; total: number } {
-  const stdout = fileSizeIfExists(job.stdoutPath);
-  const stderr = fileSizeIfExists(job.stderrPath);
-  return { stdout, stderr, total: (stdout ?? 0) + (stderr ?? 0) };
-}
-
-function fileSizeIfExists(filePath: string | undefined): number | undefined {
-  if (!filePath) return undefined;
-  try {
-    return fs.statSync(filePath).size;
-  } catch {
-    return undefined;
-  }
-}
-
-function enforceRawLogLimit(job: AgentJob): boolean {
-  if (MAX_RAW_LOG_BYTES <= 0 || job.status !== "running") return false;
-  const sizes = rawLogSizes(job);
-  const exceeded = [
-    sizes.stdout !== undefined && sizes.stdout > MAX_RAW_LOG_BYTES ? `stdout ${formatSize(sizes.stdout)}` : undefined,
-    sizes.stderr !== undefined && sizes.stderr > MAX_RAW_LOG_BYTES ? `stderr ${formatSize(sizes.stderr)}` : undefined,
-  ].filter(Boolean).join(", ");
-  if (!exceeded) return false;
-
-  const message = `raw subagent log limit exceeded (${exceeded}; limit ${formatSize(MAX_RAW_LOG_BYTES)}). Stopping job to prevent disk growth.`;
-  if (!job.rawLogLimitExceeded) {
-    job.rawLogLimitExceeded = true;
-    job.errorMessage = message;
-    addLog(job, "error", message, "raw_log_limit");
-    terminateJob(job, message, "error");
-  }
-  return true;
-}
-
-function readFileFromOffset(filePath: string, offset: number): { buffer: Buffer; offset: number } {
-  try {
-    const stat = fs.statSync(filePath);
-    const start = Math.min(offset, stat.size);
-    if (stat.size <= start) return { buffer: Buffer.alloc(0), offset: start };
-    const fd = fs.openSync(filePath, "r");
-    try {
-      const length = Math.min(stat.size - start, MAX_LOG_READ_BYTES);
-      const buffer = Buffer.alloc(length);
-      const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, start);
-      return { buffer: buffer.subarray(0, bytesRead), offset: start + bytesRead };
-    } finally {
-      fs.closeSync(fd);
-    }
-  } catch {
-    return { buffer: Buffer.alloc(0), offset };
-  }
-}
-
-function readExitCode(filePath: string | undefined): number | undefined {
-  if (!filePath) return undefined;
-  try {
-    const raw = fs.readFileSync(filePath, "utf-8").trim();
-    if (!raw) return undefined;
-    const code = Number.parseInt(raw, 10);
-    return Number.isFinite(code) ? code : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function processStdout(job: AgentJob, chunk: string): void {
-  job.stdoutBuffer += chunk;
-  if (job.stdoutBuffer.length > MAX_STDOUT_LINE_CHARS) {
-    addLog(job, "error", `stdout JSON line exceeded ${MAX_STDOUT_LINE_CHARS} chars before a newline; dropping oversized line`, "stdout");
-    job.stdoutBuffer = "";
-    return;
-  }
-  const lines = job.stdoutBuffer.split("\n");
-  job.stdoutBuffer = lines.pop() ?? "";
-  for (const line of lines) processJsonLine(job, line);
-}
-
-function processStderr(job: AgentJob, chunk: string): void {
-  job.stderr = appendCappedText(job.stderr, chunk, MAX_STORED_STDERR_CHARS);
-  job.stderrBuffer = (job.stderrBuffer ?? "") + chunk;
-  if (job.stderrBuffer.length > MAX_STDERR_PARTIAL_BUFFER_CHARS) {
-    addLog(job, "error", `stderr partial line exceeded ${MAX_STDERR_PARTIAL_BUFFER_CHARS} chars; dropping buffered partial output`, "stderr");
-    job.stderrBuffer = job.stderrBuffer.slice(-MAX_STDERR_PARTIAL_BUFFER_CHARS / 2);
-  }
-  const lines = job.stderrBuffer.split(/\r?\n/);
-  job.stderrBuffer = lines.pop() ?? "";
-  for (const line of lines) {
-    if (line.trim()) addLog(job, "stderr", line, "stderr");
-  }
-}
-
-function processJsonLine(job: AgentJob, line: string): void {
-  if (!line.trim()) return;
-  let event: any;
-  try {
-    event = JSON.parse(line);
-  } catch {
-    addLog(job, "stdout", line, "stdout");
-    return;
-  }
-  processEvent(job, event);
 }
 
 function processEvent(job: AgentJob, event: any): void {
@@ -1865,34 +1556,14 @@ async function stopRunningJobsForOwner(ownerId: string | undefined, reason: stri
 
 async function stopAgentJob(job: AgentJob, reason: string, waitMs: number): Promise<boolean> {
   if (job.status !== "running") return true;
-  if (job.supervisor !== "tmux" || !job.tmuxSession) return terminateJob(job, reason, "stop");
-
-  dispatchLifecycleEvent(job, { type: "StopRequested", reason });
-  addLog(job, "error", `interrupting tmux job with Ctrl-C: ${reason}`, "terminate");
-  refreshTmuxJob(job);
-  if (job.status !== "running") return true;
-
-  const interruptResult = runTmuxSync(["send-keys", "-t", job.tmuxSession, "C-c"]);
-  if (!interruptResult.ok) {
-    addLog(job, "error", `tmux Ctrl-C failed; falling back to kill-session: ${truncateOneLine(interruptResult.error, 300)}`, "terminate");
-  } else if (waitMs > 0) {
+  terminateJob(job, reason, "stop");
+  if (waitMs > 0) {
     const deadline = Date.now() + waitMs;
     while (Date.now() < deadline && job.status === "running") {
-      await sleep(Math.min(250, Math.max(0, deadline - Date.now())));
-      refreshTmuxJob(job);
+      await sleep(Math.min(100, Math.max(0, deadline - Date.now())));
     }
   }
-
-  refreshTmuxJobOutput(job, { drain: true });
-  const exitCode = readExitCode(job.exitCodePath);
-  if (exitCode !== undefined) {
-    finalizeJob(job, "cancelled", exitCode, undefined, reason);
-    return true;
-  }
-  if (job.status !== "running") return true;
-
-  addLog(job, "error", `Ctrl-C grace period elapsed; hard-killing tmux session ${job.tmuxSession}`, "terminate");
-  return killTmuxJobSession(job, reason, "stop");
+  return job.status !== "running";
 }
 
 function terminateJob(job: AgentJob, reason: string, intent: "stop" | "timeout" | "error" = "stop"): boolean {
@@ -1907,74 +1578,16 @@ function terminateJob(job: AgentJob, reason: string, intent: "stop" | "timeout" 
   );
   addLog(job, "error", `terminating: ${reason}`, "terminate");
 
-  if (job.supervisor === "tmux" && job.tmuxSession) {
-    refreshTmuxJob(job);
-    if (job.status !== "running") return true;
-    return killTmuxJobSession(job, reason, intent);
-  }
-
   job.errorMessage = reason;
   if (job.timeout) clearTimeout(job.timeout);
-  if (job.monitorTimer) clearInterval(job.monitorTimer);
-  if (job.proc && !job.proc.killed) {
-    signalJob(job, "SIGTERM");
-    job.killTimer = setTimeout(() => {
-      if (!job.finishedAt) signalJob(job, "SIGKILL");
-    }, 5_000);
-    return true;
+  // session.abort() resolves the in-flight prompt; finalizeInProcessJob runs on the
+  // resulting onDone(aborted) callback. Finalize directly if the session never started.
+  if (job.inProcessHandle) {
+    job.inProcessHandle.abort();
+  } else {
+    finalizeJob(job, intent === "stop" ? "cancelled" : "failed", undefined, undefined, reason);
   }
-  finalizeJob(job, intent === "stop" ? "cancelled" : "failed", undefined, undefined, reason);
   return true;
-}
-
-function killTmuxJobSession(job: AgentJob, reason: string, intent: "stop" | "timeout" | "error"): boolean {
-  if (!job.tmuxSession) return false;
-  const killResult = runTmuxSync(["kill-session", "-t", job.tmuxSession]);
-  const killError = killResult.ok ? undefined : killResult.error;
-
-  refreshTmuxJobOutput(job, { drain: true });
-  const exitCode = readExitCode(job.exitCodePath);
-  if (exitCode !== undefined) {
-    const inferredStatus = intent === "stop"
-      ? "cancelled"
-      : exitCode === 0 && job.stopReason !== "error" && job.stopReason !== "aborted" ? "completed" : "failed";
-    finalizeJob(job, inferredStatus, exitCode, undefined, reason);
-    return true;
-  }
-
-  const tmuxAvailable = isTmuxAvailable();
-  if (tmuxAvailable && tmuxSessionExists(job.tmuxSession)) {
-    addLog(job, "error", `tmux kill-session failed; job is still running${killError ? `: ${truncateOneLine(killError, 300)}` : ""}`, "terminate");
-    return false;
-  }
-
-  if (killError && !tmuxAvailable) {
-    addLog(job, "error", `tmux unavailable while stopping job: ${truncateOneLine(killError, 300)}`, "terminate");
-    return false;
-  }
-
-  if (killError) {
-    addLog(job, "error", `tmux kill-session failed but session is gone without final state: ${truncateOneLine(killError, 300)}`, "terminate");
-    return false;
-  }
-
-  if (job.timeout) clearTimeout(job.timeout);
-  if (job.monitorTimer) clearInterval(job.monitorTimer);
-  finalizeJob(job, intent === "stop" ? "cancelled" : "failed", undefined, undefined, reason);
-  return true;
-}
-
-function signalJob(job: AgentJob, signal: NodeJS.Signals): void {
-  if (!job.proc || !job.pid) return;
-  try {
-    process.kill(-job.pid, signal);
-  } catch {
-    try {
-      job.proc.kill(signal);
-    } catch {
-      // ignore
-    }
-  }
 }
 
 function buildSubagentResult(job: AgentJob): SubagentResult {
@@ -2022,16 +1635,6 @@ function finalizeJob(
   if (job.finishedAt) return;
   flushAssistantDelta(job);
   if (job.timeout) clearTimeout(job.timeout);
-  if (job.killTimer) clearTimeout(job.killTimer);
-  if (job.monitorTimer) clearInterval(job.monitorTimer);
-  refreshTmuxJobOutput(job, { drain: true });
-  if (job.stdoutDecoder) processStdout(job, job.stdoutDecoder.end());
-  if (job.stderrDecoder) processStderr(job, job.stderrDecoder.end());
-  if (job.stdoutBuffer.trim()) processJsonLine(job, job.stdoutBuffer);
-  job.stdoutBuffer = "";
-  if (job.stderrBuffer?.trim()) addLog(job, "stderr", job.stderrBuffer, "stderr");
-  job.stderrBuffer = "";
-  cleanupTempPrompt(job);
 
   if (!job.finalOutput && job.latestAssistantText) job.finalOutput = job.latestAssistantText;
   const finishedAt = Date.now();
@@ -2062,7 +1665,6 @@ function finalizeJob(
     job.finishedAt = finishedAt;
   }
   if (errorMessage) job.errorMessage = errorMessage;
-  if (job.status === "failed" && !job.errorMessage && job.stderr.trim()) job.errorMessage = job.stderr.trim();
   job.result = buildSubagentResult(job);
   if (!job.finalOutput && job.result.output) job.finalOutput = job.result.output;
   cleanupWorktree(job, job.status);
@@ -2305,27 +1907,6 @@ function notifyCloseWaiters(job: AgentJob): void {
   const waiters = [...job.closeWaiters];
   job.closeWaiters.clear();
   for (const wake of waiters) wake();
-}
-
-function cleanupTempPrompt(job: AgentJob): void {
-  cleanupPromptFiles(job.tmpPromptPath, job.tmpPromptDir);
-}
-
-function cleanupPromptFiles(tmpPromptPath: string | undefined, tmpPromptDir: string | undefined): void {
-  if (tmpPromptPath) {
-    try {
-      fs.unlinkSync(tmpPromptPath);
-    } catch {
-      // ignore
-    }
-  }
-  if (tmpPromptDir) {
-    try {
-      fs.rmdirSync(tmpPromptDir);
-    } catch {
-      // ignore
-    }
-  }
 }
 
 async function prepareWorktreeForSpawn(
@@ -2860,29 +2441,6 @@ function shouldRetainWorktree(worktree: WorktreeInfo, status: JobStatus): boolea
   return false;
 }
 
-async function writePromptToTempFile(jobId: string, prompt: string): Promise<{ dir: string; filePath: string }> {
-  const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-bg-agent-"));
-  const safeName = jobId.replace(/[^\w.-]+/g, "_");
-  const filePath = path.join(tmpDir, `system-${safeName}.md`);
-  await withFileMutationQueue(filePath, async () => {
-    await fs.promises.writeFile(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
-  });
-  return { dir: tmpDir, filePath };
-}
-
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
-  const currentScript = process.argv[1];
-  const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
-  if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
-    return { command: process.execPath, args: [currentScript, ...args] };
-  }
-
-  const execName = path.basename(process.execPath).toLowerCase();
-  const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
-  if (!isGenericRuntime) return { command: process.execPath, args };
-  return { command: "pi", args };
-}
-
 function getLogsSince(job: AgentJob, sinceSeq: number, maxLogEntries: number): AgentLogEntry[] {
   return buildLogsSince(job.logs, sinceSeq, maxLogEntries);
 }
@@ -2895,7 +2453,7 @@ function pollFormatOptions(job: AgentJob): PollFormatOptions {
   return {
     suggestedPollIntervalMs: SUGGESTED_POLL_INTERVAL_MS,
     rawLogLimitBytes: MAX_RAW_LOG_BYTES,
-    rawLogSizes: rawLogSizes(job),
+    rawLogSizes: { total: 0 },
   };
 }
 
@@ -2909,12 +2467,6 @@ function formatCompactPollResult(job: AgentJob, sinceSeq: number, nextSeq: numbe
 
 function formatPollResult(job: AgentJob, logs: AgentLogEntry[], nextSeq: number, includeFullOutput: boolean, logWindow: LogWindow<AgentLogEntry>): string {
   return renderPollResult(job, logs, nextSeq, includeFullOutput, logWindow, pollFormatOptions(job));
-}
-
-function appendCappedText(current: string, chunk: string, maxChars: number): string {
-  const next = current + chunk;
-  if (next.length <= maxChars) return next;
-  return next.slice(next.length - maxChars);
 }
 
 function pruneFinishedJobs(): void {
@@ -2980,8 +2532,6 @@ export const __subagentsTest = {
   clearJobs() {
     for (const job of jobs.values()) {
       if (job.timeout) clearTimeout(job.timeout);
-      if (job.killTimer) clearTimeout(job.killTimer);
-      if (job.monitorTimer) clearInterval(job.monitorTimer);
     }
     jobs.clear();
     storeWarnings.length = 0;
@@ -2989,8 +2539,10 @@ export const __subagentsTest = {
     clearCallbackFlushTimer();
     clearStatusRefreshTimer();
   },
-  resetTmuxAvailabilityCache,
-  isSubagentChildProcess,
+  setInProcessLauncher(launcher: typeof startInProcessAgent | undefined) {
+    inProcessLauncher = launcher ?? startInProcessAgent;
+  },
+  finalizeInProcessJob,
   refreshSubagentStatus,
   loadPersistedJobs,
   recentStoreWarnings,

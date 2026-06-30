@@ -243,6 +243,19 @@ export function emptyUsageStats(): UsageStats {
   };
 }
 
+export function addUsage(into: UsageStats, more: UsageStats): UsageStats {
+  return {
+    input: into.input + more.input,
+    output: into.output + more.output,
+    cacheRead: into.cacheRead + more.cacheRead,
+    cacheWrite: into.cacheWrite + more.cacheWrite,
+    cost: into.cost + more.cost,
+    // contextTokens is a point-in-time window size, not additive: keep the max.
+    contextTokens: Math.max(into.contextTokens, more.contextTokens),
+    turns: into.turns + more.turns,
+  };
+}
+
 export function initialLogCursor(): LogCursor {
   return { stdoutOffset: 0, stderrOffset: 0, nextSeq: 1 };
 }

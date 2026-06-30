@@ -181,18 +181,12 @@ test("live AgentJob lifecycle dispatch maps timeout to failed after drain", () =
   assert.equal(job.finishedAt, 2_200);
 });
 
-test("live AgentJob lifecycle dispatch owns output/log cursors", () => {
+test("live AgentJob lifecycle dispatch owns the log sequence cursor", () => {
   const job = makeLegacyJob({ phase: "running" });
 
-  __subagentsTest.dispatchLifecycleEvent(job, { type: "OutputChunkRead", stream: "stdout", bytes: 5, offsetAfter: 5 }, 2_000);
   __subagentsTest.dispatchLifecycleEvent(job, { type: "LogEntriesAppended", firstSeq: 1, count: 1 }, 2_100);
 
-  assert.equal(job.stdoutOffset, 5);
   assert.equal(job.nextSeq, 2);
-  assert.throws(
-    () => __subagentsTest.dispatchLifecycleEvent(job, { type: "OutputChunkRead", stream: "stdout", bytes: 1, offsetAfter: 4 }, 2_200),
-    /stdoutOffset cannot move backwards/,
-  );
 });
 
 test("applying a stale persisted record keeps runtime log cursor contiguous", () => {

@@ -1,0 +1,23 @@
+{
+  "name": "pi-extension-workflows",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "clean": "echo 'nothing to clean'",
+    "build": "tsc --noEmit",
+    "check": "tsc --noEmit",
+    "test": "tsx --test \"test/**/*.test.ts\""
+  },
+  "pi": { "extensions": ["./index.ts"] },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.2",
+    "typebox": "^1.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.1",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
+  },
+  "engines": { "node": ">=22.19.0" }
+}

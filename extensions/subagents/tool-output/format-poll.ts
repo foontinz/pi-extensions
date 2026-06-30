@@ -32,11 +32,7 @@ export interface PollJobView<TLog extends PollLogEntryView = PollLogEntryView> {
     keepWorktree?: string;
     retained?: boolean;
   };
-  pid?: number;
   supervisor: string;
-  tmuxSession?: string;
-  stdoutPath?: string;
-  stderrPath?: string;
   rawLogLimitExceeded?: boolean;
   status: "running" | "completed" | "failed" | "cancelled";
   phase?: string;
@@ -87,11 +83,7 @@ export interface PollJobSummary {
     keepWorktree?: string;
     retained?: boolean;
   };
-  pid?: number;
   supervisor: string;
-  tmuxSession?: string;
-  stdoutPath?: string;
-  stderrPath?: string;
   rawLogBytes: { stdout?: number; stderr?: number; total: number };
   rawLogLimitBytes: number;
   rawLogLimitExceeded?: boolean;
@@ -139,11 +131,7 @@ export function summarizeJob<TLog extends PollLogEntryView>(job: PollJobView<TLo
           retained: job.worktree.retained,
         }
       : undefined,
-    pid: job.pid,
     supervisor: job.supervisor,
-    tmuxSession: job.tmuxSession,
-    stdoutPath: job.stdoutPath,
-    stderrPath: job.stderrPath,
     rawLogBytes: options.rawLogSizes,
     rawLogLimitBytes: options.rawLogLimitBytes,
     rawLogLimitExceeded: job.rawLogLimitExceeded,
