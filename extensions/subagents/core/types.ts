@@ -1,4 +1,6 @@
-export const JOB_RECORD_SCHEMA_VERSION = 2 as const;
+export const JOB_RECORD_SCHEMA_VERSION = 3 as const;
+/** Older durable schema versions that `hydrateJobRecord` can migrate forward from. */
+export const MIGRATABLE_JOB_RECORD_SCHEMA_VERSIONS = [2] as const;
 
 export type JobId = string;
 
@@ -21,7 +23,9 @@ export type TerminalJobPhase = typeof TERMINAL_JOB_PHASE_VALUES[number];
 export const CLEANUP_PHASE_VALUES = ["none", "pending", "running", "complete", "retained", "failed"] as const;
 export type CleanupPhase = typeof CLEANUP_PHASE_VALUES[number];
 
-export const SUPERVISOR_KIND_VALUES = ["process", "tmux"] as const;
+// In-process is the only supervisor. The legacy "tmux" kind is migrated to
+// "process" on hydration (see hydration.ts).
+export const SUPERVISOR_KIND_VALUES = ["process"] as const;
 export type SupervisorKind = typeof SUPERVISOR_KIND_VALUES[number];
 
 export const TERMINAL_REASON_VALUES = ["natural-exit", "stop", "timeout", "prepare-failed", "supervisor-failed", "error"] as const;
@@ -98,13 +102,8 @@ export interface DurableWorktreeInfo {
 
 export interface DurableSupervisorInfo {
   kind?: SupervisorKind;
-  pid?: number;
   command?: string;
   args?: string[];
-  tmuxSession?: string;
-  stdoutPath?: string;
-  stderrPath?: string;
-  exitCodePath?: string;
 }
 
 export const DURABLE_LOG_LEVEL_VALUES = ["info", "assistant", "tool", "stdout", "stderr", "error"] as const;

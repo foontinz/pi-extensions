@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import test from "node:test";
 import { emptyUsageStats, type SubagentResult, type TerminalReason } from "../../subagents/core/types.js";
 import { WorkflowRunner } from "../index.js";
@@ -77,9 +81,52 @@ test("agent forwards resolved cwd and tools to executor", async () => {
   assert.deepEqual(Array.from(seen[1].tools!), ["read", "bash"]);
 });
 
+test("isolate runs the agent in a dedicated worktree and tears it down", async () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "wf-isolate-"));
+  try {
+    execFileSync("git", ["-C", repo, "init", "-q"]);
+    execFileSync("git", ["-C", repo, "config", "user.email", "t@t.t"]);
+    execFileSync("git", ["-C", repo, "config", "user.name", "t"]);
+    fs.writeFileSync(path.join(repo, "f.txt"), "hi");
+    execFileSync("git", ["-C", repo, "add", "."]);
+    execFileSync("git", ["-C", repo, "commit", "-qm", "init"]);
+    const realRepo = fs.realpathSync(repo);
+
+    let seenCwd = "";
+    const controller = new AbortController();
+    const runner = new WorkflowRunner(realRepo, undefined, controller.signal, () => {}, async (o) => {
+      seenCwd = o.cwd;
+      assert.ok(fs.existsSync(o.cwd), "worktree cwd should exist while the agent runs");
+      return { output: "done", usage: emptyUsageStats() };
+    });
+    const result = await runner.run(`return await agent("a", { isolate: true });`);
+    assert.equal(result, "done");
+    assert.notEqual(seenCwd, realRepo);
+    assert.ok(!fs.existsSync(seenCwd), "worktree should be removed after the agent finishes");
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 test("aborted workflow stops launching agents", async () => {
   const controller = new AbortController();
   controller.abort();
   const runner = new WorkflowRunner("/base", undefined, controller.signal, () => {}, async () => ok("x"));
   await assert.rejects(runner.run(`return await agent("a");`), /aborted/);
+});
+
+test("mid-flight abort surfaces as a rejection (not silent nulls)", async () => {
+  const controller = new AbortController();
+  // Executor resolves only after the workflow signal aborts, mimicking an
+  // in-flight subagent that gets cancelled (executor returns a stop error).
+  const runner = new WorkflowRunner("/base", undefined, controller.signal, () => {}, async (o) => {
+    await new Promise<void>((resolve) => {
+      if (o.signal?.aborted) return resolve();
+      o.signal?.addEventListener("abort", () => resolve(), { once: true });
+    });
+    return fail("aborted", "stop");
+  });
+  const p = runner.run(`return await parallel([1,2,3], (n) => agent("t"+n));`);
+  setTimeout(() => controller.abort(new Error("timed out")), 20);
+  await assert.rejects(p, /aborted/);
 });

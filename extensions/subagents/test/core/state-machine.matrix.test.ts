@@ -16,18 +16,18 @@ test("normal start path is explicit", () => {
   assert.equal(starting.next.cwd, "/tmp/wt");
   assert.equal(starting.next.worktree?.root, "/tmp/worktree");
 
-  const running = reduceJobEvent(starting.next, { type: "SupervisorStarted", handle: { kind: "tmux", tmuxSession: "s" } }, { now: 1_300 });
+  const running = reduceJobEvent(starting.next, { type: "SupervisorStarted", handle: { kind: "process", command: "<in-process>", args: [] } }, { now: 1_300 });
   assert.equal(running.next.phase, "running");
   assert.equal(running.next.startedAt, 1_300);
-  assert.equal(running.next.supervisorInfo?.tmuxSession, "s");
+  assert.equal(running.next.supervisorInfo?.command, "<in-process>");
   assert.deepEqual(running.effects, []);
 });
 
 test("out-of-order startup events are explicit no-ops", () => {
   const created = makeRecord();
   assert.equal(reduceJobEvent(created, { type: "PrepareSucceeded", cwd: "/tmp" }, { now: 1_100 }).changed, false);
-  assert.equal(reduceJobEvent(created, { type: "SupervisorStarted", handle: { kind: "tmux" } }, { now: 1_200 }).changed, false);
-  assert.equal(reduceJobEvent(makeRecord({ phase: "preparing" }), { type: "SupervisorStarted", handle: { kind: "tmux" } }, { now: 1_300 }).changed, false);
+  assert.equal(reduceJobEvent(created, { type: "SupervisorStarted", handle: { kind: "process" } }, { now: 1_200 }).changed, false);
+  assert.equal(reduceJobEvent(makeRecord({ phase: "preparing" }), { type: "SupervisorStarted", handle: { kind: "process" } }, { now: 1_300 }).changed, false);
 });
 
 test("prepare failure terminalizes directly because no child needs draining", () => {

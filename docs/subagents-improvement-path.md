@@ -81,10 +81,23 @@ in-process equivalents using an injectable launcher seam.
   session-shutdown abort), injectable executor + unit tests. Spikes A/B/E validated
   live (concurrent in-process sessions, re-entrancy from the tool's `call()`, shared
   auth/model under concurrency).
-- **Not yet (intentionally deferred):** per-agent git **worktree** isolation (agents
-  share the workflow cwd; lightweight `agent` `cwd` knob provided); shared **MCP**
-  gateway proxy (P3.3); **resume**/journal (v2); VM **sandboxing** (dropped per
-  decision).
+- **Also done:** per-agent git **worktree** isolation for in-process agents —
+  worktree create/cleanup extracted to the standalone, lifecycle-free
+  `subagents/workspace/create-worktree.ts` (`prepareWorktree`/`createWorktree` +
+  shared creation-slot semaphore); `run_agent` uses `prepareWorktree`, and
+  `WorkflowRunner` exposes `agent({ isolate: true })` (dedicated worktree per agent,
+  auto-disposed).
+- **Also done (P3.3 shared MCP):** child sessions get an opt-in `mcp` gateway tool
+  (`run_agent({ mcp: true })` / `agent({ mcp: true })`) backed by a process-wide MCP
+  connection pool (`subagents/mcp/`): each configured server is connected once per
+  process and reused across agents (stdio + HTTP/bearer; disposed on shutdown), so
+  fan-out never reconnects an adapter per child.
+- **Also done (v1 §16 polish):** durable `JobRecord` schema slimmed to v3 (tmux
+  `SupervisorKind` + supervisor-info fields removed, v2→v3 hydration migration);
+  `rawLog*` poll reporting removed; skipped `poll_agent` tests deleted; added
+  `resolveModelPattern` / bare-loader / migration / MCP-gateway tests.
+- **Not yet (intentionally deferred):** **resume**/journal (v2); VM **sandboxing**
+  (dropped per decision).
 
 ### v1 build scope (derived from the decisions)
 - **`subagents` ext:** in-process spawn-and-await primitive (`createAgentSession`

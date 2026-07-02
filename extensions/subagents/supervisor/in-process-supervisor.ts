@@ -14,13 +14,18 @@ import {
   type AgentSessionEvent,
   SessionManager,
   SettingsManager,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { getSharedMcpGateway } from "../mcp/gateway.js";
+import { createMcpProxyTool } from "../mcp/proxy-tool.js";
 import { createBareResourceLoader, getSharedHandles, resolveModelPattern } from "../core/in-process-runner.js";
 
 export interface InProcessStartOptions {
   cwd: string;
   task: string;
   tools: string[];
+  /** Inject the shared `mcp` gateway tool (forwards to the process-wide MCP pool). */
+  mcp?: boolean;
   model?: string;
   thinking?: string;
   /**
@@ -58,6 +63,12 @@ export function startInProcessAgent(options: InProcessStartOptions): InProcessHa
 
   void (async () => {
     try {
+      const customTools: ToolDefinition[] = [];
+      let toolAllowlist = options.tools.length > 0 ? [...options.tools] : undefined;
+      if (options.mcp) {
+        customTools.push(createMcpProxyTool(getSharedMcpGateway(options.cwd, getAgentDir())) as ToolDefinition);
+        if (toolAllowlist && !toolAllowlist.includes("mcp")) toolAllowlist = [...toolAllowlist, "mcp"];
+      }
       const created = await createAgentSession({
         cwd: options.cwd,
         agentDir: getAgentDir(),
@@ -66,8 +77,9 @@ export function startInProcessAgent(options: InProcessStartOptions): InProcessHa
         model: model as never,
         thinkingLevel: options.thinking as never,
         resourceLoader: createBareResourceLoader(undefined, options.appendSystemPrompt ? [options.appendSystemPrompt] : []),
-        tools: options.tools.length > 0 ? [...options.tools] : undefined,
-        noTools: options.tools.length === 0 ? "all" : undefined,
+        tools: toolAllowlist,
+        noTools: toolAllowlist && toolAllowlist.length === 0 ? "all" : undefined,
+        customTools: customTools.length > 0 ? customTools : undefined,
         sessionManager: SessionManager.inMemory(options.cwd),
         settingsManager: SettingsManager.create(options.cwd, getAgentDir()),
       });

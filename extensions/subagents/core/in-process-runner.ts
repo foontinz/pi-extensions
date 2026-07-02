@@ -8,8 +8,11 @@ import {
   type ResourceLoader,
   SessionManager,
   SettingsManager,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 
+import { getSharedMcpGateway } from "../mcp/gateway.js";
+import { createMcpProxyTool } from "../mcp/proxy-tool.js";
 import { emptyUsageStats, type SubagentResult, type TerminalReason, type UsageStats } from "./types.js";
 
 // Shared, process-wide handles so fanned-out agents don't each rebuild auth/model
@@ -52,6 +55,11 @@ export interface InProcessSubagentOptions {
   systemPrompt?: string;
   appendSystemPrompt?: readonly string[];
   timeoutMs?: number;
+  /**
+   * Give the agent a shared `mcp` gateway tool that forwards to the process-wide
+   * MCP connection pool (servers connected once, reused across agents).
+   */
+  mcp?: boolean;
   /** External abort (e.g. the workflow signal). Triggers session.abort(). */
   signal?: AbortSignal;
 }
@@ -78,14 +86,24 @@ export async function runSubagentInProcess(options: InProcessSubagentOptions): P
   const { authStorage, modelRegistry } = getSharedHandles();
   const sessionManager = SessionManager.inMemory(options.cwd);
 
+  const customTools: ToolDefinition[] = [];
+  let toolAllowlist = options.tools ? [...options.tools] : undefined;
+  if (options.mcp) {
+    const gateway = getSharedMcpGateway(options.cwd, getAgentDir());
+    customTools.push(createMcpProxyTool(gateway) as ToolDefinition);
+    // The allowlist (when present) gates custom tools too, so make sure `mcp` is in it.
+    if (toolAllowlist && !toolAllowlist.includes("mcp")) toolAllowlist = [...toolAllowlist, "mcp"];
+  }
+
   const { session } = await createAgentSession({
     cwd: options.cwd,
     agentDir: getAgentDir(),
     authStorage,
     modelRegistry,
     resourceLoader: createBareResourceLoader(options.systemPrompt, options.appendSystemPrompt),
-    tools: options.tools ? [...options.tools] : undefined,
-    noTools: options.tools && options.tools.length === 0 ? "all" : undefined,
+    tools: toolAllowlist,
+    noTools: toolAllowlist && toolAllowlist.length === 0 ? "all" : undefined,
+    customTools: customTools.length > 0 ? customTools : undefined,
     sessionManager,
     settingsManager: SettingsManager.create(options.cwd, getAgentDir()),
   });

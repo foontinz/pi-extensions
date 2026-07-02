@@ -27,7 +27,7 @@ export function makeRecord(overrides: Partial<JobRecord> = {}): JobRecord {
     cwd: "/repo",
     phase: "created",
     cleanupPhase: "none",
-    supervisor: "tmux",
+    supervisor: "process",
     createdAt: 1_000,
     updatedAt: 1_000,
     logCursor: initialLogCursor(),

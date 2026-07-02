@@ -212,82 +212,6 @@ test("list_agents has no args and does not list project markdown agents", async 
   assert.equal(result.details.agents.some((agent: any) => agent.source !== "user"), false);
 });
 
-test.skip("poll_agent list mode characterizes empty and populated output", async () => {
-  const empty = await tools.get("poll_agent")!.execute("call", {}, new AbortController().signal, () => {}, ctx);
-  assert.equal(textOf(empty), "No background agent jobs are known in this Pi session.");
-  assert.deepEqual(empty.details.jobs, []);
-
-  __subagentsTest.putJob(makeJob({ id: "agent_contract_list", label: "listed" }));
-  const populated = await tools.get("poll_agent")!.execute("call", {}, new AbortController().signal, () => {}, ctx);
-  assert.match(textOf(populated), /^agent_contract_list \[running\] adhoc age=/);
-  assert.match(textOf(populated), /label=listed/);
-  assert.equal(populated.details.jobs[0].id, "agent_contract_list");
-  assert.equal(populated.details.jobs[0].status, "running");
-});
-
-test.skip("poll_agent unknown id returns known ids and summary details", async () => {
-  __subagentsTest.putJob(makeJob({ id: "agent_known" }));
-  const result = await tools.get("poll_agent")!.execute("call", { id: "agent_missing" }, new AbortController().signal, () => {}, ctx);
-  assert.equal(textOf(result), "Unknown agent job id: agent_missing. Known ids: agent_known");
-  assert.equal(result.details.id, "agent_missing");
-  assert.deepEqual(result.details.jobs.map((job: any) => job.id), ["agent_known"]);
-});
-
-test.skip("poll_agent summary/logs/full modes expose cursor metadata and final-output preview", async () => {
-  __subagentsTest.putJob(makeJob({
-    id: "agent_modes",
-    status: "completed",
-    phase: "completed",
-    logs: [
-      { seq: 3, timestamp: 1_700_000_000_100, level: "info", text: "started" },
-      { seq: 4, timestamp: 1_700_000_000_200, level: "assistant", text: "assistant: done" },
-    ],
-    nextSeq: 5,
-    finalOutput: "final answer\nwith details",
-  }));
-
-  const summary = await tools.get("poll_agent")!.execute("call", { id: "agent_modes", sinceSeq: 0 }, new AbortController().signal, () => {}, ctx);
-  assert.match(textOf(summary), /agent_modes \[completed\]/);
-  assert.match(textOf(summary), /nextSeq: 4; newEvents: 2; logWindow: 3-4/);
-  assert.match(textOf(summary), /warning: sinceSeq 0 predates retained logs/);
-  assert.match(textOf(summary), /result: final answer/);
-  assert.equal(summary.details.nextSeq, 4);
-  assert.equal(summary.details.logWindowStartSeq, 3);
-  assert.equal(summary.details.logWindowEndSeq, 4);
-  assert.equal(summary.details.logsTruncated, false);
-  assert.equal(summary.details.cursorExpired, true);
-  assert.equal(summary.details.logs, undefined);
-
-  const logs = await tools.get("poll_agent")!.execute("call", { id: "agent_modes", sinceSeq: 2, verbosity: "logs", maxLogEntries: 1 }, new AbortController().signal, () => {}, ctx);
-  assert.match(textOf(logs), /nextSeq: 3 \(more logs available; poll again with this sinceSeq\); logWindow: 3-4/);
-  assert.match(textOf(logs), /\s+3 \d\d:\d\d:\d\d info\s+started/);
-  assert.equal(logs.details.logs.length, 1);
-  assert.equal(logs.details.nextSeq, 3);
-  assert.equal(logs.details.logsTruncated, true);
-  assert.equal(logs.details.hasMoreLogs, true);
-  assert.equal(logs.details.finalOutput, "final answer / with details");
-
-  const full = await tools.get("poll_agent")!.execute("call", { id: "agent_modes", verbosity: "full" }, new AbortController().signal, () => {}, ctx);
-  assert.match(textOf(full), /Final output:\nfinal answer\nwith details/);
-  assert.equal(full.details.finalOutput, "final answer\nwith details");
-});
-
-test.skip("poll_agent waitMs long-poll returns after a running job update", async () => {
-  const job = makeJob({ id: "agent_wait", nextSeq: 1 });
-  __subagentsTest.putJob(job);
-  const started = Date.now();
-  const pending = tools.get("poll_agent")!.execute("call", { id: "agent_wait", sinceSeq: 0, verbosity: "logs", waitMs: 5_000 }, new AbortController().signal, () => {}, ctx);
-  setTimeout(() => {
-    job.logs.push({ seq: 1, timestamp: Date.now(), level: "info", text: "arrived" });
-    job.nextSeq = 2;
-    for (const waiter of job.waiters) waiter();
-  }, 25);
-  const result = await pending;
-  assert.ok(Date.now() - started < 1_000);
-  assert.match(textOf(result), /\s+1 \d\d:\d\d:\d\d info\s+arrived/);
-  assert.equal(result.details.nextSeq, 1);
-});
-
 test("stop_agent characterizes unknown, terminal, and repeated-stop responses", async () => {
   const unknown = await tools.get("stop_agent")!.execute("call", { id: "agent_nope" }, new AbortController().signal, () => {}, ctx);
   assert.equal(textOf(unknown), "Unknown agent job id: agent_nope. Known ids: none");
@@ -481,7 +405,7 @@ test("run_agent worktree:true refusal at public layer is characterized", async (
   const result = await tools.get("run_agent")!.execute("call", { task: "must isolate", label: "must isolate", cwd, worktree: true, timeoutMs: 0 }, new AbortController().signal, () => {}, ctx);
   assert.match(textOf(result), /^Failed to start background agent agent_/);
   assert.match(textOf(result), /Status: failed/);
-  assert.match(textOf(result), /Error: run_agent worktree:true requires cwd to be inside a git repository\./);
+  assert.match(textOf(result), /Error: worktree:true requires cwd to be inside a git repository\./);
   assert.equal(result.details.status, "failed");
   assert.equal(result.details.phase, "failed");
   assert.match(result.details.errorMessage, /worktree:true requires cwd/);
@@ -508,46 +432,6 @@ test("tool renderCall/renderResult output is characterized", async () => {
   }
 });
 
-
-test.skip("poll_agent surfaces and quarantines corrupt and unsupported persisted records", async () => {
-  const jobsDir = path.dirname(__subagentsTest.callbackMarkerPath("agent_callback"));
-  fs.mkdirSync(jobsDir, { recursive: true });
-  const corruptPath = path.join(jobsDir, "agent_bad_corrupt.json");
-  const unsupportedPath = path.join(jobsDir, "agent_future_schema.json");
-  const callbackPath = path.join(jobsDir, "agent_callback.callback.json");
-  fs.writeFileSync(corruptPath, "{not json", "utf-8");
-  fs.writeFileSync(unsupportedPath, JSON.stringify({ schemaVersion: 999, id: "agent_future_schema" }), "utf-8");
-  fs.writeFileSync(callbackPath, JSON.stringify({ delivered: false }), "utf-8");
-
-  const result = await tools.get("poll_agent")!.execute("call", {}, new AbortController().signal, () => {}, ctx);
-  assert.match(textOf(result), /No background agent jobs are known/);
-  assert.match(textOf(result), /Store warnings:/);
-  assert.match(textOf(result), /corrupt: .*agent_bad_corrupt\.json: failed to parse job record JSON/);
-  assert.match(textOf(result), /unsupported: .*agent_future_schema\.json: unsupported job record schemaVersion 999/);
-  assert.equal(result.details.jobs.length, 0);
-  assert.equal(result.details.warnings.length, 2);
-  assert.deepEqual(result.details.warnings.map((warning: any) => warning.kind).sort(), ["corrupt", "unsupported"]);
-  assert.equal(fs.existsSync(corruptPath), false);
-  assert.equal(fs.existsSync(unsupportedPath), false);
-  assert.ok(fs.readdirSync(jobsDir).some((name) => /^agent_bad_corrupt\.json\.corrupt\./.test(name)));
-  assert.ok(fs.readdirSync(jobsDir).some((name) => /^agent_future_schema\.json\.unsupported\./.test(name)));
-  assert.equal(fs.existsSync(callbackPath), true);
-});
-
-test.skip("poll_agent surfaces job-specific persisted-record warnings", async () => {
-  const jobsDir = path.dirname(__subagentsTest.callbackMarkerPath("agent_specific"));
-  fs.mkdirSync(jobsDir, { recursive: true });
-  const badPath = path.join(jobsDir, "agent_specific.json");
-  fs.writeFileSync(badPath, "{bad", "utf-8");
-
-  const result = await tools.get("poll_agent")!.execute("call", { id: "agent_specific" }, new AbortController().signal, () => {}, ctx);
-  assert.match(textOf(result), /Unknown agent job id: agent_specific/);
-  assert.match(textOf(result), /Store warnings:/);
-  assert.match(textOf(result), /agent_specific\.json/);
-  assert.equal(result.details.id, "agent_specific");
-  assert.equal(result.details.warnings.length, 1);
-  assert.equal(result.details.warnings[0].kind, "corrupt");
-});
 
 test("session boundary stops running in-process jobs", async () => {
   const fake = installFakeLauncher();

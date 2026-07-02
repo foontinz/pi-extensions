@@ -35,3 +35,6 @@ npm/
 
 READMELOCAL.md
 .serena/
+
+# npm auth (internal registry token) — never commit
+.npmrc

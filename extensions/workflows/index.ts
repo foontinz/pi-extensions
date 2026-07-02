@@ -6,6 +6,7 @@ import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil
 import { Type } from "typebox";
 import { type InProcessSubagentOptions, runSubagentInProcess } from "../subagents/core/in-process-runner.js";
 import { addUsage, emptyUsageStats, type SubagentResult, type UsageStats } from "../subagents/core/types.js";
+import { createWorktree } from "../subagents/workspace/create-worktree.js";
 
 export type AgentExecutor = (options: InProcessSubagentOptions) => Promise<SubagentResult>;
 
@@ -21,6 +22,14 @@ interface AgentOptions {
   timeoutMs?: number;
   /** Run this agent in a different working directory (lightweight isolation). */
   cwd?: string;
+  /**
+   * Run this agent inside a dedicated git worktree (created from the resolved
+   * cwd, torn down when the agent finishes). Use for parallel write-heavy
+   * agents that must not share a working tree.
+   */
+  isolate?: boolean;
+  /** Give this agent a shared `mcp` gateway tool (forwards to the process-wide MCP pool). */
+  mcp?: boolean;
   schema?: AgentSchema;
   retries?: number;
 }
@@ -82,6 +91,8 @@ export default function workflowsExtension(pi: ExtensionAPI) {
       "Workflow agents run in-process with minimal tools by default: read,bash. Pass opts.tools to widen.",
       "Hooks (async): agent(task, opts) -> result; parallel(items, fn); pipeline(items, fns); workflow(script). Sync: phase(name); log(...); args(); failures().",
       "agent() returns null on failure (recorded in failures()). Pass opts.schema.required for JSON-shape validation + retry.",
+      "Pass opts.isolate:true to run a write-heavy agent in its own git worktree (auto torn down); opts.cwd sets a lightweight shared-tree subdir.",
+      "Pass opts.mcp:true to give an agent a shared `mcp` gateway tool (MCP servers are connected once per process and reused across agents).",
       "Return a value from the script to set the workflow output. Pass background:false to wait for the result inline.",
     ],
     parameters: Type.Object({
@@ -228,15 +239,28 @@ export class WorkflowRunner {
     const index = this.launchedCount - 1;
     const label = opts.label ?? `#${index}`;
     const maxRetries = Math.max(0, opts.retries ?? 2);
+    const baseCwd = opts.cwd ? path.resolve(this.cwd, opts.cwd) : this.cwd;
 
     await this.acquire();
+    let worktree: Awaited<ReturnType<typeof createWorktree>> | undefined;
+    let succeeded = false;
     try {
+      let effectiveCwd = baseCwd;
+      if (opts.isolate) {
+        worktree = await createWorktree(baseCwd, { worktreeOverride: true });
+        effectiveCwd = worktree.cwd;
+      }
       this.progress(`agent ${label} started`);
       let lastReason = "no result";
       let prompt = task;
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        const result = await this.runWith429Backoff(prompt, opts);
+        const result = await this.runWith429Backoff(prompt, opts, effectiveCwd);
         this.usage = addUsage(this.usage, result.usage);
+        // A workflow-level abort (external cancel or the overall timeout) cancels
+        // in-flight agents via the shared signal. Surface it as a rejection so the
+        // run fails loudly instead of resolving with silent nulls. A *per-agent*
+        // timeout (signal not aborted) is a recorded failure, not a workflow abort.
+        if (this.signal.aborted) throw new Error("workflow aborted");
         if (result.error) {
           lastReason = result.error.message;
           if (result.error.reason === "timeout" || result.error.reason === "stop") break;
@@ -245,6 +269,7 @@ export class WorkflowRunner {
         const value = result.structuredOutput ?? result.output;
         const schemaError = validateSchema(value, opts.schema);
         if (!schemaError) {
+          succeeded = true;
           this.progress(`agent ${label} completed`);
           return value;
         }
@@ -256,18 +281,20 @@ export class WorkflowRunner {
       this.progress(`agent ${label} failed: ${lastReason}`);
       return null;
     } finally {
+      if (worktree) await worktree.dispose(succeeded ? "completed" : "failed").catch(() => {});
       this.release();
     }
   }
 
-  private async runWith429Backoff(task: string, opts: AgentOptions) {
+  private async runWith429Backoff(task: string, opts: AgentOptions, cwd: string) {
     for (let attempt = 0; ; attempt++) {
       const result = await this.executor({
         task,
-        cwd: opts.cwd ? path.resolve(this.cwd, opts.cwd) : this.cwd,
+        cwd,
         tools: opts.tools ?? DEFAULT_WORKFLOW_TOOLS,
         systemPrompt: opts.systemPrompt,
         timeoutMs: opts.timeoutMs,
+        mcp: opts.mcp,
         signal: this.signal,
       });
       if (result.error && isRateLimit(result.error.message) && attempt < MAX_429_RETRIES) {

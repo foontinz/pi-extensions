@@ -5,10 +5,14 @@ import {
 } from "./invariants.js";
 import {
   JOB_RECORD_SCHEMA_VERSION,
+  MIGRATABLE_JOB_RECORD_SCHEMA_VERSIONS,
   createEmptyJobRuntimeState,
   type JobRecord,
   type JobRuntimeState,
 } from "./types.js";
+
+// Fields dropped from DurableSupervisorInfo in schema v3 (tmux/subprocess-only).
+const REMOVED_SUPERVISOR_INFO_KEYS = ["pid", "tmuxSession", "stdoutPath", "stderrPath", "exitCodePath"] as const;
 
 export { JobRecordHydrationError } from "./invariants.js";
 
@@ -34,13 +38,34 @@ export function hydrateJobRecord(raw: unknown): JobRecord {
     throw new JobRecordHydrationError("missing job record schemaVersion");
   }
 
-  if (parsed.schemaVersion !== JOB_RECORD_SCHEMA_VERSION) {
+  const migrated = migrateForward(structuredClone(parsed));
+
+  if (migrated.schemaVersion !== JOB_RECORD_SCHEMA_VERSION) {
     throw new UnsupportedJobRecordSchemaError(parsed.schemaVersion);
   }
 
-  const record = structuredClone(parsed) as unknown as JobRecord;
+  const record = migrated as unknown as JobRecord;
   assertDurableJobRecord(record);
   return record;
+}
+
+/**
+ * Migrate older durable records forward to the current schema. Currently handles
+ * v2 -> v3: the tmux supervisor was removed, so any legacy "tmux" kind becomes
+ * "process" (such orphaned jobs are finalized as failed on reload anyway) and the
+ * tmux/subprocess-only supervisorInfo fields are stripped.
+ */
+function migrateForward(parsed: Record<string, unknown>): Record<string, unknown> {
+  if (parsed.schemaVersion !== 2 || !MIGRATABLE_JOB_RECORD_SCHEMA_VERSIONS.includes(2)) return parsed;
+
+  if (parsed.supervisor === "tmux") parsed.supervisor = "process";
+  if (isRecord(parsed.supervisorInfo)) {
+    const info = parsed.supervisorInfo;
+    if (info.kind === "tmux") info.kind = "process";
+    for (const key of REMOVED_SUPERVISOR_INFO_KEYS) delete info[key];
+  }
+  parsed.schemaVersion = JOB_RECORD_SCHEMA_VERSION;
+  return parsed;
 }
 
 export function hydrateRuntimeState(_record: JobRecord): JobRuntimeState {

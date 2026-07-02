@@ -17,7 +17,7 @@ Subagent execution is session-bound: running child jobs are stopped when the par
 ## Tools
 
 - `list_agents` — lists user-owned markdown-backed named agents discoverable by `run_agent` from `~/.pi/agent/agents`.
-- `run_agent` — starts a session-bounded **in-process** subagent and returns a job id immediately. Finished subagents report their final output back to the parent Pi session when possible. Omit `model` unless the user explicitly requested a specific model; the subagent otherwise uses your default model configuration. Recursive subagent tools are denied in child allowlists by default.
+- `run_agent` — starts a session-bounded **in-process** subagent and returns a job id immediately. Finished subagents report their final output back to the parent Pi session when possible. Omit `model` unless the user explicitly requested a specific model; the subagent otherwise uses your default model configuration. Recursive subagent tools are denied in child allowlists by default. Pass `mcp: true` to give the subagent a shared `mcp` gateway tool that forwards to a process-wide MCP connection pool (servers connected once, reused across agents).
 - `stop_agent` — terminates a running background job.
 
 Tool names use underscores for provider/tool-call compatibility; labels render as “List Agents”, “Run Agent”, and “Stop Agent”. Running/recent jobs are also shown in Pi’s subagents status/widget with their label, runtime, status, and compact state.
@@ -71,10 +71,9 @@ run_agent({
 // assistant text, which subagents are instructed to make valid JSON.
 // If you need to wait for results, end the turn rather than blocking with sleep/polling;
 // Pi will wake you up when subagent callbacks arrive.
-// For live output/debugging, attach to the tmux session printed by run_agent.
 
-// 4. Cancel if no longer needed. stop_agent sends Ctrl-C first, then hard-kills
-// the tmux session after waitMs/default grace if the job has not exited.
+// 4. Cancel if no longer needed. stop_agent aborts the in-process session and
+// force-cancels after waitMs/default grace if the job has not finished.
 stop_agent({ "id": "agent_...", "reason": "not needed", "waitMs": 5000 })
 ```
 
@@ -119,7 +118,7 @@ Supported fields:
 
 Security note: `postCopy` commands are arbitrary shell commands from the repository. They run without an interactive approval prompt, with a minimal inherited environment rather than the full Pi process environment: only common process keys needed for shell/package-manager operation (for example `PATH`, `HOME`, `SHELL`, temp/locale/user keys when present) are preserved, then per-command `env` entries are added. Do not put secrets in repo-controlled `.pi/worktree.json`; use public/non-secret `env` values only.
 
-Temp worktrees are removed when Pi observes that the job finished, failed, or was stopped unless the `run_agent` `keepWorktree` input retains them. Running jobs are bounded to the parent Pi session: on graceful session shutdown or `/reload`, Pi sends Ctrl-C to running subagents and then hard-kills their tmux sessions after the stop grace period. If Pi exits ungracefully and leaves orphan tmux jobs behind, the next session load stops those recovered running jobs instead of adopting them. Cleanup state is persisted and retried if a previous cleanup attempt was interrupted or failed.
+Temp worktrees are removed when Pi observes that the job finished, failed, or was stopped unless the `run_agent` `keepWorktree` input retains them. Running jobs are bounded to the parent Pi session: subagents run **in-process**, so on graceful session shutdown or `/reload` Pi aborts running subagents after the stop grace period. In-process subagents cannot survive a parent restart; a persisted job still marked running on the next session load is abandoned (finalized as failed) rather than adopted. Cleanup state is persisted and retried if a previous cleanup attempt was interrupted or failed.
 
 ## Named markdown agents
 
@@ -146,11 +145,26 @@ You are a fast reconnaissance subagent. Find relevant files and return a concise
 
 ## Notes
 
-- Jobs are supervised by tmux and persisted under `~/.pi/agent/subagents/`, but running jobs are bounded to the parent Pi session. Graceful `/reload`, session switch, and parent Pi shutdown stop running subagents; the next session also stops recovered orphan running jobs left by an ungraceful exit. `tmux` on `PATH` and executable `/bin/sh` are required before a job is launched. Use `stop_agent` to terminate a running job explicitly; it sends Ctrl-C to the tmux pane first, drains output, then hard-kills the tmux session after the grace period (`waitMs`, default 5000, max 60000) if needed.
-- Attach to a live job with `tmux attach -t <session>`; `run_agent` prints the exact session name.
-- Full raw child process streams are persisted under `~/.pi/agent/subagents/logs/*.stdout.jsonl` and `*.stderr.log` for manual inspection. To prevent unbounded disk growth, a running job is stopped if either raw stream exceeds `PI_SUBAGENTS_MAX_RAW_LOG_BYTES` bytes; the default is 512 MiB per stream, and `0` disables this guard.
+- Subagents run **in-process** (via the SDK `createAgentSession`, no `pi` subprocess / tmux). Job metadata is persisted under `~/.pi/agent/subagents/` for observability and callback delivery, but running jobs are bounded to the parent Pi session. Graceful `/reload`, session switch, and parent Pi shutdown abort running subagents after the stop grace period. Because in-process work cannot survive a parent restart, a persisted job still marked running on the next session load is abandoned (finalized as failed) rather than adopted. Use `stop_agent` to terminate a running job explicitly; it aborts the in-process session and force-cancels after the grace period (`waitMs`, default 5000, max 60000) if needed.
 - Child tool access is limited to tools active in the parent Pi session. If `tools` is omitted, the child receives only the active safe read-only default tools: `read`, `grep`, `find`, and `ls` when available. For portability, omit `tools` unless extra access is needed; some Pi sessions expose search/list operations through `bash` instead of separate `grep`/`find`/`ls` tools. Explicitly requested unavailable safe-default tools are ignored, but any other unavailable tool is refused. Recursive subagent tools (`run_agent`, `list_agents`, `stop_agent`) are denied by default. Pass tools explicitly to grant write, execute, network, or other higher-risk capabilities.
 - Running job concurrency is capped by default to protect the host: `PI_SUBAGENTS_MAX_RUNNING` defaults to 10 globally and `PI_SUBAGENTS_MAX_RUNNING_PER_REPO` defaults to 10 per repository/path. Set either to `0` to disable that limit. Temporary worktree provisioning is also bounded (`PI_SUBAGENTS_MAX_WORKTREE_CREATIONS`, default 4).
-- The child process uses `--no-session`: it does not inherit the parent conversation and does not write a normal Pi session file. Put all needed context in the task, named/ad-hoc system prompt, files, or repo context.
-- Do not pass a `model` override for routine delegation/review. Only set `model` when the user explicitly asks for that exact model/provider; otherwise the child Pi uses its configured default, avoiding provider/API-key mismatches.
-- Child Pi isolation is intentionally limited: the child process loads normal Pi configuration/extensions, skills, providers, and context files. This means extension side effects still apply in the child. Recursive subagent tools are denied in child allowlists by default, and the `tools` allowlist should still be used to constrain tool exposure for each run; there is not currently a minimal-extension or extension-denylist child mode.
+- The nested session is in-memory: it does not inherit the parent conversation and does not write a normal Pi session file. Put all needed context in the task, named/ad-hoc system prompt, files, or repo context.
+- Do not pass a `model` override for routine delegation/review. Only set `model` when the user explicitly asks for that exact model/provider; otherwise the child uses its configured default, avoiding provider/API-key mismatches.
+- Child sessions use a **bare `ResourceLoader`** that loads no extensions or skills (pi's default coding system prompt is preserved via append-only additions). This avoids reloading the whole extension stack (and MCP reconnection / self-recursion) per subagent. MCP is opt-in via `mcp: true`, which injects a shared `mcp` gateway tool backed by a process-wide connection pool (see "Shared MCP gateway" below). The `tools` allowlist still constrains tool exposure per run, and recursive subagent tools are denied by default.
+
+## Shared MCP gateway
+
+Because child sessions load no extensions, they do not inherit the parent's `mcp`
+tool. Passing `mcp: true` to `run_agent` (or `agent({ mcp: true })` in a workflow)
+injects a thin `mcp` gateway tool that forwards to a **process-wide** MCP connection
+pool (`mcp/`). Each configured MCP server is connected **once per process** and reused
+across every subagent / workflow agent, so a fan-out never reconnects an MCP adapter
+per child. Server definitions are read from `<agentDir>/mcp.json`, then project-local
+`.mcp.json` and `.pi/mcp.json` (project overrides global by server name).
+
+The gateway tool modes: no args → list servers; `{ server }` → list its tools;
+`{ search }` → find tools; `{ describe }` → show a tool's parameters; `{ tool, args }`
+→ call a tool (`args` is a JSON string). Only stdio (`command`) and HTTP (`url`, with
+optional `auth: "bearer"` + `bearerToken`) servers are supported; interactive-only
+concerns (OAuth login flows, elicitation UI) are out of scope. Connections are torn
+down on session shutdown.

@@ -25,6 +25,29 @@ test("unsupported future schemas are reported", () => {
   );
 });
 
+test("legacy v2 records migrate forward to v3 (tmux -> process, vestigial fields stripped)", () => {
+  const v2 = {
+    ...makeRecord({ phase: "running", startedAt: 1_000 }),
+    schemaVersion: 2,
+    supervisor: "tmux",
+    supervisorInfo: {
+      kind: "tmux",
+      command: "pi",
+      args: ["--mode", "json"],
+      pid: 4242,
+      tmuxSession: "pi-agent_test",
+      stdoutPath: "/tmp/out",
+      stderrPath: "/tmp/err",
+      exitCodePath: "/tmp/exit",
+    },
+  };
+
+  const hydrated = hydrateJobRecord(JSON.stringify(v2));
+  assert.equal(hydrated.schemaVersion, 3);
+  assert.equal(hydrated.supervisor, "process");
+  assert.deepEqual(hydrated.supervisorInfo, { kind: "process", command: "pi", args: ["--mode", "json"] });
+});
+
 test("durable observability hydrates with compact final output and recent logs", () => {
   const record = makeRecord({
     logCursor: { stdoutOffset: 0, stderrOffset: 0, nextSeq: 3 },

@@ -33,7 +33,6 @@ export interface PollJobView<TLog extends PollLogEntryView = PollLogEntryView> {
     retained?: boolean;
   };
   supervisor: string;
-  rawLogLimitExceeded?: boolean;
   status: "running" | "completed" | "failed" | "cancelled";
   phase?: string;
   cleanupPhase?: string;
@@ -59,8 +58,6 @@ export interface PollJobView<TLog extends PollLogEntryView = PollLogEntryView> {
 
 export interface PollFormatOptions {
   suggestedPollIntervalMs: number;
-  rawLogLimitBytes: number;
-  rawLogSizes: { stdout?: number; stderr?: number; total: number };
 }
 
 export interface PollJobSummary {
@@ -84,9 +81,6 @@ export interface PollJobSummary {
     retained?: boolean;
   };
   supervisor: string;
-  rawLogBytes: { stdout?: number; stderr?: number; total: number };
-  rawLogLimitBytes: number;
-  rawLogLimitExceeded?: boolean;
   status: "running" | "completed" | "failed" | "cancelled";
   phase: string;
   cleanupPhase?: string;
@@ -132,9 +126,6 @@ export function summarizeJob<TLog extends PollLogEntryView>(job: PollJobView<TLo
         }
       : undefined,
     supervisor: job.supervisor,
-    rawLogBytes: options.rawLogSizes,
-    rawLogLimitBytes: options.rawLogLimitBytes,
-    rawLogLimitExceeded: job.rawLogLimitExceeded,
     status: job.status,
     phase: job.phase ?? job.status,
     cleanupPhase: job.cleanupPhase,

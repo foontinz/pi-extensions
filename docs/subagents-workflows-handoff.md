@@ -89,28 +89,40 @@ Last updated: after the subprocess→in-process migration and dead-code removal.
 
 Priority order:
 
-1. **Per-agent git worktree isolation for in-process agents** (main functional gap).
-   Today agents share the workflow/job cwd; only a manual `agent({ cwd })` knob
-   exists. Plan: extract the worktree-create logic currently inlined in
-   `index.ts` (`prepareWorktreeForSpawn` + `copyConfiguredFiles` + post-copy +
-   cleanup) into a standalone, lifecycle-free `createWorktree(sourceCwd) → { cwd,
-   dispose() }`, then add `agent({ isolate: true })` to `WorkflowRunner` (create on
-   start, dispose on end). Matters mainly for **parallel write-heavy** agents;
-   read-mostly fan-out is fine on a shared cwd (pi serializes same-file writes via
+1. ~~**Per-agent git worktree isolation for in-process agents**~~ **(DONE).**
+   Worktree-create/cleanup logic was extracted out of `index.ts` into a standalone,
+   lifecycle-free module `subagents/workspace/create-worktree.ts` exposing
+   `prepareWorktree(sourceCwd, opts) → { cwd, worktree?, warning? }`,
+   `createWorktree(sourceCwd, opts) → { …, dispose(status?) }`, plus the shared
+   creation-slot semaphore and git-root/cleanup helpers (`cleanupWorktreeAsync`,
+   `shouldRetainWorktree`, `getGitRoot*`). `run_agent` now calls `prepareWorktree`
+   (keeping its job-aware cleanup wrappers); `WorkflowRunner` gained
+   `agent({ isolate: true })` which provisions a dedicated worktree from the resolved
+   cwd and disposes it (completed→remove, failed→retain per `keepWorktree`) when the
+   agent finishes. Matters mainly for **parallel write-heavy** agents; read-mostly
+   fan-out is fine on a shared cwd (pi serializes same-file writes via
    `withFileMutationQueue`).
-2. **Shared MCP gateway proxy** (P3.3) — only if workflow/subagents need MCP. Route
-   child MCP calls to the parent's already-connected adapter instead of reconnecting.
+2. ~~**Shared MCP gateway proxy** (P3.3)~~ **(DONE).** Child sessions load no
+   extensions, so they get an opt-in `mcp` gateway tool (`run_agent({ mcp: true })`,
+   `agent({ mcp: true })`) backed by a **process-wide** MCP connection pool
+   (`subagents/mcp/{config,gateway,proxy-tool}.ts`): each configured server (from
+   `mcp.json` / `.pi/mcp.json` / `.mcp.json`) is connected once per process and reused
+   across all agents, disposed on session shutdown. Supports stdio + HTTP(bearer);
+   OAuth/elicitation UI out of scope. Built on `@modelcontextprotocol/sdk`.
 3. **Resume / journals** (`resumeFromRunId`, longest-unchanged-prefix cache) —
    deferred to **v2**; would require determinism stripping (also deferred).
 
-Polish / hardening:
-- Slim the durable `JobRecord` schema: it still carries vestigial `"tmux"`
-  `SupervisorKind` + supervisor-info fields for back-compat with old persisted
-  records. Remove in a future schema bump with a hydration migration.
-- `rawLog*` cap reporting in the poll summary is now moot (always 0) — remove.
-- 3 `poll_agent` characterization tests are `test.skip` (the `poll_agent` tool isn't
-  registered) — wire up or delete.
-- Add tests for `resolveModelPattern` and bare-loader system-prompt composition.
+Polish / hardening — **all DONE**:
+- Durable `JobRecord` schema slimmed: bumped to **v3**; `SupervisorKind` is now
+  `["process"]` only and `DurableSupervisorInfo` dropped the tmux/subprocess fields
+  (`pid`, `tmuxSession`, `stdoutPath`, `stderrPath`, `exitCodePath`). `hydrateJobRecord`
+  migrates v2 records forward (tmux→process, vestigial fields stripped).
+- `rawLog*` cap reporting removed from the poll formatter + `PollFormatOptions`
+  (`MAX_RAW_LOG_BYTES`/`MAX_LOG_READ_BYTES` constants deleted).
+- The 6 `test.skip` `poll_agent` characterizations were deleted (the callback-based
+  design has no `poll_agent` tool; the formatters are covered elsewhere).
+- Added tests for `resolveModelPattern`, bare-loader system-prompt composition, the
+  v2→v3 hydration migration, and the MCP gateway/proxy (real stdio MCP server).
 
 Dropped (won't do): VM sandboxing; subprocess/tmux supervisor.
 
@@ -137,6 +149,11 @@ Dropped (won't do): VM sandboxing; subprocess/tmux supervisor.
 
 ## Key files
 - `extensions/subagents/index.ts` — tools, job lifecycle, persistence, status.
+- `extensions/subagents/workspace/create-worktree.ts` — standalone worktree
+  provisioning (`prepareWorktree`/`createWorktree`/cleanup) shared by `run_agent`
+  + `workflows`.
+- `extensions/subagents/mcp/{config,gateway,proxy-tool}.ts` — process-wide shared
+  MCP connection pool + injectable `mcp` proxy tool for child sessions.
 - `extensions/subagents/core/in-process-runner.ts` — await runner, loader, handles.
 - `extensions/subagents/supervisor/in-process-supervisor.ts` — event-driven driver.
 - `extensions/subagents/core/{types,state-machine,invariants,hydration,job-store}.ts`.

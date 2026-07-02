@@ -81,8 +81,6 @@ test("extracted poll formatter exposes a named summary contract", () => {
     logs: [],
   }, {
     suggestedPollIntervalMs: 15_000,
-    rawLogLimitBytes: 1_000,
-    rawLogSizes: { total: 0 },
   });
 
   assert.equal(summary.nextSeq, 2);

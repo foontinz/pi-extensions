@@ -63,7 +63,7 @@ const JOB_RECORD_KEYS = new Set([
 ]);
 const OWNER_KEYS = new Set(["version", "id", "instanceId", "sessionId", "sessionFile", "parentPid", "cwd"]);
 const LOG_CURSOR_KEYS = new Set(["stdoutOffset", "stderrOffset", "nextSeq"]);
-const SUPERVISOR_INFO_KEYS = new Set(["kind", "pid", "command", "args", "tmuxSession", "stdoutPath", "stderrPath", "exitCodePath"]);
+const SUPERVISOR_INFO_KEYS = new Set(["kind", "command", "args"]);
 const WORKTREE_KEYS = new Set(["root", "tempParent", "originalRoot", "originalCwd", "configPath", "base", "copied", "postCopy", "keepWorktree", "retained"]);
 const WORKTREE_SCRIPT_KEYS = new Set(["command", "cwd", "optional", "timeoutMs", "failed", "stdout", "stderr"]);
 const TERMINAL_KEYS = new Set(["phase", "reason", "finishedAt", "exitCode", "signal", "message", "error"]);
@@ -318,13 +318,8 @@ function assertSupervisorInfo(value: unknown): void {
   if (value.kind !== undefined && !SUPERVISOR_KINDS.has(value.kind as SupervisorKind)) {
     throw invariant(`invalid supervisorInfo.kind ${String(value.kind)}`);
   }
-  if (value.pid !== undefined) assertNonNegativeInteger(value.pid, "supervisorInfo.pid");
   if (value.command !== undefined) assertString(value.command, "supervisorInfo.command");
   if (value.args !== undefined) assertStringArray(value.args, "supervisorInfo.args");
-  if (value.tmuxSession !== undefined) assertString(value.tmuxSession, "supervisorInfo.tmuxSession");
-  if (value.stdoutPath !== undefined) assertString(value.stdoutPath, "supervisorInfo.stdoutPath");
-  if (value.stderrPath !== undefined) assertString(value.stderrPath, "supervisorInfo.stderrPath");
-  if (value.exitCodePath !== undefined) assertString(value.exitCodePath, "supervisorInfo.exitCodePath");
 }
 
 function assertWorktree(value: unknown): void {
