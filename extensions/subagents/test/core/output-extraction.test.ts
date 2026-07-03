@@ -48,6 +48,21 @@ test("detectAssistantFailure maps aborted to stop", () => {
   assert.deepEqual(detectAssistantFailure(messages), { reason: "stop", message: "assistant was aborted" });
 });
 
+test("detectAssistantFailure flags a length-truncated stop", () => {
+  const messages = [userMsg, { role: "assistant", stopReason: "length", content: [{ type: "text", text: "partial" }] }];
+  assert.deepEqual(detectAssistantFailure(messages), { reason: "error", message: "assistant response was truncated (token limit)" });
+});
+
+test("detectAssistantFailure falls back to a default when errorMessage is empty", () => {
+  const messages = [{ role: "assistant", stopReason: "error", content: [], errorMessage: "" }];
+  assert.deepEqual(detectAssistantFailure(messages), { reason: "error", message: "assistant returned an error" });
+});
+
+test("string content is extracted as text", () => {
+  const messages = [userMsg, { role: "assistant", stopReason: "stop", content: "plain string answer" }];
+  assert.equal(extractLastAssistantText(messages), "plain string answer");
+});
+
 test("detectAssistantFailure returns undefined for a normal stop", () => {
   const messages = [
     userMsg,

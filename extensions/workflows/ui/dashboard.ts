@@ -138,9 +138,11 @@ export class WorkflowDashboard implements Component {
 
   private topBorder(w: number): string {
     const t = this.theme;
-    const title = ` ${t.bold(t.fg("accent", "Workflow"))} ${t.fg("muted", this.snap.runId || "")} `;
-    const titleW = visibleWidth(title);
-    const fill = Math.max(0, w - 3 - titleW - 1);
+    // Budget: "╭─" (2) + title + fill + "╮" (1) must equal w, so title ≤ w - 3.
+    const maxTitleW = Math.max(0, w - 3);
+    let title = ` ${t.bold(t.fg("accent", "Workflow"))} ${t.fg("muted", this.snap.runId || "")} `;
+    if (visibleWidth(title) > maxTitleW) title = truncateToWidth(title, maxTitleW, "…", false);
+    const fill = Math.max(0, w - 3 - visibleWidth(title));
     return t.fg("border", "╭─") + title + t.fg("border", "─".repeat(fill) + "╮");
   }
 

@@ -211,11 +211,17 @@ export default function workflowsExtension(pi: ExtensionAPI) {
       // is "cancelled"; the overall timeout is a "failed"; anything else is a
       // genuine error.
       const classifyFailure = (): "failed" | "cancelled" => {
-        if (runEntry.timedOut) return "failed";
+        // Prefer an explicit stop over a racing timeout so a user cancel is never
+        // mislabeled as a failure.
         if (runEntry.stopped) return "cancelled";
+        if (runEntry.timedOut) return "failed";
         if (!background && signal?.aborted) return "cancelled";
         return "failed";
       };
+
+      // The message to report for a non-cancelled failure (surfaces timeouts distinctly).
+      const failureMessage = (error: unknown): string =>
+        runEntry.timedOut ? `workflow timed out after ${timeoutMs}ms` : error instanceof Error ? error.message : String(error);
 
       const execRun = async (emit: (message: string) => void): Promise<WorkflowResult> => {
         const linked = linkSignals(background ? undefined : signal, controller.signal);
@@ -230,6 +236,10 @@ export default function workflowsExtension(pi: ExtensionAPI) {
           return { runId, scriptPath: resolved.scriptPath, output, usage: runner.usage, agents: runner.launchedCount, failures: runner.failuresList };
         } finally {
           clearTimeout(timer);
+          // Abort the shared signal so any still-in-flight sibling subagents are
+          // cancelled on a terminal error (not just on stop/timeout). No-op on a
+          // clean finish (nothing is running).
+          controller.abort();
           linked.dispose();
           runningWorkflows.delete(runId);
         }
@@ -247,6 +257,7 @@ export default function workflowsExtension(pi: ExtensionAPI) {
             const message = runEntry.stopReason ?? "workflow cancelled";
             return { content: [{ type: "text", text: `Workflow ${runId} ${message}.` }], details: { runId, status: "cancelled", reason: message } };
           }
+          if (runEntry.timedOut) throw new Error(`workflow timed out after ${timeoutMs}ms`);
           throw error;
         }
       }
@@ -260,9 +271,7 @@ export default function workflowsExtension(pi: ExtensionAPI) {
         .catch((error) => {
           const outcome = classifyFailure();
           view.finish(outcome);
-          const message = outcome === "cancelled"
-            ? runEntry.stopReason ?? "workflow cancelled"
-            : error instanceof Error ? error.message : String(error);
+          const message = outcome === "cancelled" ? runEntry.stopReason ?? "workflow cancelled" : failureMessage(error);
           deliverCompletion(undefined, { runId, error: message, cancelled: outcome === "cancelled" });
         });
 
@@ -566,13 +575,19 @@ export class WorkflowRunner {
       this.active++;
       return;
     }
+    // Wait for a slot. release() hands its slot directly to the next waiter
+    // (without decrementing), so we must NOT increment again on resume —
+    // otherwise a fresh acquire() in the handoff window could over-subscribe.
     await new Promise<void>((resolve) => this.queue.push(resolve));
-    this.active++;
   }
 
   private release(): void {
-    this.active = Math.max(0, this.active - 1);
-    this.queue.shift()?.();
+    const next = this.queue.shift();
+    if (next) {
+      next(); // transfer the held slot to the waiter; active is unchanged
+    } else {
+      this.active = Math.max(0, this.active - 1);
+    }
     this.touch();
   }
 }

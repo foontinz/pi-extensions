@@ -83,6 +83,12 @@ function compactLine(details: ResultDetails | undefined, text: string, theme: To
   if (details?.status === "running") {
     return `${theme.fg("accent", "▸")} ${title}${id} ${theme.fg("dim", "started · background")}`;
   }
+  if (details?.status === "cancelled") {
+    return `${theme.fg("warning", "⊘")} ${title}${id} ${theme.fg("warning", "cancelled")}`;
+  }
+  if (details?.status === "failed") {
+    return `${theme.fg("error", "✗")} ${title}${id} ${theme.fg("error", "failed")}`;
+  }
   if (details?.runId) {
     const failed = Array.isArray(details.failures) ? details.failures.length : 0;
     const bits: string[] = [];

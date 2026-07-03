@@ -43,6 +43,20 @@ test("verbose/expanded result shows the full body", () => {
   assert.match(full, /FULL BODY/);
 });
 
+test("cancelled result shows the cancelled glyph, not a check", () => {
+  const result = { content: [{ type: "text", text: "Workflow abcd1234 stopped by request." }], details: { runId: "abcd1234", status: "cancelled", reason: "stopped by request" } };
+  const collapsed = lines(renderWorkflowResult(result, theme, {}, false));
+  assert.match(collapsed, /⊘ Workflow abcd1234 cancelled/);
+  assert.doesNotMatch(collapsed, /done/);
+});
+
+test("failed result shows the failed glyph, not a check", () => {
+  const result = { content: [{ type: "text", text: "boom" }], details: { runId: "abcd1234", status: "failed" } };
+  const collapsed = lines(renderWorkflowResult(result, theme, {}, false));
+  assert.match(collapsed, /✗ Workflow abcd1234 failed/);
+  assert.doesNotMatch(collapsed, /done/);
+});
+
 test("errors are always shown", () => {
   const result = { content: [{ type: "text", text: "boom exploded" }] };
   const errored = lines(renderWorkflowResult(result, theme, { isError: true }, false));

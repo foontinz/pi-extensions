@@ -207,8 +207,10 @@ export function detectAssistantFailure(messages: readonly unknown[]): { reason: 
     const message = messages[i] as { role?: unknown; stopReason?: unknown; errorMessage?: unknown };
     if (message.role !== "assistant") continue;
     const errorMessage = typeof message.errorMessage === "string" ? message.errorMessage : undefined;
-    if (message.stopReason === "error") return { reason: "error", message: errorMessage ?? "assistant returned an error" };
-    if (message.stopReason === "aborted") return { reason: "stop", message: errorMessage ?? "assistant was aborted" };
+    // `||` (not `??`): an empty-string errorMessage should still fall back to the default.
+    if (message.stopReason === "error") return { reason: "error", message: errorMessage || "assistant returned an error" };
+    if (message.stopReason === "aborted") return { reason: "stop", message: errorMessage || "assistant was aborted" };
+    if (message.stopReason === "length") return { reason: "error", message: errorMessage || "assistant response was truncated (token limit)" };
     return undefined; // Most recent assistant message finished normally.
   }
   return undefined;

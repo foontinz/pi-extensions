@@ -40,6 +40,21 @@ test("every rendered line fits within the requested width", () => {
   }
 });
 
+test("box lines (borders/divider) are all exactly the box width", () => {
+  for (const width of [40, 56, 76]) {
+    const lines = new WorkflowDashboard(snap(), plainTheme, 0).render(width);
+    // Top border, divider, bottom border, and content rows all share one width.
+    const top = visibleWidth(lines[0]);
+    assert.equal(top, width, `top border width ${top} != ${width}`);
+    for (const line of lines) assert.equal(visibleWidth(line), width, `line width mismatch at ${width}: ${JSON.stringify(line)}`);
+  }
+});
+
+test("a long runId never overflows the top border", () => {
+  const long = new WorkflowDashboard(snap({ runId: "a".repeat(80) }), plainTheme, 0).render(60);
+  for (const line of long) assert.ok(visibleWidth(line) <= 60, `overflow: ${JSON.stringify(line)}`);
+});
+
 test("running dashboard shows phase, counts, tokens and agent glyphs", () => {
   const text = new WorkflowDashboard(snap(), plainTheme, 0).render(76).join("\n");
   assert.match(text, /Workflow a1b2c3d4/);
