@@ -61,6 +61,11 @@ test("completed dashboard replaces the phase with a status label", () => {
   assert.doesNotMatch(text, /running/);
 });
 
+test("cancelled dashboard shows the cancelled glyph and label", () => {
+  const text = new WorkflowDashboard(snap({ status: "cancelled", phase: undefined }), plainTheme, 0).render(76).join("\n");
+  assert.match(text, /⊘ cancelled/);
+});
+
 test("collapses to a bounded number of agent rows", () => {
   const now = Date.now();
   const many = Array.from({ length: 20 }, (_, i) => ({

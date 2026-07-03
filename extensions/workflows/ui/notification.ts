@@ -4,7 +4,7 @@ import type { UsageStats } from "../../subagents/core/types.js";
 /** Structured payload attached to the `workflow-notification` custom message. */
 export interface WorkflowNotificationDetails {
   runId: string;
-  status: "completed" | "failed";
+  status: "completed" | "failed" | "cancelled";
   agents?: number;
   failures?: number;
   usage?: UsageStats;
@@ -32,21 +32,27 @@ export function renderWorkflowNotification(
   full: boolean,
   theme: NotificationTheme,
 ): Component {
-  const ok = details?.status !== "failed";
-  const statusRole = ok ? "success" : "error";
+  const status = details?.status ?? "completed";
+  const glyph = status === "failed"
+    ? { icon: "✗", role: "error" }
+    : status === "cancelled"
+      ? { icon: "⊘", role: "warning" }
+      : { icon: "✓", role: "success" };
   const head =
-    `${theme.fg(statusRole, ok ? "✓" : "✗")} ${theme.bold("Workflow")}` +
+    `${theme.fg(glyph.role, glyph.icon)} ${theme.bold("Workflow")}` +
     ` ${theme.fg("muted", details?.runId ?? "")}` +
-    ` ${theme.fg(statusRole, ok ? "completed" : "failed")}`;
+    ` ${theme.fg(glyph.role, status)}`;
 
   const bits: string[] = [];
   if (details?.agents != null) bits.push(theme.fg("muted", `${details.agents} agent${details.agents === 1 ? "" : "s"}`));
   if (details?.failures) bits.push(theme.fg("error", `${details.failures} failed`));
   if (details?.usage) bits.push(theme.fg("muted", `↑${compact(details.usage.input)} ↓${compact(details.usage.output)}`));
   if (details?.usage?.cost) bits.push(theme.fg("muted", `$${details.usage.cost.toFixed(details.usage.cost < 1 ? 3 : 2)}`));
-  // On failure, surface the error inline so it stays visible even when the
-  // notice is collapsed (minimized/medium tool-view mode).
-  if (!ok && details?.error) bits.push(theme.fg("error", truncateToWidth(firstLine(details.error), 100, "…")));
+  // On failure/cancellation, surface the reason inline so it stays visible even
+  // when the notice is collapsed (minimized/medium tool-view mode).
+  if (status !== "completed" && details?.error) {
+    bits.push(theme.fg(glyph.role, truncateToWidth(firstLine(details.error), 100, "…")));
+  }
   const summary = bits.length > 0 ? theme.fg("dim", " · ") + bits.join(theme.fg("dim", " · ")) : "";
 
   const box = new Box(1, 0, (t) => theme.bg("customMessageBg", t));

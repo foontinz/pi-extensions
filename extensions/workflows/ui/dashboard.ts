@@ -69,7 +69,9 @@ export class WorkflowDashboard implements Component {
         ? t.fg("success", "completed")
         : s.status === "failed"
           ? t.fg("error", "failed")
-          : this.phaseLabel();
+          : s.status === "cancelled"
+            ? t.fg("warning", "cancelled")
+            : this.phaseLabel();
     const done = s.agents.filter((a) => a.status === "completed").length;
     const bar = progressBar(done, Math.max(s.launched, 1), t);
     const count = t.fg("muted", `${done}/${s.launched || 0}`);
@@ -161,6 +163,7 @@ export class WorkflowDashboard implements Component {
 function statusGlyph(status: WorkflowSnapshot["status"], frame: number): { icon: string; role: string } {
   if (status === "completed") return { icon: "✓", role: "success" };
   if (status === "failed") return { icon: "✗", role: "error" };
+  if (status === "cancelled") return { icon: "⊘", role: "warning" };
   return { icon: SPINNER[frame % SPINNER.length], role: "accent" };
 }
 

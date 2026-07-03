@@ -74,7 +74,7 @@ export interface WorkflowSnapshot {
   origin: string;
   startedAt: number;
   finishedAt?: number;
-  status: "running" | "completed" | "failed";
+  status: "running" | "completed" | "failed" | "cancelled";
   phase?: string;
   phases: string[];
   agents: WorkflowAgentView[];
@@ -101,11 +101,40 @@ const FINISHED_WIDGET_VISIBLE_MS = 8_000;
 interface RunningWorkflow {
   runId: string;
   controller: AbortController;
+  origin: string;
+  startedAt: number;
+  /** Set when the run was intentionally stopped (tool/command) -> reported as cancelled. */
+  stopped?: boolean;
+  stopReason?: string;
+  /** Set when the overall timeout fired -> reported as failed. */
+  timedOut?: boolean;
 }
 
 let piApi: ExtensionAPI | undefined;
 let deliveryContext: ExtensionContext | undefined;
 const runningWorkflows = new Map<string, RunningWorkflow>();
+
+/** Abort one running workflow by id. Returns false when it is unknown/already finished. */
+function stopWorkflow(runId: string, reason: string): boolean {
+  const run = runningWorkflows.get(runId);
+  if (!run) return false;
+  run.stopped = true;
+  run.stopReason = reason;
+  run.controller.abort(new Error(reason));
+  return true;
+}
+
+/** Abort every running workflow. Returns how many were stopped. */
+function stopAllWorkflows(reason: string): number {
+  let count = 0;
+  for (const run of runningWorkflows.values()) {
+    run.stopped = true;
+    run.stopReason = reason;
+    run.controller.abort(new Error(reason));
+    count += 1;
+  }
+  return count;
+}
 
 export default function workflowsExtension(pi: ExtensionAPI) {
   piApi = pi;
@@ -174,12 +203,26 @@ export default function workflowsExtension(pi: ExtensionAPI) {
       const timeoutMs = params.timeoutMs ?? DEFAULT_WORKFLOW_TIMEOUT_MS;
 
       const controller = new AbortController();
-      runningWorkflows.set(runId, { runId, controller });
+      const runEntry: RunningWorkflow = { runId, controller, origin: resolved.origin, startedAt: Date.now() };
+      runningWorkflows.set(runId, runEntry);
       const view = createWorkflowView(ctx, runId, resolved.origin);
+
+      // Classify why a run ended: an explicit stop (tool/command) or a turn abort
+      // is "cancelled"; the overall timeout is a "failed"; anything else is a
+      // genuine error.
+      const classifyFailure = (): "failed" | "cancelled" => {
+        if (runEntry.timedOut) return "failed";
+        if (runEntry.stopped) return "cancelled";
+        if (!background && signal?.aborted) return "cancelled";
+        return "failed";
+      };
 
       const execRun = async (emit: (message: string) => void): Promise<WorkflowResult> => {
         const linked = linkSignals(background ? undefined : signal, controller.signal);
-        const timer = setTimeout(() => controller.abort(new Error(`workflow timed out after ${timeoutMs}ms`)), timeoutMs);
+        const timer = setTimeout(() => {
+          runEntry.timedOut = true;
+          controller.abort(new Error(`workflow timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
         const runner = new WorkflowRunner(ctx.cwd, params.args, linked.signal, emit, runSubagentInProcess, view.onState, runId, resolved.origin);
         view.start();
         try {
@@ -198,7 +241,12 @@ export default function workflowsExtension(pi: ExtensionAPI) {
           view.finish("completed", result);
           return { content: [{ type: "text", text: formatSummary(result) }], details: result };
         } catch (error) {
-          view.finish("failed");
+          const outcome = classifyFailure();
+          view.finish(outcome);
+          if (outcome === "cancelled") {
+            const message = runEntry.stopReason ?? "workflow cancelled";
+            return { content: [{ type: "text", text: `Workflow ${runId} ${message}.` }], details: { runId, status: "cancelled", reason: message } };
+          }
           throw error;
         }
       }
@@ -210,12 +258,80 @@ export default function workflowsExtension(pi: ExtensionAPI) {
           deliverCompletion(result, undefined);
         })
         .catch((error) => {
-          view.finish("failed");
-          deliverCompletion(undefined, { runId, error: error instanceof Error ? error.message : String(error) });
+          const outcome = classifyFailure();
+          view.finish(outcome);
+          const message = outcome === "cancelled"
+            ? runEntry.stopReason ?? "workflow cancelled"
+            : error instanceof Error ? error.message : String(error);
+          deliverCompletion(undefined, { runId, error: message, cancelled: outcome === "cancelled" });
         });
 
-      const ack = `Workflow ${runId} started in the background (${resolved.origin}). A notification will arrive on completion. Script: ${resolved.scriptPath}`;
+      const ack = `Workflow ${runId} started in the background (${resolved.origin}). A notification will arrive on completion (or stop it with /workflow-stop ${runId}). Script: ${resolved.scriptPath}`;
       return { content: [{ type: "text", text: ack }], details: { runId, status: "running", scriptPath: resolved.scriptPath } };
+    },
+  });
+
+  pi.registerTool({
+    name: "stop_workflow",
+    label: "Stop workflow",
+    description: "Stop a running background workflow by runId (or all running workflows). In-flight subagents are aborted.",
+    promptSnippet: "Cancel a running background workflow.",
+    promptGuidelines: [
+      "Use to cancel a running background Workflow the user no longer wants; it aborts in-flight subagents.",
+      "Pass runId to stop one run, or omit it (or pass 'all') to stop every running workflow.",
+    ],
+    parameters: Type.Object({
+      runId: Type.Optional(Type.String({ description: "Workflow runId to stop. Omit or pass 'all' to stop every running workflow." })),
+      reason: Type.Optional(Type.String({ description: "Optional human-readable reason recorded on the run." })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      if (ctx.hasUI) deliveryContext = ctx;
+      const reason = params.reason?.trim() || "stopped by request";
+      if (!params.runId || params.runId.trim() === "" || params.runId.trim().toLowerCase() === "all") {
+        const count = stopAllWorkflows(reason);
+        const text = count > 0 ? `Stopping ${count} running workflow${count === 1 ? "" : "s"}.` : "No running workflows.";
+        return { content: [{ type: "text", text }], details: { stopped: count } };
+      }
+      const id = params.runId.trim();
+      const ok = stopWorkflow(id, reason);
+      const running = [...runningWorkflows.keys()];
+      const text = ok
+        ? `Stopping workflow ${id}.`
+        : `No running workflow ${id}.${running.length ? ` Running: ${running.join(", ")}.` : ""}`;
+      return { content: [{ type: "text", text }], details: { stopped: ok ? 1 : 0, runId: id } };
+    },
+  });
+
+  pi.registerCommand("workflow-stop", {
+    description: "Stop a running workflow: /workflow-stop [runId|all]",
+    getArgumentCompletions: (prefix) => {
+      const trimmed = prefix.trim();
+      const candidates = ["all", ...runningWorkflows.keys()];
+      return candidates
+        .filter((value) => value.startsWith(trimmed))
+        .map((value) => ({
+          value,
+          label: value,
+          description: value === "all" ? "stop all running workflows" : "running workflow",
+        }));
+    },
+    handler: async (args, ctx) => {
+      const running = [...runningWorkflows.keys()];
+      if (running.length === 0) {
+        ctx.ui.notify("No running workflows.", "info");
+        return;
+      }
+      const arg = args.trim();
+      if (arg === "" || arg.toLowerCase() === "all") {
+        const count = stopAllWorkflows("stopped from /workflow-stop");
+        ctx.ui.notify(`Stopping ${count} workflow${count === 1 ? "" : "s"}.`, "info");
+        return;
+      }
+      const ok = stopWorkflow(arg, "stopped from /workflow-stop");
+      ctx.ui.notify(
+        ok ? `Stopping workflow ${arg}.` : `No running workflow ${arg}. Running: ${running.join(", ")}.`,
+        ok ? "info" : "warning",
+      );
     },
   });
 }
@@ -255,13 +371,15 @@ function persistInlineScript(script: string): string {
   return filePath;
 }
 
-function deliverCompletion(result: WorkflowResult | undefined, failure: { runId: string; error: string } | undefined): void {
+function deliverCompletion(result: WorkflowResult | undefined, failure: { runId: string; error: string; cancelled?: boolean } | undefined): void {
+  const cancelled = failure?.cancelled === true;
+  const verb = cancelled ? "cancelled" : "failed";
   const content = result
     ? `<workflow-notification>\nWorkflow ${result.runId} completed.\n${formatSummary(result)}\n</workflow-notification>`
-    : `<workflow-notification>\nWorkflow ${failure?.runId} failed: ${failure?.error}\n</workflow-notification>`;
+    : `<workflow-notification>\nWorkflow ${failure?.runId} ${verb}: ${failure?.error}\n</workflow-notification>`;
   const details: WorkflowNotificationDetails = result
     ? { runId: result.runId, status: "completed", agents: result.agents, failures: result.failures.length, usage: result.usage }
-    : { runId: failure?.runId ?? "", status: "failed", error: failure?.error };
+    : { runId: failure?.runId ?? "", status: cancelled ? "cancelled" : "failed", error: failure?.error };
   try {
     // A custom message (not a user message) keeps the full result in LLM context
     // while letting our registered renderer collapse it in the transcript.
@@ -548,7 +666,7 @@ function stringifyLog(value: unknown): string {
 interface WorkflowView {
   onState: (snap: WorkflowSnapshot) => void;
   start: () => void;
-  finish: (status: "completed" | "failed", result?: WorkflowResult) => void;
+  finish: (status: "completed" | "failed" | "cancelled", result?: WorkflowResult) => void;
 }
 
 /**
@@ -630,6 +748,7 @@ function createWorkflowView(ctx: ExtensionContext, runId: string, origin: string
 function workflowStatusLine(snap: WorkflowSnapshot): string {
   if (snap.status === "completed") return `workflow ${snap.runId}: done (${snap.launched} agents${snap.failures ? `, ${snap.failures} failed` : ""})`;
   if (snap.status === "failed") return `workflow ${snap.runId}: failed`;
+  if (snap.status === "cancelled") return `workflow ${snap.runId}: cancelled`;
   const running = snap.agents.filter((a) => a.status === "running" || a.status === "retrying").length;
   const done = snap.agents.filter((a) => a.status === "completed").length;
   return `workflow ${snap.runId}: ${running} running · ${done}/${snap.launched} done`;

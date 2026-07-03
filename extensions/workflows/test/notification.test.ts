@@ -43,6 +43,14 @@ test("failed notification shows the error and a red glyph", () => {
   assert.match(expanded, /boom/);
 });
 
+test("cancelled notification renders a distinct glyph and reason inline", () => {
+  const details: WorkflowNotificationDetails = { runId: "beefcafe", status: "cancelled", error: "stopped by request" };
+  const collapsed = lines(renderWorkflowNotification(details, "<workflow-notification>\nWorkflow beefcafe cancelled: stopped by request\n</workflow-notification>", false, theme));
+  assert.equal(collapsed.split("\n").length, 1);
+  assert.match(collapsed, /⊘ Workflow beefcafe cancelled/);
+  assert.match(collapsed, /stopped by request/);
+});
+
 test("collapsed failure surfaces the error inline (visible in minimized mode)", () => {
   const details: WorkflowNotificationDetails = {
     runId: "deadbeef",
