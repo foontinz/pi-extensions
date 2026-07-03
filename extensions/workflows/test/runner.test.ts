@@ -114,8 +114,8 @@ test("agent forwards resolved cwd and tools to executor", async () => {
   assert.deepEqual(Array.from(seen[1].tools!), ["read", "bash"]);
 });
 
-test("isolate runs the agent in a dedicated worktree and tears it down", async () => {
-  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "wf-isolate-"));
+test("worktree runs the agent in a dedicated worktree and tears it down", async () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "wf-worktree-"));
   try {
     execFileSync("git", ["-C", repo, "init", "-q"]);
     execFileSync("git", ["-C", repo, "config", "user.email", "t@t.t"]);
@@ -132,7 +132,7 @@ test("isolate runs the agent in a dedicated worktree and tears it down", async (
       assert.ok(fs.existsSync(o.cwd), "worktree cwd should exist while the agent runs");
       return { output: "done", usage: emptyUsageStats() };
     });
-    const result = await runner.run(`return await agent("a", { isolate: true });`);
+    const result = await runner.run(`return await agent("a", { worktree: true });`);
     assert.equal(result, "done");
     assert.notEqual(seenCwd, realRepo);
     assert.ok(!fs.existsSync(seenCwd), "worktree should be removed after the agent finishes");

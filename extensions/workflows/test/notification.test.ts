@@ -47,10 +47,10 @@ test("collapsed failure surfaces the error inline (visible in minimized mode)", 
   const details: WorkflowNotificationDetails = {
     runId: "deadbeef",
     status: "failed",
-    error: "agent #0: isolate:true needs a git repository, but \"/tmp/x\" is not inside one.\nsecond line",
+    error: "agent #0: worktree:true needs a git repository, but \"/tmp/x\" is not inside one.\nsecond line",
   };
   const collapsed = lines(renderWorkflowNotification(details, "<workflow-notification>\n...\n</workflow-notification>", false, theme));
   assert.equal(collapsed.split("\n").length, 1, "stays a single line");
-  assert.match(collapsed, /isolate:true needs a git repository/);
+  assert.match(collapsed, /worktree:true needs a git repository/);
   assert.doesNotMatch(collapsed, /second line/, "only the first line is shown");
 });

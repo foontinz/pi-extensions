@@ -53,7 +53,7 @@ With `background:false` it waits and returns the envelope:
   systemPrompt?: string;
   timeoutMs?: number;        // per-agent
   cwd?: string;              // run the agent in this dir (resolved against workflow cwd)
-  isolate?: boolean;         // run in a dedicated git worktree (created from cwd, torn down after)
+  worktree?: boolean;        // run in a dedicated git worktree (default false; requires a git repo)
   mcp?: boolean;             // inject a shared `mcp` gateway tool (process-wide MCP connection pool)
   schema?: { required?: string[]; description?: string };  // JSON validate + retry
   retries?: number;          // schema-validation retries, default 2
@@ -135,17 +135,20 @@ ack or summary. Errors are always shown.
 
 ## Worktree isolation
 
-`agent(task, { isolate: true })` provisions a dedicated detached git worktree from
+`agent(task, { worktree: true })` provisions a dedicated detached git worktree from
 the resolved cwd (honoring `.pi/worktree.json` copy/postCopy config), runs the agent
 there, and tears it down when the agent finishes. Use it for **parallel write-heavy**
 agents that must not share a working tree; read-mostly fan-out is fine on the shared
 cwd (pi serializes same-file writes via `withFileMutationQueue`). Worktree creation
 across the whole process is bounded by a shared slot semaphore
 (`PI_SUBAGENTS_MAX_WORKTREE_CREATIONS`, default 4). The provisioning logic is shared
-with `run_agent` via `subagents/workspace/create-worktree.ts`. **`isolate` requires
-the workflow cwd to be inside a git repository**; in a non-git working dir use the
-default shared cwd (read-mostly fan-out is safe; pi serializes same-file writes).
-If `isolate:true` is used outside a git repo the agent throws a clear, actionable
+with `run_agent` via `subagents/workspace/create-worktree.ts`.
+
+The flag mirrors `run_agent`'s `worktree`, with two intentional differences: here it
+defaults to **`false`** (fan-out shares one working tree) and there is **no `auto`
+mode** — pass `worktree: true` explicitly to opt in. **It requires the workflow cwd
+to be inside a git repository**; in a non-git working dir use the default shared cwd.
+If `worktree: true` is used outside a git repo the agent throws a clear, actionable
 error (surfaced to the user, including on the collapsed failure notice) rather than
 failing obscurely.
 

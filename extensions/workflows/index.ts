@@ -28,9 +28,12 @@ interface AgentOptions {
   /**
    * Run this agent inside a dedicated git worktree (created from the resolved
    * cwd, torn down when the agent finishes). Use for parallel write-heavy
-   * agents that must not share a working tree.
+   * agents that must not share a working tree. Requires a git repo.
+   *
+   * Matches `run_agent`'s `worktree` flag, except the default here is `false`
+   * (fan-out shares one working tree) and there is no `auto` mode.
    */
-  isolate?: boolean;
+  worktree?: boolean;
   /** Give this agent a shared `mcp` gateway tool (forwards to the process-wide MCP pool). */
   mcp?: boolean;
   schema?: AgentSchema;
@@ -151,7 +154,7 @@ export default function workflowsExtension(pi: ExtensionAPI) {
       "Workflow agents run in-process with minimal tools by default: read,bash. Pass opts.tools to widen.",
       "Hooks (async): agent(task, opts) -> result; parallel(items, fn); pipeline(items, fns); workflow(script). Sync: phase(name); log(...); args(); failures().",
       "agent() returns null on failure (recorded in failures()). Pass opts.schema.required for JSON-shape validation + retry.",
-      "Pass opts.isolate:true to run a write-heavy agent in its own git worktree (auto torn down); opts.cwd sets a lightweight shared-tree subdir.",
+      "Pass opts.worktree:true to run a write-heavy agent in its own git worktree (requires a git repo, auto torn down); opts.cwd sets a lightweight shared-tree subdir.",
       "Pass opts.mcp:true to give an agent a shared `mcp` gateway tool (MCP servers are connected once per process and reused across agents).",
       "Return a value from the script to set the workflow output. Pass background:false to wait for the result inline.",
     ],
@@ -388,16 +391,16 @@ export class WorkflowRunner {
     let succeeded = false;
     try {
       let effectiveCwd = baseCwd;
-      if (opts.isolate) {
+      if (opts.worktree) {
         try {
           worktree = await createWorktree(baseCwd, { worktreeOverride: true });
         } catch (error) {
           const detail = error instanceof Error ? error.message : String(error);
-          // Non-git cwd is the common case; rephrase around isolate for the workflow author.
+          // Non-git cwd is the common case; rephrase around worktree for the workflow author.
           throw new Error(
             /not inside one|requires a git repository/i.test(detail)
-              ? `agent ${label}: isolate:true needs a git repository, but "${baseCwd}" is not inside one. Run the workflow from a git repo, or drop isolate to use the shared working directory.`
-              : `agent ${label}: could not create an isolated git worktree: ${detail}`,
+              ? `agent ${label}: worktree:true needs a git repository, but "${baseCwd}" is not inside one. Run the workflow from a git repo, or drop worktree to use the shared working directory.`
+              : `agent ${label}: could not create a dedicated git worktree: ${detail}`,
           );
         }
         effectiveCwd = worktree.cwd;
