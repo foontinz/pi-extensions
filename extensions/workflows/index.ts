@@ -266,7 +266,7 @@ export default function workflowsExtension(pi: ExtensionAPI) {
           deliverCompletion(undefined, { runId, error: message, cancelled: outcome === "cancelled" });
         });
 
-      const ack = `Workflow ${runId} started in the background (${resolved.origin}). A notification will arrive on completion (or stop it with /workflow-stop ${runId}). Script: ${resolved.scriptPath}`;
+      const ack = `Workflow ${runId} started in the background (${resolved.origin}). A notification will arrive on completion (or stop it with stop_workflow runId=${runId}). Script: ${resolved.scriptPath}`;
       return { content: [{ type: "text", text: ack }], details: { runId, status: "running", scriptPath: resolved.scriptPath } };
     },
   });
@@ -302,38 +302,6 @@ export default function workflowsExtension(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("workflow-stop", {
-    description: "Stop a running workflow: /workflow-stop [runId|all]",
-    getArgumentCompletions: (prefix) => {
-      const trimmed = prefix.trim();
-      const candidates = ["all", ...runningWorkflows.keys()];
-      return candidates
-        .filter((value) => value.startsWith(trimmed))
-        .map((value) => ({
-          value,
-          label: value,
-          description: value === "all" ? "stop all running workflows" : "running workflow",
-        }));
-    },
-    handler: async (args, ctx) => {
-      const running = [...runningWorkflows.keys()];
-      if (running.length === 0) {
-        ctx.ui.notify("No running workflows.", "info");
-        return;
-      }
-      const arg = args.trim();
-      if (arg === "" || arg.toLowerCase() === "all") {
-        const count = stopAllWorkflows("stopped from /workflow-stop");
-        ctx.ui.notify(`Stopping ${count} workflow${count === 1 ? "" : "s"}.`, "info");
-        return;
-      }
-      const ok = stopWorkflow(arg, "stopped from /workflow-stop");
-      ctx.ui.notify(
-        ok ? `Stopping workflow ${arg}.` : `No running workflow ${arg}. Running: ${running.join(", ")}.`,
-        ok ? "info" : "warning",
-      );
-    },
-  });
 }
 
 interface ResolvedScript {
@@ -670,7 +638,7 @@ interface WorkflowView {
 }
 
 /**
- * Owns the live `belowEditor` dashboard + footer status for a single run.
+ * Owns the live `belowEditor` dashboard for a single run.
  * Re-renders on every state change and on a spinner tick while running; keeps
  * the finished view visible briefly, then clears it.
  */
@@ -684,13 +652,12 @@ function createWorkflowView(ctx: ExtensionContext, runId: string, origin: string
   const render = (): void => {
     if (!ctx.hasUI || !snap) return;
     const current = snap;
-    ctx.ui.setStatus(key, workflowStatusLine(current));
+    // Dashboard widget only — no footer status line for workflows.
     ctx.ui.setWidget(key, (_tui, theme) => new WorkflowDashboard(current, theme, frame), { placement: "belowEditor" });
   };
 
   const clear = (): void => {
     if (!ctx.hasUI) return;
-    ctx.ui.setStatus(key, undefined);
     ctx.ui.setWidget(key, undefined);
   };
 
@@ -743,15 +710,6 @@ function createWorkflowView(ctx: ExtensionContext, runId: string, origin: string
       expiry.unref?.();
     },
   };
-}
-
-function workflowStatusLine(snap: WorkflowSnapshot): string {
-  if (snap.status === "completed") return `workflow ${snap.runId}: done (${snap.launched} agents${snap.failures ? `, ${snap.failures} failed` : ""})`;
-  if (snap.status === "failed") return `workflow ${snap.runId}: failed`;
-  if (snap.status === "cancelled") return `workflow ${snap.runId}: cancelled`;
-  const running = snap.agents.filter((a) => a.status === "running" || a.status === "retrying").length;
-  const done = snap.agents.filter((a) => a.status === "completed").length;
-  return `workflow ${snap.runId}: ${running} running · ${done}/${snap.launched} done`;
 }
 
 function formatSummary(result: WorkflowResult): string {

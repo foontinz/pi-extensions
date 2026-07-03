@@ -18,8 +18,8 @@ Parameters (provide exactly one script source):
 With `background:true` (default) the tool returns immediately with
 `{ runId, status: "running", scriptPath }` and delivers a `workflow-notification`
 custom message when the run finishes (see [Completion notifications](#completion-notifications)).
-Stop a running background run with the `stop_workflow` tool or the `/workflow-stop`
-command (see [Stopping a run](#stopping-a-run)).
+Stop a running background run with the `stop_workflow` tool (see
+[Stopping a run](#stopping-a-run)).
 With `background:false` it waits and returns the envelope:
 
 ```jsonc
@@ -65,7 +65,7 @@ With `background:false` it waits and returns the envelope:
 ## Live view (TUI)
 
 While a run is active — including background runs — a boxed dashboard is shown
-`belowEditor` and a compact status line in the footer, both keyed per `runId`:
+`belowEditor`, keyed per `runId` (no footer status line):
 
 ```
 ╭─ Workflow a1b2c3d4 ──────────────────────────────────────────╮
@@ -93,16 +93,13 @@ While a run is active — including background runs — a boxed dashboard is sho
 - The view is responsive to terminal width and disappears a few seconds after the
   run finishes. Rendering is driven by `WorkflowRunner.snapshot()` /
   `WorkflowSnapshot`; see `ui/dashboard.ts`. In RPC mode the component factory is
-  ignored (the status line still updates).
+  ignored (no widget is shown).
 
 ## Stopping a run
 
-A background run can be cancelled while in flight:
-
-- **Tool:** `stop_workflow({ runId })` — stops one run; omit `runId` (or pass `"all"`)
-  to stop every running workflow. Optional `reason` is recorded on the run.
-- **Command:** `/workflow-stop [runId|all]` — same, for the user. Argument completion
-  lists the currently running run ids (plus `all`).
+A background run can be cancelled while in flight with the **`stop_workflow`** tool:
+`stop_workflow({ runId })` stops one run; omit `runId` (or pass `"all"`) to stop every
+running workflow. Optional `reason` is recorded on the run.
 
 Stopping aborts the shared `AbortSignal`, which cancels in-flight subagents. The run
 ends as **cancelled** (not failed): a distinct `⊘ cancelled` glyph in the dashboard and
