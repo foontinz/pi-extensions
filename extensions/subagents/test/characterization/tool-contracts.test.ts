@@ -405,10 +405,10 @@ test("run_agent worktree:true refusal at public layer is characterized", async (
   const result = await tools.get("run_agent")!.execute("call", { task: "must isolate", label: "must isolate", cwd, worktree: true, timeoutMs: 0 }, new AbortController().signal, () => {}, ctx);
   assert.match(textOf(result), /^Failed to start background agent agent_/);
   assert.match(textOf(result), /Status: failed/);
-  assert.match(textOf(result), /Error: worktree:true requires cwd to be inside a git repository\./);
+  assert.match(textOf(result), /worktree isolation \(worktree:true\) requires a git repository/);
   assert.equal(result.details.status, "failed");
   assert.equal(result.details.phase, "failed");
-  assert.match(result.details.errorMessage, /worktree:true requires cwd/);
+  assert.match(result.details.errorMessage, /worktree isolation \(worktree:true\) requires a git repository/);
 });
 
 test("tool renderCall/renderResult output is characterized", async () => {

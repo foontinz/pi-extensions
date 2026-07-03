@@ -389,7 +389,17 @@ export class WorkflowRunner {
     try {
       let effectiveCwd = baseCwd;
       if (opts.isolate) {
-        worktree = await createWorktree(baseCwd, { worktreeOverride: true });
+        try {
+          worktree = await createWorktree(baseCwd, { worktreeOverride: true });
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          // Non-git cwd is the common case; rephrase around isolate for the workflow author.
+          throw new Error(
+            /not inside one|requires a git repository/i.test(detail)
+              ? `agent ${label}: isolate:true needs a git repository, but "${baseCwd}" is not inside one. Run the workflow from a git repo, or drop isolate to use the shared working directory.`
+              : `agent ${label}: could not create an isolated git worktree: ${detail}`,
+          );
+        }
         effectiveCwd = worktree.cwd;
       }
       view.status = "running";

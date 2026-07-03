@@ -119,7 +119,12 @@ export async function prepareWorktree(
   const gitRoot = await getGitRootDetailed(sourceCwd);
   if (!gitRoot.ok) {
     if (gitRoot.kind === "not-repo") {
-      if (worktreeOverride === true) throw new Error("worktree:true requires cwd to be inside a git repository.");
+      if (worktreeOverride === true) {
+        throw new Error(
+          `worktree isolation (worktree:true) requires a git repository, but "${sourceCwd}" is not inside one. ` +
+            `Run from a git repo, or set worktree:false to run in-place.`,
+        );
+      }
       return { cwd: sourceCwd };
     }
     const message = formatGitRootError(gitRoot);

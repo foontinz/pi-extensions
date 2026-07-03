@@ -1,4 +1,4 @@
-import { Box, type Component, Text } from "@earendil-works/pi-tui";
+import { Box, type Component, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import type { UsageStats } from "../../subagents/core/types.js";
 
 /** Structured payload attached to the `workflow-notification` custom message. */
@@ -44,6 +44,9 @@ export function renderWorkflowNotification(
   if (details?.failures) bits.push(theme.fg("error", `${details.failures} failed`));
   if (details?.usage) bits.push(theme.fg("muted", `↑${compact(details.usage.input)} ↓${compact(details.usage.output)}`));
   if (details?.usage?.cost) bits.push(theme.fg("muted", `$${details.usage.cost.toFixed(details.usage.cost < 1 ? 3 : 2)}`));
+  // On failure, surface the error inline so it stays visible even when the
+  // notice is collapsed (minimized/medium tool-view mode).
+  if (!ok && details?.error) bits.push(theme.fg("error", truncateToWidth(firstLine(details.error), 100, "…")));
   const summary = bits.length > 0 ? theme.fg("dim", " · ") + bits.join(theme.fg("dim", " · ")) : "";
 
   const box = new Box(1, 0, (t) => theme.bg("customMessageBg", t));
@@ -53,11 +56,14 @@ export function renderWorkflowNotification(
   }
 
   const lines = [head + summary];
-  if (details?.error) lines.push(theme.fg("error", details.error));
   const body = stripTags(content);
   if (body) lines.push(theme.fg("dim", body));
   box.addChild(new Text(lines.join("\n"), 0, 0));
   return box;
+}
+
+function firstLine(text: string): string {
+  return text.split("\n")[0] ?? text;
 }
 
 function stripTags(content: string): string {

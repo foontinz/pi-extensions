@@ -63,7 +63,7 @@ test("worktree override true requires a git repo", async () => {
   try {
     await assert.rejects(
       __subagentsTest.prepareWorktreeForSpawn(temp, "agent_test", {} as any, true),
-      /worktree:true requires cwd to be inside a git repository/,
+      /worktree isolation \(worktree:true\) requires a git repository/,
     );
   } finally {
     await fs.rm(temp, { recursive: true, force: true });

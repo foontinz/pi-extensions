@@ -145,6 +145,9 @@ across the whole process is bounded by a shared slot semaphore
 with `run_agent` via `subagents/workspace/create-worktree.ts`. **`isolate` requires
 the workflow cwd to be inside a git repository**; in a non-git working dir use the
 default shared cwd (read-mostly fan-out is safe; pi serializes same-file writes).
+If `isolate:true` is used outside a git repo the agent throws a clear, actionable
+error (surfaced to the user, including on the collapsed failure notice) rather than
+failing obscurely.
 
 ## Shared MCP gateway
 
