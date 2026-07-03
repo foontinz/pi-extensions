@@ -7,6 +7,9 @@ import { Type } from "typebox";
 import { type InProcessSubagentOptions, runSubagentInProcess } from "../subagents/core/in-process-runner.js";
 import { addUsage, emptyUsageStats, type SubagentResult, type UsageStats } from "../subagents/core/types.js";
 import { createWorktree } from "../subagents/workspace/create-worktree.js";
+import { WorkflowDashboard } from "./ui/dashboard.js";
+import { renderWorkflowNotification, type WorkflowNotificationDetails } from "./ui/notification.js";
+import { renderWorkflowCall, renderWorkflowResult } from "./ui/tool-render.js";
 
 export type AgentExecutor = (options: InProcessSubagentOptions) => Promise<SubagentResult>;
 
@@ -49,11 +52,48 @@ interface WorkflowResult {
   failures: Failure[];
 }
 
+export type WorkflowAgentStatus = "queued" | "running" | "retrying" | "completed" | "failed";
+
+export interface WorkflowAgentView {
+  index: number;
+  label: string;
+  phase?: string;
+  status: WorkflowAgentStatus;
+  attempt: number;
+  maxRetries: number;
+  startedAt?: number;
+  finishedAt?: number;
+  reason?: string;
+}
+
+export interface WorkflowSnapshot {
+  runId: string;
+  origin: string;
+  startedAt: number;
+  finishedAt?: number;
+  status: "running" | "completed" | "failed";
+  phase?: string;
+  phases: string[];
+  agents: WorkflowAgentView[];
+  active: number;
+  queued: number;
+  launched: number;
+  usage: UsageStats;
+  failures: number;
+  rateLimited: boolean;
+  lastMessage?: string;
+}
+
 const DEFAULT_WORKFLOW_TOOLS = ["read", "bash"];
 const MAX_AGENTS = 100;
 const DEFAULT_CONCURRENCY = 8;
 const DEFAULT_WORKFLOW_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_429_RETRIES = 5;
+/** Custom message type used for background completion notices (rendered collapsed). */
+const WORKFLOW_NOTIFICATION_TYPE = "workflow-notification";
+type ToolViewMode = "minimized" | "medium" | "verbose";
+/** How long the finished dashboard lingers before it is cleared. */
+const FINISHED_WIDGET_VISIBLE_MS = 8_000;
 
 interface RunningWorkflow {
   runId: string;
@@ -66,6 +106,15 @@ const runningWorkflows = new Map<string, RunningWorkflow>();
 
 export default function workflowsExtension(pi: ExtensionAPI) {
   piApi = pi;
+
+  // Collapse background completion notices in the transcript, mirroring the
+  // `tool-view` extension and reusing its persisted `mode` flag: minimized /
+  // medium => one tinted line; verbose (or an expanded entry) => full body.
+  pi.registerMessageRenderer<WorkflowNotificationDetails>(WORKFLOW_NOTIFICATION_TYPE, (message, { expanded }, theme) => {
+    const full = expanded || readToolViewMode() === "verbose";
+    const content = typeof message.content === "string" ? message.content : "";
+    return renderWorkflowNotification(message.details, content, full, theme);
+  });
 
   pi.on("session_start", async (_event, ctx) => {
     if (ctx.hasUI) deliveryContext = ctx;
@@ -86,6 +135,17 @@ export default function workflowsExtension(pi: ExtensionAPI) {
       "Runs in the background by default and delivers a notification on completion. Built-in async hooks: agent, parallel, pipeline, workflow, phase, log, args, failures.",
     ].join("\n"),
     promptSnippet: "Run dynamic multi-agent workflows with an explicit user request.",
+    // Collapse the call/result in the transcript unless the shared `tool-view`
+    // flag is `verbose` (or the row is expanded), matching the tool minimizer.
+    renderShell: "self",
+    renderCall(args, theme, ctx) {
+      const full = ctx.expanded || readToolViewMode() === "verbose";
+      return renderWorkflowCall(args, theme, ctx, full);
+    },
+    renderResult(result, options, theme, ctx) {
+      const full = options.expanded || readToolViewMode() === "verbose";
+      return renderWorkflowResult(result, theme, ctx, full);
+    },
     promptGuidelines: [
       "Use only when the user explicitly asks for multi-agent/workflow orchestration; it can spawn many agents and burn tokens.",
       "Workflow agents run in-process with minimal tools by default: read,bash. Pass opts.tools to widen.",
@@ -112,11 +172,13 @@ export default function workflowsExtension(pi: ExtensionAPI) {
 
       const controller = new AbortController();
       runningWorkflows.set(runId, { runId, controller });
+      const view = createWorkflowView(ctx, runId, resolved.origin);
 
       const execRun = async (emit: (message: string) => void): Promise<WorkflowResult> => {
         const linked = linkSignals(background ? undefined : signal, controller.signal);
         const timer = setTimeout(() => controller.abort(new Error(`workflow timed out after ${timeoutMs}ms`)), timeoutMs);
-        const runner = new WorkflowRunner(ctx.cwd, params.args, linked.signal, emit, runSubagentInProcess);
+        const runner = new WorkflowRunner(ctx.cwd, params.args, linked.signal, emit, runSubagentInProcess, view.onState, runId, resolved.origin);
+        view.start();
         try {
           const output = await runner.run(resolved.script);
           return { runId, scriptPath: resolved.scriptPath, output, usage: runner.usage, agents: runner.launchedCount, failures: runner.failuresList };
@@ -128,14 +190,26 @@ export default function workflowsExtension(pi: ExtensionAPI) {
       };
 
       if (!background) {
-        const result = await execRun((message) => onUpdate?.({ content: [{ type: "text", text: message }], details: {} }));
-        return { content: [{ type: "text", text: formatSummary(result) }], details: result };
+        try {
+          const result = await execRun((message) => onUpdate?.({ content: [{ type: "text", text: message }], details: {} }));
+          view.finish("completed", result);
+          return { content: [{ type: "text", text: formatSummary(result) }], details: result };
+        } catch (error) {
+          view.finish("failed");
+          throw error;
+        }
       }
 
       // Background: kick off, return immediately, notify on completion.
       void execRun(() => {})
-        .then((result) => deliverCompletion(result, undefined))
-        .catch((error) => deliverCompletion(undefined, { runId, error: error instanceof Error ? error.message : String(error) }));
+        .then((result) => {
+          view.finish("completed", result);
+          deliverCompletion(result, undefined);
+        })
+        .catch((error) => {
+          view.finish("failed");
+          deliverCompletion(undefined, { runId, error: error instanceof Error ? error.message : String(error) });
+        });
 
       const ack = `Workflow ${runId} started in the background (${resolved.origin}). A notification will arrive on completion. Script: ${resolved.scriptPath}`;
       return { content: [{ type: "text", text: ack }], details: { runId, status: "running", scriptPath: resolved.scriptPath } };
@@ -179,22 +253,48 @@ function persistInlineScript(script: string): string {
 }
 
 function deliverCompletion(result: WorkflowResult | undefined, failure: { runId: string; error: string } | undefined): void {
-  const message = result
+  const content = result
     ? `<workflow-notification>\nWorkflow ${result.runId} completed.\n${formatSummary(result)}\n</workflow-notification>`
     : `<workflow-notification>\nWorkflow ${failure?.runId} failed: ${failure?.error}\n</workflow-notification>`;
+  const details: WorkflowNotificationDetails = result
+    ? { runId: result.runId, status: "completed", agents: result.agents, failures: result.failures.length, usage: result.usage }
+    : { runId: failure?.runId ?? "", status: "failed", error: failure?.error };
   try {
-    piApi?.sendUserMessage(message, { deliverAs: deliveryContext?.isIdle() ? "followUp" : "steer" });
+    // A custom message (not a user message) keeps the full result in LLM context
+    // while letting our registered renderer collapse it in the transcript.
+    piApi?.sendMessage(
+      { customType: WORKFLOW_NOTIFICATION_TYPE, content, display: true, details },
+      { deliverAs: deliveryContext?.isIdle() ? "followUp" : "steer", triggerTurn: true },
+    );
   } catch {
     // Delivery is best-effort; never throw from a background completion.
   }
 }
 
+/** Read the `tool-view` extension's persisted verbosity flag (shared minimize toggle). */
+function readToolViewMode(): ToolViewMode {
+  try {
+    const raw = fs.readFileSync(path.join(getAgentDir(), "tool-view.json"), "utf8");
+    const mode = (JSON.parse(raw) as { mode?: string }).mode;
+    if (mode === "minimized" || mode === "medium" || mode === "verbose") return mode;
+  } catch {
+    // Missing/unreadable prefs — default to collapsed (minimized-like).
+  }
+  return "minimized";
+}
+
 export class WorkflowRunner {
   launchedCount = 0;
   usage: UsageStats = emptyUsageStats();
+  currentPhase?: string;
+  rateLimited = false;
+  readonly startedAt = Date.now();
+  readonly phases: string[] = [];
   private active = 0;
+  private lastMessage?: string;
   private readonly queue: Array<() => void> = [];
   private readonly failures: Failure[] = [];
+  private readonly agentViews = new Map<number, WorkflowAgentView>();
 
   constructor(
     private readonly cwd: string,
@@ -202,10 +302,44 @@ export class WorkflowRunner {
     private readonly signal: AbortSignal,
     private readonly progress: (message: string) => void,
     private readonly executor: AgentExecutor,
+    private readonly onState: (snap: WorkflowSnapshot) => void = () => {},
+    private readonly runId: string = "",
+    private readonly origin: string = "",
   ) {}
 
   get failuresList(): Failure[] {
     return [...this.failures];
+  }
+
+  /** Structured view of the run for live rendering. */
+  snapshot(): WorkflowSnapshot {
+    return {
+      runId: this.runId,
+      origin: this.origin,
+      startedAt: this.startedAt,
+      status: "running",
+      phase: this.currentPhase,
+      phases: [...this.phases],
+      agents: [...this.agentViews.values()].sort((a, b) => a.index - b.index),
+      active: this.active,
+      queued: this.queue.length,
+      launched: this.launchedCount,
+      usage: this.usage,
+      failures: this.failures.length,
+      rateLimited: this.rateLimited,
+      lastMessage: this.lastMessage,
+    };
+  }
+
+  private touch(): void {
+    this.onState(this.snapshot());
+  }
+
+  /** Emit a human-readable progress line and refresh the live snapshot. */
+  private emit(message: string): void {
+    this.lastMessage = message;
+    this.progress(message);
+    this.touch();
   }
 
   async run(script: string): Promise<unknown> {
@@ -220,8 +354,12 @@ export class WorkflowRunner {
           return value;
         })),
       workflow: (nestedScript: string) => this.run(nestedScript),
-      phase: (name: string) => this.progress(`▸ phase: ${name}`),
-      log: (...values: unknown[]) => this.progress(values.map(stringifyLog).join(" ")),
+      phase: (name: string) => {
+        this.currentPhase = name;
+        if (!this.phases.includes(name)) this.phases.push(name);
+        this.emit(`▸ phase: ${name}`);
+      },
+      log: (...values: unknown[]) => this.emit(values.map(stringifyLog).join(" ")),
       args: () => this.workflowArgs,
       failures: () => this.failuresList,
     };
@@ -241,6 +379,10 @@ export class WorkflowRunner {
     const maxRetries = Math.max(0, opts.retries ?? 2);
     const baseCwd = opts.cwd ? path.resolve(this.cwd, opts.cwd) : this.cwd;
 
+    const view: WorkflowAgentView = { index, label, phase: this.currentPhase, status: "queued", attempt: 0, maxRetries };
+    this.agentViews.set(index, view);
+    this.touch();
+
     await this.acquire();
     let worktree: Awaited<ReturnType<typeof createWorktree>> | undefined;
     let succeeded = false;
@@ -250,10 +392,13 @@ export class WorkflowRunner {
         worktree = await createWorktree(baseCwd, { worktreeOverride: true });
         effectiveCwd = worktree.cwd;
       }
-      this.progress(`agent ${label} started`);
+      view.status = "running";
+      view.startedAt = Date.now();
+      this.emit(`agent ${label} started`);
       let lastReason = "no result";
       let prompt = task;
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        view.status = "running";
         const result = await this.runWith429Backoff(prompt, opts, effectiveCwd);
         this.usage = addUsage(this.usage, result.usage);
         // A workflow-level abort (external cancel or the overall timeout) cancels
@@ -270,15 +415,22 @@ export class WorkflowRunner {
         const schemaError = validateSchema(value, opts.schema);
         if (!schemaError) {
           succeeded = true;
-          this.progress(`agent ${label} completed`);
+          view.status = "completed";
+          view.finishedAt = Date.now();
+          this.emit(`agent ${label} completed`);
           return value;
         }
         lastReason = schemaError;
         prompt = `${task}\n\nYour previous response was rejected: ${schemaError}. Return only valid JSON matching the required shape.`;
-        this.progress(`agent ${label} retry ${attempt + 1}/${maxRetries}: ${schemaError}`);
+        view.status = "retrying";
+        view.attempt = attempt + 1;
+        this.emit(`agent ${label} retry ${attempt + 1}/${maxRetries}: ${schemaError}`);
       }
       this.failures.push({ index, label: opts.label, reason: lastReason });
-      this.progress(`agent ${label} failed: ${lastReason}`);
+      view.status = "failed";
+      view.finishedAt = Date.now();
+      view.reason = lastReason;
+      this.emit(`agent ${label} failed: ${lastReason}`);
       return null;
     } finally {
       if (worktree) await worktree.dispose(succeeded ? "completed" : "failed").catch(() => {});
@@ -299,8 +451,11 @@ export class WorkflowRunner {
       });
       if (result.error && isRateLimit(result.error.message) && attempt < MAX_429_RETRIES) {
         const delayMs = Math.min(30_000, 500 * 2 ** attempt) + Math.floor(Math.random() * 250);
-        this.progress(`rate-limited; backing off ${delayMs}ms`);
+        this.rateLimited = true;
+        this.emit(`rate-limited; backing off ${delayMs}ms`);
         await delay(delayMs, this.signal);
+        this.rateLimited = false;
+        this.touch();
         continue;
       }
       return result;
@@ -319,6 +474,7 @@ export class WorkflowRunner {
   private release(): void {
     this.active = Math.max(0, this.active - 1);
     this.queue.shift()?.();
+    this.touch();
   }
 }
 
@@ -374,6 +530,96 @@ function stringifyLog(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+interface WorkflowView {
+  onState: (snap: WorkflowSnapshot) => void;
+  start: () => void;
+  finish: (status: "completed" | "failed", result?: WorkflowResult) => void;
+}
+
+/**
+ * Owns the live `belowEditor` dashboard + footer status for a single run.
+ * Re-renders on every state change and on a spinner tick while running; keeps
+ * the finished view visible briefly, then clears it.
+ */
+function createWorkflowView(ctx: ExtensionContext, runId: string, origin: string): WorkflowView {
+  const key = `workflow:${runId}`;
+  let snap: WorkflowSnapshot | undefined;
+  let frame = 0;
+  let ticker: ReturnType<typeof setInterval> | undefined;
+  let finished = false;
+
+  const render = (): void => {
+    if (!ctx.hasUI || !snap) return;
+    const current = snap;
+    ctx.ui.setStatus(key, workflowStatusLine(current));
+    ctx.ui.setWidget(key, (_tui, theme) => new WorkflowDashboard(current, theme, frame), { placement: "belowEditor" });
+  };
+
+  const clear = (): void => {
+    if (!ctx.hasUI) return;
+    ctx.ui.setStatus(key, undefined);
+    ctx.ui.setWidget(key, undefined);
+  };
+
+  return {
+    onState: (next) => {
+      snap = next;
+      if (!finished) render();
+    },
+    start: () => {
+      if (!ctx.hasUI || ticker) return;
+      ticker = setInterval(() => {
+        frame = (frame + 1) % 10;
+        if (!finished) render();
+      }, 120);
+      ticker.unref?.();
+    },
+    finish: (status, result) => {
+      finished = true;
+      if (ticker) {
+        clearInterval(ticker);
+        ticker = undefined;
+      }
+      const base: WorkflowSnapshot = snap ?? {
+        runId,
+        origin,
+        startedAt: Date.now(),
+        status,
+        phases: [],
+        agents: [],
+        active: 0,
+        queued: 0,
+        launched: result?.agents ?? 0,
+        usage: result?.usage ?? emptyUsageStats(),
+        failures: result?.failures.length ?? 0,
+        rateLimited: false,
+      };
+      snap = {
+        ...base,
+        status,
+        finishedAt: Date.now(),
+        phase: undefined,
+        active: 0,
+        queued: 0,
+        rateLimited: false,
+        usage: result?.usage ?? base.usage,
+        failures: result?.failures.length ?? base.failures,
+      };
+      render();
+      const expiry = setTimeout(clear, FINISHED_WIDGET_VISIBLE_MS);
+      expiry.unref?.();
+    },
+  };
+}
+
+function workflowStatusLine(snap: WorkflowSnapshot): string {
+  if (snap.status === "completed") return `workflow ${snap.runId}: done (${snap.launched} agents${snap.failures ? `, ${snap.failures} failed` : ""})`;
+  if (snap.status === "failed") return `workflow ${snap.runId}: failed`;
+  const running = snap.agents.filter((a) => a.status === "running" || a.status === "retrying").length;
+  const done = snap.agents.filter((a) => a.status === "completed").length;
+  return `workflow ${snap.runId}: ${running} running · ${done}/${snap.launched} done`;
 }
 
 function formatSummary(result: WorkflowResult): string {

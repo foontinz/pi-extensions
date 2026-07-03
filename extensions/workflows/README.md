@@ -16,9 +16,9 @@ Parameters (provide exactly one script source):
 - `background` — run in background and notify on completion (default `true`).
 
 With `background:true` (default) the tool returns immediately with
-`{ runId, status: "running", scriptPath }` and delivers a `<workflow-notification>`
-user message when the run finishes. With `background:false` it waits and returns the
-envelope:
+`{ runId, status: "running", scriptPath }` and delivers a `workflow-notification`
+custom message when the run finishes (see [Completion notifications](#completion-notifications)).
+With `background:false` it waits and returns the envelope:
 
 ```jsonc
 {
@@ -59,6 +59,65 @@ envelope:
   retries?: number;          // schema-validation retries, default 2
 }
 ```
+
+## Live view (TUI)
+
+While a run is active — including background runs — a boxed dashboard is shown
+`belowEditor` and a compact status line in the footer, both keyed per `runId`:
+
+```
+╭─ Workflow a1b2c3d4 ──────────────────────────────────────────╮
+│ ⠸ research › synthesize                  ▰▱▱▱▱▱▱▱ 2/11         │
+│ 8 active · 3 queued · ↑12k ↓4.1k · $0.083 · 1 failed     0:42 │
+├──────────────────────────────────────────────────────────────┤
+│ ✓ crawl-docs      research                              0:12 │
+│ ✗ fetch-legacy    research                   timeout after…  │
+│ ⠸ summarize       synthesize                            0:03 │
+│ ↻ verify          synthesize                       retry 1/2 │
+│ · draft-report    synthesize                          queued │
+│ … 3 more                                                     │
+╰──────────────────────────────────────────────────────────────╯
+```
+
+- The header shows a spinner + a **phase breadcrumb** (`research › synthesize`,
+  current one highlighted) — or `completed`/`failed` when done — plus a progress
+  bar of completed/launched agents and the count.
+- The metrics row shows live concurrency (`active`/`queued`) while running (or the
+  total agent count when finished), rolled-up token usage, cost, failures, a
+  rate-limit flag, and elapsed time (frozen at finish).
+- Agent rows use glyphs: `✓` done · `✗` failed · `↻` retrying · `⠸` running ·
+  `·` queued. Running/retrying/failed agents are prioritized; the rest collapse
+  into a `… N more` line.
+- The view is responsive to terminal width and disappears a few seconds after the
+  run finishes. Rendering is driven by `WorkflowRunner.snapshot()` /
+  `WorkflowSnapshot`; see `ui/dashboard.ts`. In RPC mode the component factory is
+  ignored (the status line still updates).
+
+## Completion notifications
+
+Background runs announce completion by injecting a `workflow-notification`
+**custom message** (via `pi.sendMessage`, not `sendUserMessage`). The full result
+(`formatSummary`) is always kept in LLM context; a registered message renderer
+controls only how the entry looks in the transcript, collapsing it like the
+`tool-view` extension:
+
+```
+✓ Workflow 97e85be8 completed · 5 agents · ↑3.5k ↓376
+```
+
+- **It reuses `tool-view`'s persisted flag** (`~/.pi/agent/tool-view.json` `mode`):
+  `minimized` / `medium` → the one-line summary above; `verbose` → the full body.
+  Toggle it with `/toolview` (no separate setting). When the flag file is absent
+  it defaults to collapsed.
+- Expanding the entry in the TUI always reveals the full body regardless of mode.
+- Failures render with a red `✗` and the error message.
+
+The **`Workflow` tool call/result** itself is collapsed by the same flag too
+(the tool is custom, so `tool-view` cannot manage it directly — the extension
+registers its own `renderCall`/`renderResult`). Collapsed, a background start
+shows `▸ Workflow <id> started · background` and a foreground finish shows
+`✓ Workflow <id> done · N agents · ↑in ↓out`; `verbose`/expanded shows the full
+ack or summary. Errors are always shown.
 
 ## Non-functional behavior
 

@@ -53,6 +53,39 @@ test("schema retry succeeds on second attempt", async () => {
   assert.equal(n, 2);
 });
 
+test("snapshot tracks agent lifecycle, phases and usage", async () => {
+  const snaps: number[] = [];
+  const controller = new AbortController();
+  const runner = new WorkflowRunner(
+    "/tmp",
+    undefined,
+    controller.signal,
+    () => {},
+    async (o) => ok(o.task.toUpperCase()),
+    (snap) => snaps.push(snap.agents.length),
+    "run1234",
+    "inline",
+  );
+  await runner.run(`phase("build"); return await parallel(["a","b"], (x) => agent(x, { label: x }));`);
+  const final = runner.snapshot();
+  assert.equal(final.runId, "run1234");
+  assert.deepEqual(final.phases, ["build"]);
+  assert.equal(final.agents.length, 2);
+  assert.ok(final.agents.every((a) => a.status === "completed"));
+  assert.equal(final.launched, 2);
+  assert.equal(final.usage.input, 20);
+  assert.ok(snaps.length > 0, "onState should be called during the run");
+});
+
+test("snapshot records a failed agent with its reason", async () => {
+  const controller = new AbortController();
+  const runner = new WorkflowRunner("/tmp", undefined, controller.signal, () => {}, async () => fail("boom"), () => {}, "r", "inline");
+  await runner.run(`return await agent("do", { retries: 0, label: "do" });`);
+  const view = runner.snapshot().agents[0];
+  assert.equal(view.status, "failed");
+  assert.match(view.reason ?? "", /boom/);
+});
+
 test("args() exposes the input value", async () => {
   const runner = makeRunner(async () => ok("x"), { topic: "cats" });
   const result = await runner.run(`return args().topic;`);

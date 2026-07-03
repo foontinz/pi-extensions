@@ -30,6 +30,12 @@ bin/
 
 # Skill Loader local state
 /skill-loader/
+
+# Workflow inline-script run artifacts
+/workflows/
+
+# Playwright MCP local state
+.playwright-mcp/
 mcp-npx-cache.json
 npm/
 
