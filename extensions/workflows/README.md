@@ -35,7 +35,7 @@ With `background:false` it waits and returns the envelope:
 
 | hook | sync? | description |
 |------|-------|-------------|
-| `agent(task, opts?)` | async | Run one in-process subagent; returns its JSON output (or text). Returns `null` on failure (recorded in `failures()`). |
+| `agent(task, opts?)` | async | Run one in-process subagent; resolves to its parsed JSON output when the child returned JSON, otherwise the child's **final assistant text** (the last assistant message that carries text, even if the run ends on a tool call). Returns `null` on failure (recorded in `failures()`); a model-side terminal error (`stopReason` error/aborted) is treated as a failure, not a silent empty success. |
 | `parallel(items, fn)` | async | `Promise.all` fan-out over `items`. |
 | `pipeline(items, fns)` | async | Per item, thread the value through `fns` in order. |
 | `workflow(script)` | async | Run a nested workflow script in the same runner. |
@@ -142,7 +142,9 @@ agents that must not share a working tree; read-mostly fan-out is fine on the sh
 cwd (pi serializes same-file writes via `withFileMutationQueue`). Worktree creation
 across the whole process is bounded by a shared slot semaphore
 (`PI_SUBAGENTS_MAX_WORKTREE_CREATIONS`, default 4). The provisioning logic is shared
-with `run_agent` via `subagents/workspace/create-worktree.ts`.
+with `run_agent` via `subagents/workspace/create-worktree.ts`. **`isolate` requires
+the workflow cwd to be inside a git repository**; in a non-git working dir use the
+default shared cwd (read-mostly fan-out is safe; pi serializes same-file writes).
 
 ## Shared MCP gateway
 

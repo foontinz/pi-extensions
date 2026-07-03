@@ -130,6 +130,12 @@ export async function runSubagentInProcess(options: InProcessSubagentOptions): P
         error: { reason: timedOut ? "timeout" : "stop", message: timedOut ? `subagent timed out after ${options.timeoutMs}ms` : "aborted" },
       };
     }
+    // Surface a model-side terminal error (stopReason "error"/"aborted") that would
+    // otherwise be reported as a silent empty-string success.
+    const failure = detectAssistantFailure(messages);
+    if (failure) {
+      return { output, usage: { ...usage, turns }, error: failure };
+    }
     return { output, structuredOutput: parseJsonOutput(output), usage: { ...usage, turns } };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -157,20 +163,55 @@ function normalizeUsage(value: unknown): UsageStats {
   return usage;
 }
 
-function extractLastAssistantText(messages: readonly unknown[]): string {
+/**
+ * The subagent's textual output. Scans backwards for the most recent assistant
+ * message that actually carries text.
+ *
+ * A run can end with the terminal assistant message being tool-calls-only (no
+ * text block) — e.g. the loop stopped right after a tool call, or the model
+ * emitted only a `thinking` block. Returning that message's (empty) text made
+ * `agent()` resolve to "" even though earlier assistant turns had content. We
+ * therefore skip text-less assistant messages and fall back to the last one
+ * that has a non-empty text block.
+ */
+export function extractLastAssistantText(messages: readonly unknown[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i] as { role?: unknown; content?: unknown };
     if (message.role !== "assistant") continue;
-    if (typeof message.content === "string") return message.content;
-    if (Array.isArray(message.content)) {
-      return message.content
-        .filter((block): block is { type: string; text: string } =>
-          Boolean(block) && typeof block === "object" && (block as { type?: unknown }).type === "text" && typeof (block as { text?: unknown }).text === "string")
-        .map((block) => block.text)
-        .join("\n");
-    }
+    const text = assistantMessageText(message.content);
+    if (text.trim().length > 0) return text;
   }
   return "";
+}
+
+function assistantMessageText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((block): block is { type: string; text: string } =>
+        Boolean(block) && typeof block === "object" && (block as { type?: unknown }).type === "text" && typeof (block as { text?: unknown }).text === "string")
+      .map((block) => block.text)
+      .join("\n");
+  }
+  return "";
+}
+
+/**
+ * Inspect the terminal assistant message for a model-side failure that the
+ * one-shot runner would otherwise swallow (returning an empty success). Maps
+ * `stopReason` "error" -> error and "aborted" -> stop so `WorkflowRunner` records
+ * it in `failures()` instead of counting an inert run as a success.
+ */
+export function detectAssistantFailure(messages: readonly unknown[]): { reason: TerminalReason; message: string } | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i] as { role?: unknown; stopReason?: unknown; errorMessage?: unknown };
+    if (message.role !== "assistant") continue;
+    const errorMessage = typeof message.errorMessage === "string" ? message.errorMessage : undefined;
+    if (message.stopReason === "error") return { reason: "error", message: errorMessage ?? "assistant returned an error" };
+    if (message.stopReason === "aborted") return { reason: "stop", message: errorMessage ?? "assistant was aborted" };
+    return undefined; // Most recent assistant message finished normally.
+  }
+  return undefined;
 }
 
 function countAssistantTurns(messages: readonly unknown[]): number {
