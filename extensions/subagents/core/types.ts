@@ -72,6 +72,8 @@ export interface SubagentResult {
   usage: UsageStats;
   error?: { reason: TerminalReason; message: string };
   truncated?: boolean;
+  /** Path to the persisted session transcript (JSONL), when the run persisted to disk. */
+  sessionFile?: string;
 }
 
 export const USAGE_STAT_KEYS = ["input", "output", "cacheRead", "cacheWrite", "cost", "contextTokens", "turns"] as const satisfies ReadonlyArray<keyof UsageStats>;

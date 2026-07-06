@@ -29,6 +29,7 @@ import {
   JOB_STORE_ROOT,
   jobExitCodePathForStore,
   jobLogPathForStore,
+  jobSessionDirForStore,
   jobStatePathForStore,
   storePathsForOwner,
   withJobFileLock,
@@ -36,6 +37,7 @@ import {
   writeTextAtomicForStore,
   type JobStorePaths,
 } from "./core/job-store.js";
+import { DEFAULT_RUN_RETENTION_MS, pruneOldRuns } from "./core/run-archive.js";
 import { reduceJobEvent } from "./core/state-machine.js";
 import { disposeSharedMcpGateway } from "./mcp/gateway.js";
 import { startInProcessAgent, type InProcessHandle, type InProcessOutcome } from "./supervisor/in-process-supervisor.js";
@@ -369,6 +371,8 @@ async function handleSubagentsSessionStart(ctx: ExtensionContext): Promise<void>
   bindOwner(nextOwner);
   statusContext = ctx;
   cleanupLegacyRootStore();
+  // Age out old persisted transcripts for this owner (retention: DEFAULT_RUN_RETENTION_MS).
+  if (currentStorePaths) pruneOldRuns(currentStorePaths.sessionsDir, DEFAULT_RUN_RETENTION_MS);
   loadPersistedJobs();
   await stopRunningJobsForSessionBoundary("cancelled because subagents are bounded to the parent Pi session and the previous session ended", 0);
   scheduleRunningJobTimeouts();
@@ -404,6 +408,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       `Omit tools for the portable safe read-only default (${DEFAULT_SUBAGENT_TOOLS.join(", ")} when active); do not explicitly pass grep/find/ls unless they are active in the parent session. Pass tools explicitly only when the subagent needs additional capabilities, for example read+bash when shell access is acceptable. Do not grant recursive subagent tools to child agents.`,
       "Do not set the model parameter unless the user explicitly requests a specific model/provider; omit it to use the child Pi default and avoid provider/API-key mismatches.",
       "Subagents do not inherit the parent conversation; include all necessary context in the task, systemPrompt, named agent, files, or repo context.",
+      "Each subagent persists its full session transcript (JSONL) under the Transcript directory shown in the start result and finish callback; read/grep it to inspect progress or what the agent actually did. Don't poll — the final result arrives via callback.",
     ],
     parameters: RunAgentParams,
 
@@ -588,8 +593,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
 }
 
+/** Isolated directory where a job's full session transcript(s) are persisted. */
+function jobTranscriptDir(job: AgentJob): string {
+  return jobSessionDirForStore(storePathsForOwner(job.owner), job.id);
+}
+
+/** True once at least one transcript file has actually been written for the job. */
+function jobHasTranscript(job: AgentJob): boolean {
+  try {
+    const dir = jobTranscriptDir(job);
+    return fs.existsSync(dir) && fs.readdirSync(dir).length > 0;
+  } catch {
+    return false;
+  }
+}
+
 function formatRunAgentStartResult(job: AgentJob): string {
-  return renderRunAgentStartResult(job, SUGGESTED_POLL_INTERVAL_MS);
+  return renderRunAgentStartResult({ ...job, transcriptDir: jobTranscriptDir(job) });
 }
 
 function formatListAgentsResult(agents: AgentConfig[]): string {
@@ -816,6 +836,9 @@ function launchInProcessJob(job: AgentJob, opts: { combinedPrompt: string; model
       model: opts.model,
       thinking: opts.thinking,
       appendSystemPrompt: opts.combinedPrompt || undefined,
+      // Persist the full transcript into an isolated per-job dir (read/grep-able).
+      sessionDir: jobTranscriptDir(job),
+      sessionId: job.id,
       onEvent: (event) => {
         processEvent(job, event as any);
         refreshSubagentStatus();
@@ -1727,6 +1750,9 @@ function formatSubagentFinishedCallback(job: AgentJob): string {
     `Label: ${job.label}`,
     `CWD: ${job.cwd}`,
     `Runtime: ${formatJobRuntime(job)}`,
+    jobHasTranscript(job)
+      ? `Transcript: ${jobTranscriptDir(job)} (read/grep the JSONL session for full detail)`
+      : "Transcript: (none captured — the agent produced no output)",
   ];
   if (job.exitCode !== undefined) lines.push(`Exit code: ${job.exitCode}`);
   if (job.signal) lines.push(`Signal: ${job.signal}`);

@@ -178,6 +178,23 @@ tools; `{ search }` → find tools; `{ describe }` → show a tool's parameters;
 session shutdown. Only stdio (`command`) and HTTP (`url`, optional `bearer`) servers are
 supported; interactive-only concerns (OAuth login, elicitation UI) are out of scope.
 
+## Run artifacts (read/grep, no extra tool)
+
+Every run gets an **isolated directory** at `<agentDir>/workflows/runs/<runId>/`, returned
+in the background ack and the completion notification (`runDir`). Instead of a dedicated
+status tool, the agent inspects a run on demand with the existing `read` / `grep` tools:
+
+- `events.log` — a timestamped **timeline** of the run: `phase:` markers, `agent X
+  started/completed/failed`, retries, rate-limit backoff, and an `agent … transcript:
+  agents/<file>` mapping line tying each agent to its transcript.
+- `agents/*.jsonl` — each agent's **full native session transcript** (user turn,
+  assistant text, tool calls, thinking, outputs), persisted incrementally via
+  `SessionManager.create` (filenames are `<timestamp>_<runId>-a<index>.jsonl`).
+
+This is on-demand only — don't poll; completion still arrives via the notification.
+Artifacts are **pruned on session start** after 3 days
+(`DEFAULT_RUN_RETENTION_MS`, shared with `subagents/core/run-archive.ts`).
+
 ## Out of scope (v1)
 
 - VM **sandboxing** (the script is trusted, model-authored on explicit opt-in).

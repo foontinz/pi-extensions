@@ -33,6 +33,13 @@ export interface InProcessStartOptions {
    * coding system prompt, matching the subprocess `--append-system-prompt` behavior.
    */
   appendSystemPrompt?: string;
+  /**
+   * Persist the agent's full session transcript (JSONL) into this directory
+   * instead of running in-memory, so it can be read/grepped after the fact.
+   */
+  sessionDir?: string;
+  /** Explicit session id (controls the transcript filename suffix). */
+  sessionId?: string;
   onEvent: (event: AgentSessionEvent) => void;
   onDone: (outcome: InProcessOutcome) => void;
 }
@@ -80,7 +87,9 @@ export function startInProcessAgent(options: InProcessStartOptions): InProcessHa
         tools: toolAllowlist,
         noTools: toolAllowlist && toolAllowlist.length === 0 ? "all" : undefined,
         customTools: customTools.length > 0 ? customTools : undefined,
-        sessionManager: SessionManager.inMemory(options.cwd),
+        sessionManager: options.sessionDir
+          ? SessionManager.create(options.cwd, options.sessionDir, options.sessionId ? { id: options.sessionId } : undefined)
+          : SessionManager.inMemory(options.cwd),
         settingsManager: SettingsManager.create(options.cwd, getAgentDir()),
       });
       session = created.session;

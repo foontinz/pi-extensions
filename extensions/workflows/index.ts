@@ -5,6 +5,7 @@ import vm from "node:vm";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type InProcessSubagentOptions, runSubagentInProcess } from "../subagents/core/in-process-runner.js";
+import { DEFAULT_RUN_RETENTION_MS, pruneOldRuns } from "../subagents/core/run-archive.js";
 import { addUsage, emptyUsageStats, type SubagentResult, type UsageStats } from "../subagents/core/types.js";
 import { createWorktree } from "../subagents/workspace/create-worktree.js";
 import { WorkflowDashboard } from "./ui/dashboard.js";
@@ -49,10 +50,17 @@ interface Failure {
 interface WorkflowResult {
   runId: string;
   scriptPath: string;
+  /** Isolated directory holding this run's event log + per-agent transcripts (read/grep). */
+  runDir: string;
   output: unknown;
   usage: UsageStats;
   agents: number;
   failures: Failure[];
+}
+
+/** Absolute path to a run's isolated artifact directory under <agentDir>/workflows/runs/<runId>/. */
+function runDirFor(runId: string): string {
+  return path.join(getAgentDir(), "workflows", "runs", runId);
 }
 
 export type WorkflowAgentStatus = "queued" | "running" | "retrying" | "completed" | "failed";
@@ -150,6 +158,8 @@ export default function workflowsExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     if (ctx.hasUI) deliveryContext = ctx;
+    // Age out old run artifacts (event logs + per-agent transcripts).
+    pruneOldRuns(path.join(getAgentDir(), "workflows", "runs"), DEFAULT_RUN_RETENTION_MS);
   });
 
   pi.on("session_shutdown", async () => {
@@ -199,6 +209,8 @@ export default function workflowsExtension(pi: ExtensionAPI) {
       if (ctx.hasUI) deliveryContext = ctx;
       const resolved = resolveScript(ctx.cwd, params);
       const runId = randomUUID().slice(0, 8);
+      const runDir = runDirFor(runId);
+      try { fs.mkdirSync(runDir, { recursive: true }); } catch { /* best-effort */ }
       const background = params.background ?? true;
       const timeoutMs = params.timeoutMs ?? DEFAULT_WORKFLOW_TIMEOUT_MS;
 
@@ -229,11 +241,11 @@ export default function workflowsExtension(pi: ExtensionAPI) {
           runEntry.timedOut = true;
           controller.abort(new Error(`workflow timed out after ${timeoutMs}ms`));
         }, timeoutMs);
-        const runner = new WorkflowRunner(ctx.cwd, params.args, linked.signal, emit, runSubagentInProcess, view.onState, runId, resolved.origin);
+        const runner = new WorkflowRunner(ctx.cwd, params.args, linked.signal, emit, runSubagentInProcess, view.onState, runId, resolved.origin, runDir);
         view.start();
         try {
           const output = await runner.run(resolved.script);
-          return { runId, scriptPath: resolved.scriptPath, output, usage: runner.usage, agents: runner.launchedCount, failures: runner.failuresList };
+          return { runId, scriptPath: resolved.scriptPath, runDir, output, usage: runner.usage, agents: runner.launchedCount, failures: runner.failuresList };
         } finally {
           clearTimeout(timer);
           // Abort the shared signal so any still-in-flight sibling subagents are
@@ -275,8 +287,8 @@ export default function workflowsExtension(pi: ExtensionAPI) {
           deliverCompletion(undefined, { runId, error: message, cancelled: outcome === "cancelled" });
         });
 
-      const ack = `Workflow ${runId} started in the background (${resolved.origin}). A notification will arrive on completion (or stop it with stop_workflow runId=${runId}). Script: ${resolved.scriptPath}`;
-      return { content: [{ type: "text", text: ack }], details: { runId, status: "running", scriptPath: resolved.scriptPath } };
+      const ack = `Workflow ${runId} started in the background (${resolved.origin}). A notification will arrive on completion (or stop it with stop_workflow runId=${runId}). Script: ${resolved.scriptPath}. Live artifacts (read/grep as needed): ${runDir} (events.log timeline + agents/ per-agent transcripts).`;
+      return { content: [{ type: "text", text: ack }], details: { runId, status: "running", scriptPath: resolved.scriptPath, runDir } };
     },
   });
 
@@ -403,7 +415,19 @@ export class WorkflowRunner {
     private readonly onState: (snap: WorkflowSnapshot) => void = () => {},
     private readonly runId: string = "",
     private readonly origin: string = "",
+    /** When set, an `events.log` timeline is appended here and agent transcripts land in `<logDir>/agents/`. */
+    private readonly logDir?: string,
   ) {}
+
+  /** Append one timestamped line to the run's `events.log` (best-effort; file-only). */
+  private writeLog(line: string): void {
+    if (!this.logDir) return;
+    try {
+      fs.appendFileSync(path.join(this.logDir, "events.log"), `${new Date().toISOString()} ${line}\n`);
+    } catch {
+      // Logging is best-effort; never let it break a run.
+    }
+  }
 
   get failuresList(): Failure[] {
     return [...this.failures];
@@ -437,6 +461,7 @@ export class WorkflowRunner {
   private emit(message: string): void {
     this.lastMessage = message;
     this.progress(message);
+    this.writeLog(message);
     this.touch();
   }
 
@@ -505,10 +530,16 @@ export class WorkflowRunner {
       this.emit(`agent ${label} started`);
       let lastReason = "no result";
       let prompt = task;
+      // Persist each agent's full transcript into <logDir>/agents/ so it can be
+      // read/grepped after the fact. Filenames are timestamp-prefixed; the
+      // events.log mapping line below ties an agent label/index to its file.
+      const sessionDir = this.logDir ? path.join(this.logDir, "agents") : undefined;
+      const sessionId = this.logDir ? `${this.runId || "run"}-a${index}` : undefined;
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
         view.status = "running";
-        const result = await this.runWith429Backoff(prompt, opts, effectiveCwd);
+        const result = await this.runWith429Backoff(prompt, opts, effectiveCwd, sessionDir, sessionId);
         this.usage = addUsage(this.usage, result.usage);
+        if (result.sessionFile) this.writeLog(`agent ${label} (#${index}) transcript: agents/${path.basename(result.sessionFile)}`);
         // A workflow-level abort (external cancel or the overall timeout) cancels
         // in-flight agents via the shared signal. Surface it as a rejection so the
         // run fails loudly instead of resolving with silent nulls. A *per-agent*
@@ -546,7 +577,7 @@ export class WorkflowRunner {
     }
   }
 
-  private async runWith429Backoff(task: string, opts: AgentOptions, cwd: string) {
+  private async runWith429Backoff(task: string, opts: AgentOptions, cwd: string, sessionDir?: string, sessionId?: string) {
     for (let attempt = 0; ; attempt++) {
       const result = await this.executor({
         task,
@@ -556,6 +587,8 @@ export class WorkflowRunner {
         timeoutMs: opts.timeoutMs,
         mcp: opts.mcp,
         signal: this.signal,
+        sessionDir,
+        sessionId,
       });
       if (result.error && isRateLimit(result.error.message) && attempt < MAX_429_RETRIES) {
         const delayMs = Math.min(30_000, 500 * 2 ** attempt) + Math.floor(Math.random() * 250);
@@ -731,6 +764,7 @@ function formatSummary(result: WorkflowResult): string {
   const lines = [
     `agents: ${result.agents}, failures: ${result.failures.length}`,
     `usage: ↑${result.usage.input} ↓${result.usage.output} turns=${result.usage.turns}${result.usage.cost ? ` $${result.usage.cost.toFixed(4)}` : ""}`,
+    `artifacts: ${result.runDir} (events.log + agents/*.jsonl — read/grep for details)`,
     "",
     JSON.stringify(result.output, null, 2),
   ];

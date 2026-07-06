@@ -8,9 +8,11 @@ export interface RunAgentStartJobView {
   effectiveTools: string[];
   errorMessage?: string;
   cwd: string;
+  /** Isolated dir where the agent's full transcript is persisted (read/grep). */
+  transcriptDir?: string;
 }
 
-export function formatRunAgentStartResult(job: RunAgentStartJobView, _suggestedPollIntervalMs: number): string {
+export function formatRunAgentStartResult(job: RunAgentStartJobView): string {
   const lines = [
     job.status === "running" ? `Started background agent ${job.id}.` : `Failed to start background agent ${job.id}.`,
     `Status: ${job.status}`,
@@ -21,8 +23,9 @@ export function formatRunAgentStartResult(job: RunAgentStartJobView, _suggestedP
   if (job.status !== "running" && job.errorMessage) {
     lines.push(`Error: ${compactPreview(job.errorMessage, 500, 3)}`);
   }
+  lines.push(`CWD: ${job.cwd}`);
+  if (job.transcriptDir) lines.push(`Transcript (written as the agent runs): ${job.transcriptDir} (read/grep the JSONL session to inspect progress or what the agent did)`);
   lines.push(
-    `CWD: ${job.cwd}`,
     "",
     "The final result will be sent back to this Pi session when the subagent finishes.",
   );

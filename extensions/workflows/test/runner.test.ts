@@ -141,6 +141,77 @@ test("worktree runs the agent in a dedicated worktree and tears it down", async 
   }
 });
 
+test("logDir: writes an events.log timeline and forwards per-agent sessionDir/sessionId", async () => {
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), "wf-log-"));
+  try {
+    const seen: Array<{ sessionDir?: string; sessionId?: string }> = [];
+    const controller = new AbortController();
+    const runner = new WorkflowRunner(
+      "/base",
+      undefined,
+      controller.signal,
+      () => {},
+      async (o) => {
+        seen.push({ sessionDir: o.sessionDir, sessionId: o.sessionId });
+        return { output: "ok", usage: emptyUsageStats(), sessionFile: path.join(o.sessionDir ?? "", "2026_x.jsonl") };
+      },
+      () => {},
+      "run1234",
+      "inline",
+      logDir,
+    );
+    await runner.run(`phase("build"); return await agent("a", { label: "first" });`);
+
+    assert.equal(seen[0].sessionDir, path.join(logDir, "agents"));
+    assert.equal(seen[0].sessionId, "run1234-a0");
+
+    const log = fs.readFileSync(path.join(logDir, "events.log"), "utf8");
+    assert.match(log, /phase: build/);
+    assert.match(log, /agent first started/);
+    assert.match(log, /agent first \(#0\) transcript: agents\/2026_x\.jsonl/);
+    assert.match(log, /agent first completed/);
+  } finally {
+    fs.rmSync(logDir, { recursive: true, force: true });
+  }
+});
+
+test("logDir: parallel agents each get a distinct transcript mapping in events.log", async () => {
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), "wf-log-par-"));
+  try {
+    const controller = new AbortController();
+    const runner = new WorkflowRunner(
+      "/base",
+      undefined,
+      controller.signal,
+      () => {},
+      async (o) => ({ output: "ok", usage: emptyUsageStats(), sessionFile: path.join(o.sessionDir ?? "", `t_${o.sessionId}.jsonl`) }),
+      () => {},
+      "runpar12",
+      "inline",
+      logDir,
+    );
+    await runner.run(`return await parallel(["a","b","c"], (x) => agent(x, { label: x }));`);
+    const log = fs.readFileSync(path.join(logDir, "events.log"), "utf8");
+    for (const i of [0, 1, 2]) {
+      assert.match(log, new RegExp(`transcript: agents/t_runpar12-a${i}\\.jsonl`), `agent #${i} mapped`);
+    }
+  } finally {
+    fs.rmSync(logDir, { recursive: true, force: true });
+  }
+});
+
+test("no logDir: no sessionDir/sessionId forwarded and no events.log written", async () => {
+  const seen: Array<{ sessionDir?: string; sessionId?: string }> = [];
+  const controller = new AbortController();
+  const runner = new WorkflowRunner("/base", undefined, controller.signal, () => {}, async (o) => {
+    seen.push({ sessionDir: o.sessionDir, sessionId: o.sessionId });
+    return ok("x");
+  }, () => {}, "run1234", "inline");
+  await runner.run(`return await agent("a");`);
+  assert.equal(seen[0].sessionDir, undefined);
+  assert.equal(seen[0].sessionId, undefined);
+});
+
 test("aborted workflow stops launching agents", async () => {
   const controller = new AbortController();
   controller.abort();

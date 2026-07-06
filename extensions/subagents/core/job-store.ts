@@ -8,6 +8,8 @@ export interface JobStorePaths {
   root: string;
   jobsDir: string;
   logsDir: string;
+  /** Full per-job session transcripts (JSONL), one dir per job. */
+  sessionsDir: string;
 }
 
 export const JOB_STORE_ROOT = process.env.PI_SUBAGENTS_STORE_DIR
@@ -20,11 +22,11 @@ const JOB_LOCK_WAIT_MS = 2_000;
 
 export function storePathsForOwner(owner: JobOwnerInfo): JobStorePaths {
   const root = path.join(JOB_OWNERS_DIR, owner.id);
-  return { root, jobsDir: path.join(root, "jobs"), logsDir: path.join(root, "logs") };
+  return { root, jobsDir: path.join(root, "jobs"), logsDir: path.join(root, "logs"), sessionsDir: path.join(root, "sessions") };
 }
 
 export function ensureJobStoreDirsFor(store: JobStorePaths): void {
-  for (const dir of [JOB_STORE_ROOT, JOB_OWNERS_DIR, store.root, store.jobsDir, store.logsDir]) {
+  for (const dir of [JOB_STORE_ROOT, JOB_OWNERS_DIR, store.root, store.jobsDir, store.logsDir, store.sessionsDir]) {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     try {
       fs.chmodSync(dir, 0o700);
@@ -44,6 +46,11 @@ export function jobLogPathForStore(store: JobStorePaths, id: string, stream: "st
 
 export function jobExitCodePathForStore(store: JobStorePaths, id: string): string {
   return path.join(store.logsDir, `${id}.exit`);
+}
+
+/** Isolated directory holding one job's full session transcript(s) (JSONL). */
+export function jobSessionDirForStore(store: JobStorePaths, id: string): string {
+  return path.join(store.sessionsDir, id);
 }
 
 export function callbackMarkerPathForStore(store: JobStorePaths, id: string): string {

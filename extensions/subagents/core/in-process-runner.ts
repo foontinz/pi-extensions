@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import {
   AuthStorage,
   createAgentSession,
@@ -62,6 +63,14 @@ export interface InProcessSubagentOptions {
   mcp?: boolean;
   /** External abort (e.g. the workflow signal). Triggers session.abort(). */
   signal?: AbortSignal;
+  /**
+   * Persist the agent's full session transcript (JSONL) into this directory
+   * instead of running in-memory. Enables after-the-fact read/grep of what the
+   * agent actually did (tool calls, thinking, outputs).
+   */
+  sessionDir?: string;
+  /** Explicit session id (controls the transcript filename suffix). */
+  sessionId?: string;
 }
 
 export function createBareResourceLoader(systemPrompt?: string, appendSystemPrompt: readonly string[] = []): ResourceLoader {
@@ -84,7 +93,16 @@ export async function runSubagentInProcess(options: InProcessSubagentOptions): P
   }
 
   const { authStorage, modelRegistry } = getSharedHandles();
-  const sessionManager = SessionManager.inMemory(options.cwd);
+  const sessionManager = options.sessionDir
+    ? SessionManager.create(options.cwd, options.sessionDir, options.sessionId ? { id: options.sessionId } : undefined)
+    : SessionManager.inMemory(options.cwd);
+  // The transcript file is created lazily on the first assistant message
+  // (SessionManager._persist). Only report it once it actually exists on disk,
+  // so callers never advertise a read/grep path for a run that produced nothing.
+  const persistedTranscript = (): string | undefined => {
+    const file = sessionManager.getSessionFile();
+    return file && fs.existsSync(file) ? file : undefined;
+  };
 
   const customTools: ToolDefinition[] = [];
   let toolAllowlist = options.tools ? [...options.tools] : undefined;
@@ -127,6 +145,7 @@ export async function runSubagentInProcess(options: InProcessSubagentOptions): P
       return {
         output,
         usage: { ...usage, turns },
+        sessionFile: persistedTranscript(),
         error: { reason: timedOut ? "timeout" : "stop", message: timedOut ? `subagent timed out after ${options.timeoutMs}ms` : "aborted" },
       };
     }
@@ -134,13 +153,13 @@ export async function runSubagentInProcess(options: InProcessSubagentOptions): P
     // otherwise be reported as a silent empty-string success.
     const failure = detectAssistantFailure(messages);
     if (failure) {
-      return { output, usage: { ...usage, turns }, error: failure };
+      return { output, usage: { ...usage, turns }, sessionFile: persistedTranscript(), error: failure };
     }
-    return { output, structuredOutput: parseJsonOutput(output), usage: { ...usage, turns } };
+    return { output, structuredOutput: parseJsonOutput(output), usage: { ...usage, turns }, sessionFile: persistedTranscript() };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const reason: TerminalReason = timedOut ? "timeout" : externallyAborted ? "stop" : "error";
-    return { output: "", usage: emptyUsageStats(), error: { reason, message } };
+    return { output: "", usage: emptyUsageStats(), sessionFile: persistedTranscript(), error: { reason, message } };
   } finally {
     if (timeout) clearTimeout(timeout);
     options.signal?.removeEventListener("abort", onAbort);

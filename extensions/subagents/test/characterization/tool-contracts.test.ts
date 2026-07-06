@@ -269,6 +269,12 @@ test("run_agent default in-process supervisor start + completion is characterize
     // The combined append prompt carries the JSON addendum.
     assert.match(captured.appendSystemPrompt, /Return only valid JSON/);
     assert.deepEqual(captured.tools, ["read", "grep", "find", "ls"]);
+    // Transcript persistence wiring: an isolated per-job sessions dir + the job id
+    // as the session id, and the start result advertises the transcript path.
+    assert.equal(captured.sessionId, started.details.id);
+    assert.ok(captured.sessionDir.startsWith(path.join(process.env.PI_SUBAGENTS_STORE_DIR!, "owners")), `sessionDir under owners store: ${captured.sessionDir}`);
+    assert.ok(captured.sessionDir.endsWith(path.join("sessions", started.details.id)), `sessionDir is an isolated per-job sessions dir: ${captured.sessionDir}`);
+    assert.match(textOf(started), /Transcript \(written as the agent runs\): .*[/\\]sessions[/\\]/);
 
     await new Promise((resolve) => setTimeout(resolve, 20));
     const job = __subagentsTest.getJob(started.details.id);
