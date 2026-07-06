@@ -28,6 +28,9 @@ bin/
 .envvar-registry*.json
 .debug-hooks.log
 
+# Usage extension per-file cache
+usage-cache.json
+
 # Skill Loader local state
 /skill-loader/
 
