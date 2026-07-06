@@ -1,0 +1,15 @@
+{
+  "name": "pi-tooling",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Standalone maintenance/benchmark scripts (run with npx tsx), not pi extensions.",
+  "scripts": {
+    "bench": "tsx bench-models.ts",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.1",
+    "typescript": "^6.0.3"
+  }
+}
