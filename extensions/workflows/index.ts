@@ -171,12 +171,13 @@ export default function workflowsExtension(pi: ExtensionAPI) {
     name: "Workflow",
     label: "Workflow",
     description: [
-      "Execute a workflow script that orchestrates multiple in-process subagents.",
+      "Execute a workflow script that orchestrates multiple in-process subagents — your go-to tool for anything that fans out.",
+      "REACH FOR THIS FIRST whenever a task splits into independent parts: multi-file edits/reviews, codebase-wide search+analysis, per-package/per-service work, batch refactors, migrations, test generation, doc sweeps, or any 'do X for each of these' request. Parallel subagents finish far faster than doing it yourself sequentially, and each gets its own context window so you avoid bloating this one.",
       "Provide the script via `script` (inline), `scriptPath` (a file), or `name` (a saved workflow).",
       "Inline scripts are persisted to a file; the path is returned so you can edit + re-invoke with `scriptPath`.",
       "Runs in the background by default and delivers a notification on completion. Built-in async hooks: agent, parallel, pipeline, workflow, phase, log, args, failures.",
     ].join("\n"),
-    promptSnippet: "Run dynamic multi-agent workflows with an explicit user request.",
+    promptSnippet: "Fan work out across parallel subagents — prefer this for any multi-part/parallelizable task.",
     // Collapse the call/result in the transcript unless the shared `tool-view`
     // flag is `verbose` (or the row is expanded), matching the tool minimizer.
     renderShell: "self",
@@ -189,7 +190,9 @@ export default function workflowsExtension(pi: ExtensionAPI) {
       return renderWorkflowResult(result, theme, ctx, full);
     },
     promptGuidelines: [
-      "Use only when the user explicitly asks for multi-agent/workflow orchestration; it can spawn many agents and burn tokens.",
+      "Proactively prefer a Workflow whenever a task has independent parts you could split — don't wait to be asked. If you catch yourself about to do the same kind of step repeatedly (per file/module/service/item), fan it out with parallel() instead.",
+      "Good fits: parallel code review, repo-wide search+summarize, batch refactors/migrations, generating tests or docs across many files, comparing approaches, multi-step pipelines. A quick planning phase() then parallel() agents usually beats sequential hand work.",
+      "It does spawn multiple agents and use tokens, so match the agent count to the work (a handful for small jobs, more for big fan-outs) rather than avoiding it — the parallelism and isolated context windows are the point.",
       "Workflow agents run in-process with minimal tools by default: read,bash. Pass opts.tools to widen.",
       "Hooks (async): agent(task, opts) -> result; parallel(items, fn); pipeline(items, fns); workflow(script). Sync: phase(name); log(...); args(); failures().",
       "agent() returns null on failure (recorded in failures()). Pass opts.schema.required for JSON-shape validation + retry.",

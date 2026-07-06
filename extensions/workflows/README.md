@@ -4,6 +4,24 @@ Always-available `Workflow` tool that orchestrates multiple **in-process**
 subagents (via the SDK `createAgentSession`, no `pi` subprocess / tmux). Depends on
 the `subagents` extension's in-process runner.
 
+## When to use it (reach for this first)
+
+Prefer a `Workflow` **proactively** — don't wait to be explicitly asked — whenever
+a task splits into independent parts. If you're about to repeat the same kind of
+step across many files/modules/services/items, fan it out instead. Strong fits:
+
+- Parallel code review or repo-wide search + summarize
+- Batch refactors / migrations / codemods across many files
+- Generating tests or docs for many modules at once
+- Comparing multiple approaches in parallel
+- Multi-step pipelines (a planning `phase()` then `parallel()` agents)
+
+Parallel subagents finish far faster than sequential hand-work, and each gets its
+own context window so this session stays lean. It does spawn multiple agents and
+use tokens — so size the agent count to the job (a handful for small tasks, more
+for big fan-outs) rather than avoiding it; the parallelism and isolated context
+are the point.
+
 ## Tool: `Workflow`
 
 Parameters (provide exactly one script source):
