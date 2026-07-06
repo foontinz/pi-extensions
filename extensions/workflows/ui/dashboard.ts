@@ -104,7 +104,8 @@ export class WorkflowDashboard implements Component {
       parts.push(t.fg("muted", `${s.launched} agent${s.launched === 1 ? "" : "s"}`));
     }
     parts.push(t.fg("muted", `↑${compact(s.usage.input)} ↓${compact(s.usage.output)}`));
-    if (s.usage.cost > 0) parts.push(t.fg("muted", `$${s.usage.cost.toFixed(s.usage.cost < 1 ? 3 : 2)}`));
+    // The workflow's own cost — always shown so a run's spend is visible at a glance.
+    parts.push(t.fg("accent", `$${s.usage.cost.toFixed(s.usage.cost < 1 ? 3 : 2)}`));
     if (s.failures > 0) parts.push(t.fg("error", `${s.failures} failed`));
     if (s.rateLimited) parts.push(t.fg("warning", "rate-limited"));
     const left = parts.join(t.fg("dim", " · "));

@@ -11,36 +11,8 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createReadStream } from "node:fs";
-import { readdir } from "node:fs/promises";
-import { createInterface } from "node:readline";
-import { join } from "node:path";
-import { homedir } from "node:os";
 import { matchesKey, Key, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-
-// ─── types ───────────────────────────────────────────────────────────────────
-
-interface DayCost {
-  total: number;
-  input: number;
-  output: number;
-  turns: number;
-}
-
-interface ModelStats {
-  turns: number;
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  total: number;
-}
-
-interface UsageData {
-  days: Map<string, DayCost>;
-  models: Map<string, ModelStats>;
-  grand: { turns: number; input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
-}
+import { loadUsageData, todayCostFrom, type UsageData } from "./core.js";
 
 // ─── GitHub-style green palette (truecolor ANSI) ─────────────────────────────
 
@@ -59,68 +31,6 @@ const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "
 // Grid geometry – single source of truth
 const LABEL_W = 4;  // "Mon " = 3 chars + 1 separator space
 const CELL_W  = 2;  // "▪ "  = 1 block char + 1 separator space
-
-// ─── data loading ─────────────────────────────────────────────────────────────
-
-async function loadData(): Promise<UsageData> {
-  const root   = join(homedir(), ".pi", "agent", "sessions");
-  const days   = new Map<string, DayCost>();
-  const models = new Map<string, ModelStats>();
-  const grand  = { turns: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
-
-  const scanDir = async (dir: string) => {
-    let entries;
-    try { entries = await readdir(dir, { withFileTypes: true }); }
-    catch { return; }
-    for (const e of entries) {
-      const p = join(dir, e.name);
-      if (e.isDirectory())               await scanDir(p);
-      else if (e.name.endsWith(".jsonl")) await scanFile(p);
-    }
-  };
-
-  const scanFile = async (path: string) => {
-    const rl = createInterface({ input: createReadStream(path), crlfDelay: Infinity });
-    for await (const line of rl) {
-      if (!line) continue;
-      try {
-        const entry = JSON.parse(line);
-        if (entry.type !== "message" || entry.message?.role !== "assistant") continue;
-        const cost = entry.message?.usage?.cost;
-        if (!cost?.total) continue;
-
-        const day   = (entry.timestamp as string).slice(0, 10);  // "YYYY-MM-DD"
-        const model = (entry.message?.model as string) || "unknown";
-
-        const d = days.get(day) ?? { total: 0, input: 0, output: 0, turns: 0 };
-        d.total  += cost.total;
-        d.input  += cost.input      ?? 0;
-        d.output += cost.output     ?? 0;
-        d.turns  += 1;
-        days.set(day, d);
-
-        const m = models.get(model) ?? { turns: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
-        m.turns      += 1;
-        m.input      += cost.input      ?? 0;
-        m.output     += cost.output     ?? 0;
-        m.cacheRead  += cost.cacheRead  ?? 0;
-        m.cacheWrite += cost.cacheWrite ?? 0;
-        m.total      += cost.total;
-        models.set(model, m);
-
-        grand.turns      += 1;
-        grand.input      += cost.input      ?? 0;
-        grand.output     += cost.output     ?? 0;
-        grand.cacheRead  += cost.cacheRead  ?? 0;
-        grand.cacheWrite += cost.cacheWrite ?? 0;
-        grand.total      += cost.total;
-      } catch { /* skip malformed lines */ }
-    }
-  };
-
-  await scanDir(root);
-  return { days, models, grand };
-}
 
 // ─── date helpers ─────────────────────────────────────────────────────────────
 
@@ -199,10 +109,13 @@ class UsagePanel {
     const hr = theme.fg("accent", "─".repeat(width));
 
     // ── header bar ────────────────────────────────────────────────────────────
+    const todayCost = todayCostFrom(data);
     const leftStr  = theme.fg("accent", theme.bold(" USAGE"));
     // Build right string from raw parts so visibleWidth is exact
-    const rightRaw = "Total: $" + data.grand.total.toFixed(4) + "  Turns: " + data.grand.turns;
-    const rightStr = "Total: " + theme.fg("accent", "$" + data.grand.total.toFixed(4)) +
+    const rightRaw = "Today: $" + todayCost.total.toFixed(4) +
+                     "  Total: $" + data.grand.total.toFixed(4) + "  Turns: " + data.grand.turns;
+    const rightStr = "Today: " + theme.fg("accent", "$" + todayCost.total.toFixed(4)) +
+                     "  Total: " + theme.fg("accent", "$" + data.grand.total.toFixed(4)) +
                      "  Turns: " + data.grand.turns;
     const gap = " ".repeat(Math.max(1, width - visibleWidth(leftStr) - rightRaw.length));
     lines.push(leftStr + gap + rightStr);
@@ -334,7 +247,7 @@ export default function (pi: ExtensionAPI) {
     description: "Show token/cost usage heatmap across all sessions",
     handler: async (_args, ctx) => {
       ctx.ui.notify("Loading session data…", "info");
-      const data = await loadData();
+      const data = await loadUsageData();
 
       await ctx.ui.custom<void>((tui, theme, _kb, done) => {
         const panel = new UsagePanel(data, theme, done);
