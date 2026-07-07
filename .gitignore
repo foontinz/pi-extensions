@@ -30,6 +30,7 @@ bin/
 
 # Usage extension per-file cache
 usage-cache.json
+usage-cache.json.bak
 
 # Skill Loader local state
 /skill-loader/
