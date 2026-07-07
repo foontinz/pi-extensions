@@ -239,7 +239,10 @@ export default function (pi: ExtensionAPI) {
       "Execute a bash command. Foreground commands get a default timeout " +
       `(${DEFAULT_TIMEOUT_S}s, cap ${MAX_TIMEOUT_S}s) and run non-interactively. ` +
       "Set background:true to detach long-running processes; their output goes to a log file " +
-      "(read it with the read tool) and you are notified on completion.",
+      "(read it with the read tool) and you are notified on completion. " +
+      "After starting a background job, do NOT monitor it yourself: do not poll, sleep, or tail its log in a loop. " +
+      "End your turn and wait for the completion notification. Only inspect a running job when genuinely needed " +
+      "(user asks for status, you suspect it is stuck and may `kill` it, or a later step this turn hard-depends on its output).",
     async execute(id: string, params: Params, signal: AbortSignal | undefined, onUpdate: any, ctx: ExtensionContext) {
       currentCtx = ctx;
       if (params.background) {
@@ -252,7 +255,7 @@ export default function (pi: ExtensionAPI) {
         }
         const job = startBackgroundJob(params.command);
         return {
-          content: [{ type: "text", text: `bg ${job.id} started (pid ${job.pid ?? "?"}); log: ${job.logFile}` }],
+          content: [{ type: "text", text: `bg ${job.id} started (pid ${job.pid ?? "?"}); log: ${job.logFile}. Do not monitor it — end your turn; you'll be notified when it finishes.` }],
           details: undefined,
         };
       }
