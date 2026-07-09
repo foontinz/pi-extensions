@@ -9,8 +9,8 @@
 import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { AssistantMessage, Message, ToolResultMessage } from "@earendil-works/pi-ai";
-import { StringEnum } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Message, ToolResultMessage } from "@earendil-works/pi-ai/compat";
+import { StringEnum } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_MAX_BYTES,

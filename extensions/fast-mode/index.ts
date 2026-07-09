@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import type { Model } from "@earendil-works/pi-ai";
+import type { Model } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const PREFS_PATH = join(homedir(), ".pi", "agent", "fast-mode.json");
@@ -15,7 +15,7 @@ type SupportedMode =
 	}
 	| {
 		provider: "openai" | "openai-codex";
-		id: "gpt-5.4" | "gpt-5.5";
+		id: "gpt-5.4" | "gpt-5.5" | "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna";
 		enabledTier: "priority";
 		disabledTier?: undefined;
 	};
@@ -36,8 +36,16 @@ const SUPPORTED_MODELS: SupportedMode[] = [
 	{ provider: "anthropic", id: "claude-opus-4-8", enabledTier: "auto", disabledTier: "standard_only" },
 	{ provider: "openai", id: "gpt-5.4", enabledTier: "priority" },
 	{ provider: "openai", id: "gpt-5.5", enabledTier: "priority" },
+	{ provider: "openai", id: "gpt-5.6", enabledTier: "priority" },
+	{ provider: "openai", id: "gpt-5.6-sol", enabledTier: "priority" },
+	{ provider: "openai", id: "gpt-5.6-terra", enabledTier: "priority" },
+	{ provider: "openai", id: "gpt-5.6-luna", enabledTier: "priority" },
 	{ provider: "openai-codex", id: "gpt-5.4", enabledTier: "priority" },
 	{ provider: "openai-codex", id: "gpt-5.5", enabledTier: "priority" },
+	{ provider: "openai-codex", id: "gpt-5.6", enabledTier: "priority" },
+	{ provider: "openai-codex", id: "gpt-5.6-sol", enabledTier: "priority" },
+	{ provider: "openai-codex", id: "gpt-5.6-terra", enabledTier: "priority" },
+	{ provider: "openai-codex", id: "gpt-5.6-luna", enabledTier: "priority" },
 ];
 
 export default function (pi: ExtensionAPI) {
@@ -76,13 +84,13 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("fast", {
-		description: "Toggle fast mode for supported models (claude-opus-4-6, claude-opus-4-7, claude-opus-4-8, gpt-5.4, gpt-5.5)",
+		description: "Toggle fast mode for supported Anthropic Opus and OpenAI GPT-5.4/5.5/5.6 models",
 		handler: async (_args, ctx) => {
 			prefs = await loadPrefs();
 			const supported = getSupportedMode(ctx.model);
 			if (!ctx.model || !supported) {
 				ctx.ui.notify(
-					"Fast mode is only available for anthropic/claude-opus-4-6, anthropic/claude-opus-4-7, anthropic/claude-opus-4-8, openai/gpt-5.4, openai/gpt-5.5, openai-codex/gpt-5.4, and openai-codex/gpt-5.5.",
+					"Fast mode is only available for Anthropic Opus 4.6/4.7/4.8 and OpenAI/OpenAI Codex GPT-5.4, GPT-5.5, and GPT-5.6 variants.",
 					"info",
 				);
 				refreshStatus(ctx);

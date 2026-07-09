@@ -39,7 +39,7 @@ Workflow:
      - `@earendil-works/pi-ai`
      - `@earendil-works/pi-agent-core` if present
      - `@earendil-works/pi-tui`
-   - Update closely-related non-major dependencies shown by `npm outdated --depth=0` when safe, especially `typebox`, while avoiding risky major upgrades such as TypeScript unless the changelog requires it.
+   - Update closely-related dependencies shown by `npm outdated --depth=0` when safe, especially `typebox`.
    - Preserve intentional exact pins such as Playwright unless they are outdated and were already being kept in sync or the changelog requires an update.
    - Run `npm install` at the workspace root to refresh `package-lock.json`.
    - Treat the refreshed root `package-lock.json` as part of the dependency bump; if committing the bump, include it in the same commit with the related `package.json` changes.
@@ -66,6 +66,5 @@ Guardrails:
 - Do not commit unless explicitly asked.
 - When explicitly asked to commit a bump, include the refreshed root `package-lock.json` in the commit unless it contains unrelated user changes that must be preserved separately.
 - Do not run `pi update` unless the user explicitly asks to update the globally installed Pi CLI.
-- Do not upgrade TypeScript to a new major version just because it is latest; keep it pinned unless required.
 - Do not overwrite unrelated user changes. If unrelated changes exist, leave them alone and mention them.
 - Prefer precise edits over broad rewrites.
