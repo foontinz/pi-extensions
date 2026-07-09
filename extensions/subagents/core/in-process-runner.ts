@@ -137,7 +137,7 @@ export async function runSubagentInProcess(options: InProcessSubagentOptions): P
   try {
     await session.prompt(options.task);
     const entries = sessionManager.getEntries();
-    const usage = normalizeUsage(getLastAssistantUsage(entries as never) as unknown);
+    const usage = usageFromSession(session, entries);
     const messages = ((session as { messages?: unknown[] }).messages ?? []) as unknown[];
     const output = extractLastAssistantText(messages);
     const turns = countAssistantTurns(messages);
@@ -167,16 +167,57 @@ export async function runSubagentInProcess(options: InProcessSubagentOptions): P
   }
 }
 
-function normalizeUsage(value: unknown): UsageStats {
+/**
+ * Prefer the session's cumulative stats: they sum input/output/cost across ALL
+ * assistant turns and expose `cost` as a single number. The per-message usage
+ * from `getLastAssistantUsage` only covers the final turn and stores `cost` as
+ * an object (`{ total, ... }`), which the legacy numeric parse below read as 0 —
+ * that's why workflow/subagent spend always showed $0. Falls back to the
+ * per-message path if stats are unavailable.
+ */
+function usageFromSession(session: unknown, entries: unknown[]): UsageStats {
+  try {
+    const stats = (session as {
+      getSessionStats?: () => {
+        tokens?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number };
+        cost?: number;
+        contextUsage?: { tokens?: number };
+      };
+    }).getSessionStats?.();
+    if (stats?.tokens) {
+      const usage = emptyUsageStats();
+      usage.input = stats.tokens.input ?? 0;
+      usage.output = stats.tokens.output ?? 0;
+      usage.cacheRead = stats.tokens.cacheRead ?? 0;
+      usage.cacheWrite = stats.tokens.cacheWrite ?? 0;
+      usage.cost = typeof stats.cost === "number" ? stats.cost : 0;
+      usage.contextTokens = stats.contextUsage?.tokens ?? stats.tokens.total ?? 0;
+      return usage;
+    }
+  } catch {
+    // fall through to the per-message estimate below
+  }
+  return normalizeUsage(getLastAssistantUsage(entries as never) as unknown);
+}
+
+export function normalizeUsage(value: unknown): UsageStats {
   const usage = emptyUsageStats();
   if (!value || typeof value !== "object") return usage;
   const record = value as Record<string, unknown>;
   const number = (key: string): number => (typeof record[key] === "number" ? (record[key] as number) : 0);
+  const nested = (key: string): number => {
+    const v = record[key];
+    if (typeof v === "number") return v;
+    if (v && typeof v === "object" && typeof (v as Record<string, unknown>).total === "number") {
+      return (v as { total: number }).total;
+    }
+    return 0;
+  };
   usage.input = number("input");
   usage.output = number("output");
   usage.cacheRead = number("cacheRead");
   usage.cacheWrite = number("cacheWrite");
-  usage.cost = number("cost");
+  usage.cost = nested("cost");
   usage.contextTokens = number("totalTokens") || number("contextTokens");
   usage.turns = 1;
   return usage;

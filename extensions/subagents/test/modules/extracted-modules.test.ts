@@ -6,9 +6,32 @@ import { parseOptionalNonNegativeIntegerEnv } from "../../platform/env.js";
 import { validateToolSelection } from "../../policy/tool-selection.js";
 import { formatJobSummaryLine, summarizeJob } from "../../tool-output/format-poll.js";
 import { compactJobState, formatStatusTable, type StatusTheme } from "../../ui/status-widget.js";
+import { normalizeUsage } from "../../core/in-process-runner.js";
 import { normalizeWorktreeEnvConfig } from "../../workspace/worktree-config.js";
 
 const plainTheme: StatusTheme = { fg: (_role, text) => text };
+
+test("normalizeUsage reads cost from pi's nested {total} usage object", () => {
+  // Pi assistant messages store cost as an object, not a number. Regression
+  // guard: a numeric parse here silently reported $0 spend for subagents.
+  const usage = normalizeUsage({
+    input: 655,
+    output: 4,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 659,
+    cost: { input: 0.003275, output: 0.0001, cacheRead: 0, cacheWrite: 0, total: 0.003375 },
+  });
+  assert.equal(usage.input, 655);
+  assert.equal(usage.output, 4);
+  assert.equal(usage.cost, 0.003375);
+  assert.equal(usage.contextTokens, 659);
+});
+
+test("normalizeUsage still accepts a plain numeric cost", () => {
+  const usage = normalizeUsage({ input: 10, output: 2, cost: 0.5, contextTokens: 12 });
+  assert.equal(usage.cost, 0.5);
+});
 
 test("extracted tool selection module validates default and rejected tools directly", () => {
   const defaultSelection = validateToolSelection(["bash", "find", "ls", "read"], undefined);
