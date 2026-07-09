@@ -42,21 +42,29 @@ export function compactJobState<T extends StatusJobView>(job: T, latestLogPrevie
   if (job.cleanupPhase === "failed" || job.cleanupError) return `cleanup-failed ${truncateOneLine(job.cleanupError ?? "check logs", 60)}`;
   if (job.cleanupPending || job.cleanupPhase === "pending" || job.cleanupPhase === "running") return `cleanup-${job.cleanupPhase ?? "pending"}`;
   const statusWord = job.status === "completed" ? "done" : job.status === "cancelled" ? "stopped" : job.status;
-  const fallback = job.status === "running"
-    ? ["background", "task", "active"]
-    : job.status === "completed"
-      ? ["final", "output", "ready"]
-      : job.status === "cancelled"
-        ? ["by", "request", "stopped"]
-        : ["check", "logs", "failed"];
   const source = job.status === "running"
     ? job.latestAssistantText || latestLogPreview(job)
     : job.status === "completed"
       ? job.finalOutput
       : job.errorMessage || job.stopReason || latestLogPreview(job);
-  const words = extractStatusWords(source).filter((word) => word !== statusWord).slice(0, 3);
-  while (words.length < 3) words.push(fallback[words.length] ?? "task");
-  return [statusWord, ...words].slice(0, 4).join(" ");
+  const fallback = job.status === "running"
+    ? "working\u2026"
+    : job.status === "completed"
+      ? "output ready"
+      : job.status === "cancelled"
+        ? "stopped by request"
+        : "check logs";
+  // Show the actual latest line (truncated), not fabricated keywords, so the
+  // widget always reflects real activity rather than word-salad from paths/noise.
+  const preview = cleanPreview(source);
+  return `${statusWord} ${preview || fallback}`;
+}
+
+/** Strip ANSI + "assistant:" prefixes and collapse to a single short line. */
+function cleanPreview(text: string | undefined): string {
+  if (!text) return "";
+  const cleaned = text.replace(/\x1b\[[0-9;]*m/g, " ").replace(/^assistant:\s*/i, "");
+  return truncateOneLine(cleaned, 48);
 }
 
 function formatStatusRow<T extends StatusJobView>(job: T, theme: StatusTheme, latestLogPreview: LatestLogPreview<T>, idWidth: number, labelWidth: number, timeWidth: number, durationWidth: number, statusWidth: number): string {
@@ -94,18 +102,3 @@ function padCell(value: string, width: number): string {
   return value.length >= width ? value : value + " ".repeat(width - value.length);
 }
 
-function extractStatusWords(text: string | undefined): string[] {
-  if (!text) return [];
-  return text
-    .replace(/\x1b\[[0-9;]*m/g, " ")
-    .replace(/[^\p{L}\p{N}]+/gu, " ")
-    .trim()
-    .toLowerCase()
-    .split(/\s+/)
-    .filter((word) => word.length > 1 && !STATUS_STOP_WORDS.has(word));
-}
-
-const STATUS_STOP_WORDS = new Set([
-  "the", "and", "for", "with", "that", "this", "from", "into", "your", "you", "are", "was", "were", "has", "have", "had",
-  "assistant", "message", "complete", "tool", "bash", "read", "write", "edit", "turn", "started", "ended", "output", "chars",
-]);
