@@ -27,26 +27,68 @@ export function getSharedHandles(): { authStorage: ReturnType<typeof AuthStorage
   return { authStorage: sharedAuthStorage, modelRegistry: sharedModelRegistry };
 }
 
+type ModelPatternRegistry = Pick<ReturnType<typeof ModelRegistry.create>, "getAll" | "hasConfiguredAuth">;
+type PatternModel = { provider: string; id: string };
+
+const CLI_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
+
+function modelPatternQueries(pattern: string): string[] {
+  const queries = [pattern.toLowerCase()];
+  const colon = pattern.lastIndexOf(":");
+  if (colon > 0 && CLI_THINKING_LEVELS.has(pattern.slice(colon + 1).toLowerCase())) {
+    queries.push(pattern.slice(0, colon).toLowerCase());
+  }
+  return queries;
+}
+
+function chooseModelMatch(
+  candidates: PatternModel[],
+  queries: string[],
+  registry: ModelPatternRegistry,
+): PatternModel | undefined {
+  // Exact IDs always beat fuzzy matches, even when the fuzzy match is the only
+  // authenticated one. Within the same tier, configured auth remains the tie-breaker.
+  for (const exact of [true, false]) {
+    for (const query of queries) {
+      const matches = candidates.filter((model) => exact
+        ? model.id.toLowerCase() === query
+        : model.id.toLowerCase().includes(query));
+      if (matches.length > 0) {
+        return matches.find((model) => registry.hasConfiguredAuth(model as never)) ?? matches[0];
+      }
+    }
+  }
+  return undefined;
+}
+
 /**
  * Best-effort resolution of a CLI-style model pattern (`provider/id`, `id`, or a
  * substring) to a concrete Model. Returns undefined when no pattern is given or no
  * match is found, so the session falls back to default discovery.
  */
-export function resolveModelPattern(pattern: string | undefined): unknown | undefined {
+export function resolveModelPattern(
+  pattern: string | undefined,
+  registry?: ModelPatternRegistry,
+): unknown | undefined {
   if (!pattern || !pattern.trim()) return undefined;
-  const { modelRegistry } = getSharedHandles();
-  const all = modelRegistry.getAll() as Array<{ provider: string; id: string }>;
+  const modelRegistry = registry ?? getSharedHandles().modelRegistry;
+  const all = modelRegistry.getAll() as PatternModel[];
   const raw = pattern.trim();
-  const [maybeProvider, maybeId] = raw.includes("/") ? raw.split("/", 2) : [undefined, raw];
-  const id = (maybeId ?? raw).split(":")[0]?.toLowerCase();
-  const provider = maybeProvider?.toLowerCase();
-  const matches = all.filter((model) => {
-    const providerOk = !provider || model.provider.toLowerCase() === provider;
-    const idOk = model.id.toLowerCase() === id || model.id.toLowerCase().includes(id ?? "");
-    return providerOk && idOk;
-  });
-  const prefer = matches.find((model) => modelRegistry.hasConfiguredAuth(model as never)) ?? matches[0];
-  return prefer;
+  const separator = raw.indexOf("/");
+  const firstSegment = separator >= 0 ? raw.slice(0, separator).toLowerCase() : undefined;
+  const providers = new Set(all.map((model) => model.provider.toLowerCase()));
+
+  if (firstSegment && providers.has(firstSegment)) {
+    const providerCandidates = all.filter((model) => model.provider.toLowerCase() === firstSegment);
+    const canonical = chooseModelMatch(providerCandidates, modelPatternQueries(raw.slice(separator + 1)), modelRegistry);
+    if (canonical) return canonical;
+
+    // A known provider-looking prefix can also be part of a literal model ID
+    // (for example, an OpenRouter ID). Only fall back after canonical matching fails.
+    return chooseModelMatch(all, modelPatternQueries(raw), modelRegistry);
+  }
+
+  return chooseModelMatch(all, modelPatternQueries(raw), modelRegistry);
 }
 
 export interface InProcessSubagentOptions {
@@ -87,7 +129,10 @@ export function createBareResourceLoader(systemPrompt?: string, appendSystemProm
   };
 }
 
-export async function runSubagentInProcess(options: InProcessSubagentOptions): Promise<SubagentResult> {
+export async function runSubagentInProcess(
+  options: InProcessSubagentOptions,
+  createSession: typeof createAgentSession = createAgentSession,
+): Promise<SubagentResult> {
   if (options.signal?.aborted) {
     return { output: "", usage: emptyUsageStats(), error: { reason: "stop", message: "aborted before start" } };
   }
@@ -100,8 +145,12 @@ export async function runSubagentInProcess(options: InProcessSubagentOptions): P
   // (SessionManager._persist). Only report it once it actually exists on disk,
   // so callers never advertise a read/grep path for a run that produced nothing.
   const persistedTranscript = (): string | undefined => {
-    const file = sessionManager.getSessionFile();
-    return file && fs.existsSync(file) ? file : undefined;
+    try {
+      const file = sessionManager.getSessionFile();
+      return file && fs.existsSync(file) ? file : undefined;
+    } catch {
+      return undefined;
+    }
   };
 
   const customTools: ToolDefinition[] = [];
@@ -113,57 +162,194 @@ export async function runSubagentInProcess(options: InProcessSubagentOptions): P
     if (toolAllowlist && !toolAllowlist.includes("mcp")) toolAllowlist = [...toolAllowlist, "mcp"];
   }
 
-  const { session } = await createAgentSession({
-    cwd: options.cwd,
-    agentDir: getAgentDir(),
-    authStorage,
-    modelRegistry,
-    resourceLoader: createBareResourceLoader(options.systemPrompt, options.appendSystemPrompt),
-    tools: toolAllowlist,
-    noTools: toolAllowlist && toolAllowlist.length === 0 ? "all" : undefined,
-    customTools: customTools.length > 0 ? customTools : undefined,
-    sessionManager,
-    settingsManager: SettingsManager.create(options.cwd, getAgentDir()),
+  type Session = Awaited<ReturnType<typeof createAgentSession>>["session"];
+  type Cancellation = { reason: "stop" | "timeout"; message: string };
+  type CreationOutcome =
+    | { kind: "created"; session: Session }
+    | { kind: "create-error"; error: unknown };
+
+  let session: Session | undefined;
+  let cancellation: Cancellation | undefined;
+  let resolveCancellation!: (value: Cancellation) => void;
+  const cancellationPromise = new Promise<Cancellation>((resolve) => { resolveCancellation = resolve; });
+  const timeoutMs = options.timeoutMs && options.timeoutMs > 0 ? options.timeoutMs : undefined;
+  const deadline = timeoutMs === undefined ? undefined : performance.now() + timeoutMs;
+  const timeoutCancellation = (): Cancellation => ({
+    reason: "timeout",
+    message: `subagent timed out after ${timeoutMs}ms`,
   });
 
-  let timedOut = false;
-  let externallyAborted = false;
-  const timeout = options.timeoutMs && options.timeoutMs > 0
-    ? setTimeout(() => { timedOut = true; void session.abort(); }, options.timeoutMs)
-    : undefined;
-  const onAbort = () => { externallyAborted = true; void session.abort(); };
+  const handleRejection = (value: unknown): void => {
+    if (!value || (typeof value !== "object" && typeof value !== "function")) return;
+    try {
+      if (typeof (value as { then?: unknown }).then === "function") {
+        void Promise.resolve(value).catch(() => {});
+      }
+    } catch {
+      // Accessing a hostile thenable can itself throw. Cancellation must still settle.
+    }
+  };
+  const abortSession = (target: Session | undefined): void => {
+    if (!target) return;
+    try {
+      handleRejection(target.abort());
+    } catch {
+      // Cooperative abort is best effort; disposal below is the hard boundary.
+    }
+  };
+  const disposeSession = (target: Session | undefined): void => {
+    if (!target) return;
+    try {
+      handleRejection(target.dispose());
+    } catch {
+      // Disposal errors must never replace the run's terminal result.
+    }
+  };
+  const cancel = (next: Cancellation): void => {
+    if (cancellation) return;
+    cancellation = next;
+    // Resolve first so a synchronous abort-induced prompt settlement cannot win
+    // the race over the cancellation which caused it.
+    resolveCancellation(next);
+    abortSession(session);
+  };
+  const onAbort = () => cancel({ reason: "stop", message: "aborted" });
+  const checkDeadline = (): void => {
+    // Timers cannot fire while synchronous session creation/prompt work blocks
+    // the event loop, so also enforce the recorded wall-clock deadline directly.
+    if (!cancellation && deadline !== undefined && performance.now() >= deadline) cancel(timeoutCancellation());
+  };
+  const partialResult = (target: Session): Pick<SubagentResult, "output" | "usage"> => {
+    let entries: unknown[] = [];
+    try {
+      entries = sessionManager.getEntries();
+    } catch {
+      // Session stats may still provide complete usage without transcript entries.
+    }
+
+    let messages: unknown[] | undefined;
+    try {
+      const value = (target as { messages?: unknown }).messages;
+      if (Array.isArray(value)) messages = value;
+    } catch {
+      // Usage must survive a failed message snapshot.
+    }
+
+    let output = "";
+    if (messages) {
+      try { output = extractLastAssistantText(messages); } catch {}
+    }
+
+    let usage = emptyUsageStats();
+    try { usage = usageFromSession(target, entries); } catch {}
+    if (messages) {
+      try { usage.turns = countAssistantTurns(messages); } catch {}
+    }
+    return { output, usage };
+  };
+
+  // Both cancellation sources start before createSession, so startup is part of
+  // the run's deadline. A cancelled startup is detached and cleaned up if it
+  // eventually creates a session.
   options.signal?.addEventListener("abort", onAbort, { once: true });
+  const timeout = timeoutMs === undefined
+    ? undefined
+    : setTimeout(() => cancel(timeoutCancellation()), timeoutMs);
 
   try {
-    await session.prompt(options.task);
-    const entries = sessionManager.getEntries();
-    const usage = usageFromSession(session, entries);
-    const messages = ((session as { messages?: unknown[] }).messages ?? []) as unknown[];
-    const output = extractLastAssistantText(messages);
-    const turns = countAssistantTurns(messages);
-    if (timedOut || externallyAborted) {
-      return {
-        output,
-        usage: { ...usage, turns },
-        sessionFile: persistedTranscript(),
-        error: { reason: timedOut ? "timeout" : "stop", message: timedOut ? `subagent timed out after ${options.timeoutMs}ms` : "aborted" },
-      };
+    // addEventListener does not replay an abort that happened before registration.
+    if (options.signal?.aborted) onAbort();
+
+    const creationPromise: Promise<CreationOutcome> = Promise.resolve()
+      .then(() => createSession({
+        cwd: options.cwd,
+        agentDir: getAgentDir(),
+        authStorage,
+        modelRegistry,
+        resourceLoader: createBareResourceLoader(options.systemPrompt, options.appendSystemPrompt),
+        tools: toolAllowlist,
+        noTools: toolAllowlist && toolAllowlist.length === 0 ? "all" : undefined,
+        customTools: customTools.length > 0 ? customTools : undefined,
+        sessionManager,
+        settingsManager: SettingsManager.create(options.cwd, getAgentDir()),
+      }))
+      .then(
+        (created): CreationOutcome => ({ kind: "created", session: created.session }),
+        (error): CreationOutcome => ({ kind: "create-error", error }),
+      );
+
+    const startup = await Promise.race([
+      creationPromise,
+      cancellationPromise.then((value) => ({ kind: "cancelled" as const, value })),
+    ]);
+
+    if (startup.kind === "cancelled") {
+      // creationPromise never rejects (failures are values), so this continuation
+      // handles both outcomes and safely disposes a session created after return.
+      void creationPromise.then((late) => {
+        if (late.kind === "created") disposeSession(late.session);
+      });
+      return { output: "", usage: emptyUsageStats(), sessionFile: persistedTranscript(), error: startup.value };
     }
-    // Surface a model-side terminal error (stopReason "error"/"aborted") that would
-    // otherwise be reported as a silent empty-string success.
-    const failure = detectAssistantFailure(messages);
-    if (failure) {
-      return { output, usage: { ...usage, turns }, sessionFile: persistedTranscript(), error: failure };
+    if (startup.kind === "create-error") {
+      const message = startup.error instanceof Error ? startup.error.message : String(startup.error);
+      return { output: "", usage: emptyUsageStats(), sessionFile: persistedTranscript(), error: { reason: "error", message } };
     }
-    return { output, structuredOutput: parseJsonOutput(output), usage: { ...usage, turns }, sessionFile: persistedTranscript() };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const reason: TerminalReason = timedOut ? "timeout" : externallyAborted ? "stop" : "error";
-    return { output: "", usage: emptyUsageStats(), sessionFile: persistedTranscript(), error: { reason, message } };
+
+    session = startup.session;
+    checkDeadline();
+    if (cancellation) {
+      const partial = partialResult(session);
+      return { ...partial, sessionFile: persistedTranscript(), error: cancellation };
+    }
+
+    const promptPromise = Promise.resolve()
+      .then(() => session!.prompt(options.task))
+      .then(
+        () => ({ kind: "prompt-complete" as const }),
+        (error) => ({ kind: "prompt-error" as const, error }),
+      );
+    const promptOutcome = await Promise.race([
+      promptPromise,
+      cancellationPromise.then((value) => ({ kind: "cancelled" as const, value })),
+    ]);
+
+    checkDeadline();
+    if (cancellation) {
+      const partial = partialResult(session);
+      return { ...partial, sessionFile: persistedTranscript(), error: cancellation };
+    }
+    if (promptOutcome.kind === "cancelled") {
+      const partial = partialResult(session);
+      return { ...partial, sessionFile: persistedTranscript(), error: promptOutcome.value };
+    }
+    if (promptOutcome.kind === "prompt-error") {
+      const message = promptOutcome.error instanceof Error ? promptOutcome.error.message : String(promptOutcome.error);
+      const partial = partialResult(session);
+      return { ...partial, sessionFile: persistedTranscript(), error: { reason: "error", message } };
+    }
+
+    try {
+      const entries = sessionManager.getEntries();
+      const usage = usageFromSession(session, entries);
+      const messages = ((session as { messages?: unknown[] }).messages ?? []) as unknown[];
+      const output = extractLastAssistantText(messages);
+      const turns = countAssistantTurns(messages);
+      // Surface a model-side terminal error (stopReason "error"/"aborted") that would
+      // otherwise be reported as a silent empty-string success.
+      const failure = detectAssistantFailure(messages);
+      if (failure) {
+        return { output, usage: { ...usage, turns }, sessionFile: persistedTranscript(), error: failure };
+      }
+      return { output, structuredOutput: parseJsonOutput(output), usage: { ...usage, turns }, sessionFile: persistedTranscript() };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { output: "", usage: emptyUsageStats(), sessionFile: persistedTranscript(), error: { reason: "error", message } };
+    }
   } finally {
     if (timeout) clearTimeout(timeout);
     options.signal?.removeEventListener("abort", onAbort);
-    session.dispose();
+    disposeSession(session);
   }
 }
 

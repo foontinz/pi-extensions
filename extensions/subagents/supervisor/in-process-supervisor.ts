@@ -24,6 +24,8 @@ export interface InProcessStartOptions {
   cwd: string;
   task: string;
   tools: string[];
+  /** Abort startup when the invoking tool call is cancelled. */
+  signal?: AbortSignal;
   /** Inject the shared `mcp` gateway tool (forwards to the process-wide MCP pool). */
   mcp?: boolean;
   model?: string;
@@ -50,33 +52,118 @@ export interface InProcessOutcome {
 }
 
 export interface InProcessHandle {
+  /** Ask the session to abort cooperatively. */
   abort: () => void;
+  /** Immediately dispose the session and settle the supervisor as aborted. */
+  forceAbort?: () => void;
+  /** Idempotent alias for forceAbort, for shutdown/cleanup callers. */
+  dispose?: () => void;
+  /** Stop treating the invoking tool call's signal as job cancellation. */
+  detachStartupSignal?: () => void;
   modelResolved: boolean;
 }
+
+let createSession: typeof createAgentSession = createAgentSession;
 
 export function startInProcessAgent(options: InProcessStartOptions): InProcessHandle {
   const { authStorage, modelRegistry } = getSharedHandles();
   const model = resolveModelPattern(options.model);
   let aborted = false;
+  let forceAborted = false;
+  let completionDelivered = false;
+  let completionRetryQueued = false;
+  let automaticCompletionRetryUsed = false;
+  let pendingOutcome: InProcessOutcome | undefined;
   let session: AgentSession | undefined;
+  let disposedSession: AgentSession | undefined;
+  let unsubscribe: (() => void) | undefined;
+  let startupSignalAttached = false;
+
+  const detachStartupSignal = () => {
+    if (!startupSignalAttached) return;
+    options.signal?.removeEventListener("abort", onSignalAbort);
+    startupSignalAttached = false;
+  };
+  const disposeSession = () => {
+    try { unsubscribe?.(); } catch {}
+    unsubscribe = undefined;
+    if (!session || disposedSession === session) return;
+    disposedSession = session;
+    try { session.dispose(); } catch {}
+  };
+  const deliverCompletion = (allowAutomaticRetry: boolean) => {
+    if (completionDelivered || !pendingOutcome) return;
+    try {
+      options.onDone(pendingOutcome);
+      completionDelivered = true;
+      detachStartupSignal();
+    } catch (error) {
+      // Do not mark completion delivered until the owner accepts it. Retry once
+      // after supervisor cleanup; forceAbort/dispose can retry again later.
+      if (allowAutomaticRetry && !automaticCompletionRetryUsed && !completionRetryQueued) {
+        completionRetryQueued = true;
+        queueMicrotask(() => {
+          completionRetryQueued = false;
+          automaticCompletionRetryUsed = true;
+          deliverCompletion(false);
+        });
+      } else {
+        console.error("in-process supervisor completion callback failed", error);
+      }
+    }
+  };
+  const finish = (outcome: InProcessOutcome) => {
+    pendingOutcome ??= outcome;
+    detachStartupSignal();
+    deliverCompletion(true);
+  };
+  const abortCooperatively = () => {
+    aborted = true;
+    try {
+      const pending = session?.abort();
+      void pending?.catch(() => {});
+    } catch {
+      // The caller's grace timer owns escalation to forceAbort().
+    }
+  };
+  const forceAbort = () => {
+    if (forceAborted) {
+      // Disposal remains idempotent, but a previously rejected completion
+      // callback gets another chance to accept the stored terminal outcome.
+      deliverCompletion(false);
+      return;
+    }
+    forceAborted = true;
+    if (!aborted) abortCooperatively();
+    disposeSession();
+    finish({ aborted: true });
+  };
+  const onSignalAbort = () => forceAbort();
 
   const handle: InProcessHandle = {
-    abort: () => {
-      aborted = true;
-      void session?.abort();
-    },
+    abort: abortCooperatively,
+    forceAbort,
+    dispose: forceAbort,
+    detachStartupSignal,
     modelResolved: !options.model || model !== undefined,
   };
 
+  if (options.signal?.aborted) forceAbort();
+  else if (options.signal) {
+    startupSignalAttached = true;
+    options.signal.addEventListener("abort", onSignalAbort, { once: true });
+  }
+
   void (async () => {
     try {
+      if (forceAborted) return;
       const customTools: ToolDefinition[] = [];
       let toolAllowlist = options.tools.length > 0 ? [...options.tools] : undefined;
       if (options.mcp) {
         customTools.push(createMcpProxyTool(getSharedMcpGateway(options.cwd, getAgentDir())) as ToolDefinition);
         if (toolAllowlist && !toolAllowlist.includes("mcp")) toolAllowlist = [...toolAllowlist, "mcp"];
       }
-      const created = await createAgentSession({
+      const created = await createSession({
         cwd: options.cwd,
         agentDir: getAgentDir(),
         authStorage,
@@ -95,17 +182,17 @@ export function startInProcessAgent(options: InProcessStartOptions): InProcessHa
       session = created.session;
 
       if (aborted) {
-        session.dispose();
-        options.onDone({ aborted: true });
+        disposeSession();
+        finish({ aborted: true });
         return;
       }
       if (!session.model) {
-        session.dispose();
-        options.onDone({ aborted: false, error: "no model available for in-process subagent (configure a default model or pass model)" });
+        disposeSession();
+        finish({ aborted: false, error: "no model available for in-process subagent (configure a default model or pass model)" });
         return;
       }
 
-      const unsubscribe = session.subscribe((event) => {
+      unsubscribe = session.subscribe((event) => {
         try {
           options.onEvent(event);
         } catch {
@@ -115,16 +202,22 @@ export function startInProcessAgent(options: InProcessStartOptions): InProcessHa
 
       try {
         await session.prompt(options.task);
-        options.onDone({ aborted });
+        finish({ aborted });
       } finally {
-        unsubscribe();
-        session.dispose();
+        disposeSession();
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      options.onDone({ aborted, error: message });
+      finish({ aborted, error: message });
+      disposeSession();
     }
   })();
 
   return handle;
 }
+
+export const __inProcessSupervisorTest = {
+  setCreateAgentSession(factory: typeof createAgentSession | undefined): void {
+    createSession = factory ?? createAgentSession;
+  },
+};

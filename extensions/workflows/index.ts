@@ -1,13 +1,13 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import vm from "node:vm";
+import { Worker } from "node:worker_threads";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type InProcessSubagentOptions, runSubagentInProcess } from "../subagents/core/in-process-runner.js";
 import { DEFAULT_RUN_RETENTION_MS, pruneOldRuns } from "../subagents/core/run-archive.js";
 import { addUsage, emptyUsageStats, type SubagentResult, type UsageStats } from "../subagents/core/types.js";
-import { createWorktree } from "../subagents/workspace/create-worktree.js";
+import { createWorktree, WorktreeStartupCleanupError } from "../subagents/workspace/create-worktree.js";
 import { WorkflowDashboard } from "./ui/dashboard.js";
 import { renderWorkflowNotification, type WorkflowNotificationDetails } from "./ui/notification.js";
 import { renderWorkflowCall, renderWorkflowResult } from "./ui/tool-render.js";
@@ -100,6 +100,8 @@ const MAX_AGENTS = 100;
 const DEFAULT_CONCURRENCY = 8;
 const DEFAULT_WORKFLOW_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_429_RETRIES = 5;
+/** Do not let a broken injected/test executor make external cancellation hang forever. */
+const EXTERNAL_AGENT_DRAIN_GRACE_MS = 250;
 /** Custom message type used for background completion notices (rendered collapsed). */
 const WORKFLOW_NOTIFICATION_TYPE = "workflow-notification";
 type ToolViewMode = "minimized" | "medium" | "verbose";
@@ -225,7 +227,10 @@ export default function workflowsExtension(pi: ExtensionAPI) {
       // Classify why a run ended: an explicit stop (tool/command) or a turn abort
       // is "cancelled"; the overall timeout is a "failed"; anything else is a
       // genuine error.
-      const classifyFailure = (): "failed" | "cancelled" => {
+      const classifyFailure = (error: unknown): "failed" | "cancelled" => {
+        // Resource cleanup failures are real failures even when cancellation
+        // initiated cleanup; reporting only "cancelled" would hide the leak.
+        if (error instanceof WorktreeStartupCleanupError) return "failed";
         // Prefer an explicit stop over a racing timeout so a user cancel is never
         // mislabeled as a failure.
         if (runEntry.stopped) return "cancelled";
@@ -236,7 +241,11 @@ export default function workflowsExtension(pi: ExtensionAPI) {
 
       // The message to report for a non-cancelled failure (surfaces timeouts distinctly).
       const failureMessage = (error: unknown): string =>
-        runEntry.timedOut ? `workflow timed out after ${timeoutMs}ms` : error instanceof Error ? error.message : String(error);
+        error instanceof WorktreeStartupCleanupError
+          ? error.message
+          : runEntry.timedOut
+            ? `workflow timed out after ${timeoutMs}ms`
+            : error instanceof Error ? error.message : String(error);
 
       const execRun = async (emit: (message: string) => void): Promise<WorkflowResult> => {
         const linked = linkSignals(background ? undefined : signal, controller.signal);
@@ -244,11 +253,19 @@ export default function workflowsExtension(pi: ExtensionAPI) {
           runEntry.timedOut = true;
           controller.abort(new Error(`workflow timed out after ${timeoutMs}ms`));
         }, timeoutMs);
-        const runner = new WorkflowRunner(ctx.cwd, params.args, linked.signal, emit, runSubagentInProcess, view.onState, runId, resolved.origin, runDir);
+        const runner = new WorkflowRunner(ctx.cwd, params.args, linked.signal, emit, runSubagentInProcess, view.onState, runId, resolved.origin, runDir, timeoutMs);
         view.start();
         try {
           const output = await runner.run(resolved.script);
           return { runId, scriptPath: resolved.scriptPath, runDir, output, usage: runner.usage, agents: runner.launchedCount, failures: runner.failuresList };
+        } catch (error) {
+          // The runner's worker deadline also catches loops that prevent the
+          // script thread itself from observing cancellation.
+          if (isScriptExecutionTimeout(error)) {
+            runEntry.timedOut = true;
+            controller.abort(new Error(`workflow timed out after ${timeoutMs}ms`));
+          }
+          throw error;
         } finally {
           clearTimeout(timer);
           // Abort the shared signal so any still-in-flight sibling subagents are
@@ -266,13 +283,15 @@ export default function workflowsExtension(pi: ExtensionAPI) {
           view.finish("completed", result);
           return { content: [{ type: "text", text: formatSummary(result) }], details: result };
         } catch (error) {
-          const outcome = classifyFailure();
+          const outcome = classifyFailure(error);
           view.finish(outcome);
           if (outcome === "cancelled") {
             const message = runEntry.stopReason ?? "workflow cancelled";
             return { content: [{ type: "text", text: `Workflow ${runId} ${message}.` }], details: { runId, status: "cancelled", reason: message } };
           }
-          if (runEntry.timedOut) throw new Error(`workflow timed out after ${timeoutMs}ms`);
+          if (runEntry.timedOut && !(error instanceof WorktreeStartupCleanupError)) {
+            throw new Error(`workflow timed out after ${timeoutMs}ms`);
+          }
           throw error;
         }
       }
@@ -284,7 +303,7 @@ export default function workflowsExtension(pi: ExtensionAPI) {
           deliverCompletion(result, undefined);
         })
         .catch((error) => {
-          const outcome = classifyFailure();
+          const outcome = classifyFailure(error);
           view.finish(outcome);
           const message = outcome === "cancelled" ? runEntry.stopReason ?? "workflow cancelled" : failureMessage(error);
           deliverCompletion(undefined, { runId, error: message, cancelled: outcome === "cancelled" });
@@ -396,6 +415,256 @@ function readToolViewMode(): ToolViewMode {
   return "minimized";
 }
 
+interface QueueWaiter {
+  resume: () => void;
+}
+
+interface SerializedWorkerError {
+  name: string;
+  message: string;
+  stack?: string;
+  code?: string | number;
+}
+
+interface WorkerAgentCall {
+  type: "agent";
+  id: number;
+  task: string;
+  opts?: AgentOptions;
+}
+
+interface WorkerHookCall {
+  type: "phase" | "log";
+  value: string;
+}
+
+interface WorkerResult {
+  type: "result";
+  output: unknown;
+}
+
+interface WorkerFailure {
+  type: "failure";
+  error: SerializedWorkerError;
+}
+
+type WorkflowWorkerMessage = WorkerAgentCall | WorkerHookCall | WorkerResult | WorkerFailure;
+
+type WorkflowWorktreeOptions = Parameters<typeof createWorktree>[1] & { signal?: AbortSignal };
+type WorkflowWorktreeFactory = (
+  sourceCwd: string,
+  options: WorkflowWorktreeOptions,
+) => Promise<Awaited<ReturnType<typeof createWorktree>>>;
+
+/**
+ * The complete script runtime. It deliberately lives in an eval worker so the
+ * parent can terminate JavaScript even when it enters a loop after an await.
+ * Hook calls cross the worker boundary; real agents remain in the parent.
+ */
+const WORKFLOW_WORKER_SOURCE = String.raw`
+"use strict";
+const { parentPort, workerData } = require("node:worker_threads");
+const vm = require("node:vm");
+
+const { AsyncLocalStorage, createHook } = require("node:async_hooks");
+
+const pendingRpc = new Map();
+let nextRpcId = 1;
+let failureSnapshot = [];
+
+// Promise subclassing only sees chains derived directly from an agent promise;
+// native/VM Promise combinators and async functions immediately escape it. Tag
+// the whole script's async tree instead. Non-Promise resources are blockers,
+// while Promise hook activity tells the stable-turn check that continuations
+// are still running. A detached inert Promise is intentionally not a blocker:
+// with no handle or RPC capable of resolving it, it has no work left to run.
+const workflowScope = new AsyncLocalStorage();
+const WORKFLOW_SCOPE = {};
+const scriptResources = new Map();
+let activityVersion = 0;
+let activityWaiters = [];
+let hasUnhandledRejection = false;
+let firstUnhandledRejection;
+
+function markActivity() {
+  activityVersion++;
+  const waiters = activityWaiters;
+  activityWaiters = [];
+  for (const resolve of waiters) resolve();
+}
+
+const asyncHook = createHook({
+  init(asyncId, type) {
+    if (workflowScope.getStore() !== WORKFLOW_SCOPE) return;
+    scriptResources.set(asyncId, type);
+    markActivity();
+  },
+  before(asyncId) {
+    if (scriptResources.has(asyncId)) markActivity();
+  },
+  after(asyncId) {
+    if (scriptResources.has(asyncId)) markActivity();
+  },
+  destroy(asyncId) {
+    if (scriptResources.delete(asyncId)) markActivity();
+  },
+  promiseResolve(asyncId) {
+    if (scriptResources.get(asyncId) === "PROMISE") {
+      scriptResources.delete(asyncId);
+      markActivity();
+    }
+  },
+});
+asyncHook.enable();
+
+process.on("unhandledRejection", (reason) => {
+  if (!hasUnhandledRejection) {
+    hasUnhandledRejection = true;
+    firstUnhandledRejection = reason;
+  }
+  markActivity();
+});
+
+function serializeError(error) {
+  const object = error && (typeof error === "object" || typeof error === "function") ? error : undefined;
+  return {
+    name: object && typeof object.name === "string" ? object.name : "Error",
+    message: object && typeof object.message === "string" ? object.message : String(error),
+    stack: object && typeof object.stack === "string" ? object.stack : undefined,
+    code: object && (typeof object.code === "string" || typeof object.code === "number") ? object.code : undefined,
+  };
+}
+
+function deserializeError(error) {
+  const result = new Error(error && error.message ? error.message : "workflow hook failed");
+  if (error && error.name) result.name = error.name;
+  if (error && error.stack) result.stack = error.stack;
+  if (error && error.code !== undefined) result.code = error.code;
+  return result;
+}
+
+function rpcAgent(task, opts) {
+  const id = nextRpcId++;
+  const promise = new Promise((resolve, reject) => pendingRpc.set(id, { resolve, reject }));
+  parentPort.postMessage({ type: "agent", id, task, opts });
+  markActivity();
+  return promise;
+}
+
+parentPort.on("message", (message) => {
+  if (!message || message.type !== "agent-result") return;
+  const pending = pendingRpc.get(message.id);
+  if (!pending) return;
+  pendingRpc.delete(message.id);
+  if (Array.isArray(message.failures)) failureSnapshot = message.failures;
+  markActivity();
+  if (message.ok) pending.resolve(message.value);
+  else pending.reject(deserializeError(message.error));
+});
+
+function stringifyLog(value) {
+  if (typeof value === "string") return value;
+  try {
+    const json = JSON.stringify(value);
+    return json === undefined ? String(value) : json;
+  } catch {
+    return String(value);
+  }
+}
+
+const api = {
+  agent: (task, opts) => rpcAgent(task, opts),
+  parallel: async (items, fn) => Promise.all(items.map((item, index) => fn(item, index))),
+  pipeline: async (items, fns) => Promise.all(items.map(async (item, index) => {
+    let value = item;
+    for (const fn of fns) value = await fn(value, index);
+    return value;
+  })),
+  workflow: (script) => executeScript(script),
+  phase: (name) => { parentPort.postMessage({ type: "phase", value: name }); },
+  log: (...values) => { parentPort.postMessage({ type: "log", value: values.map(stringifyLog).join(" ") }); },
+  args: () => workerData.args,
+  failures: () => failureSnapshot.map((failure) => ({ ...failure })),
+};
+
+async function executeScript(script) {
+  const context = vm.createContext({
+    ...api,
+    console: { log: api.log, error: api.log },
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    setImmediate,
+    clearImmediate,
+    queueMicrotask,
+  });
+  const wrapped = "(async () => {\n" + script + "\n})()";
+  return await new vm.Script(wrapped, { filename: "workflow.vm.js" }).runInContext(context);
+}
+
+function blockerCount() {
+  let count = pendingRpc.size;
+  for (const type of scriptResources.values()) {
+    if (type !== "PROMISE") count++;
+  }
+  return count;
+}
+
+function nextEventLoopTurn() {
+  return workflowScope.exit(() => new Promise((resolve) => setImmediate(resolve)));
+}
+
+function waitForActivity(observedVersion) {
+  return workflowScope.exit(() => new Promise((resolve) => {
+    if (activityVersion !== observedVersion) resolve();
+    else activityWaiters.push(resolve);
+  }));
+}
+
+function throwUnhandledRejection() {
+  if (hasUnhandledRejection) throw firstUnhandledRejection;
+}
+
+async function waitForQuiescence() {
+  let observedVersion = activityVersion;
+  let stableTurns = 0;
+  while (stableTurns < 2) {
+    throwUnhandledRejection();
+    if (blockerCount() > 0) {
+      stableTurns = 0;
+      await waitForActivity(observedVersion);
+      observedVersion = activityVersion;
+      continue;
+    }
+
+    // Promise reactions and unhandledRejection are observable before/around an
+    // event-loop turn. Require two turns with no script activity so chains that
+    // enqueue more native continuations cannot race the result message.
+    await nextEventLoopTurn();
+    throwUnhandledRejection();
+    const currentVersion = activityVersion;
+    if (blockerCount() === 0 && currentVersion === observedVersion) stableTurns++;
+    else stableTurns = 0;
+    observedVersion = currentVersion;
+  }
+  throwUnhandledRejection();
+}
+
+void (async () => {
+  try {
+    const execution = workflowScope.run(WORKFLOW_SCOPE, () => executeScript(workerData.script));
+    const output = await execution;
+    await waitForQuiescence();
+    asyncHook.disable();
+    parentPort.postMessage({ type: "result", output });
+  } catch (error) {
+    asyncHook.disable();
+    parentPort.postMessage({ type: "failure", error: serializeError(error) });
+  }
+})();
+`;
+
 export class WorkflowRunner {
   launchedCount = 0;
   usage: UsageStats = emptyUsageStats();
@@ -405,14 +674,26 @@ export class WorkflowRunner {
   readonly phases: string[] = [];
   private active = 0;
   private lastMessage?: string;
-  private readonly queue: Array<() => void> = [];
+  private readonly queue: QueueWaiter[] = [];
   private readonly failures: Failure[] = [];
   private readonly agentViews = new Map<number, WorkflowAgentView>();
+  private readonly agentPromises = new Set<Promise<unknown>>();
+  private readonly executorPromises = new Set<Promise<SubagentResult>>();
+  private readonly runController = new AbortController();
+  private readonly externalSignal: AbortSignal;
+  /** Agents are aborted only after the script worker has been terminated. */
+  private readonly runSignal: AbortSignal;
+  private readonly scriptDeadline: number;
+  private hasCallbackFailure = false;
+  private callbackFailure: unknown;
+  private worktreeStartupCleanupFailure?: WorktreeStartupCleanupError;
+  /** Disposal failures may reject an RPC that workflow code catches, but remain terminal. */
+  private worktreeDisposalFailure?: Error;
 
   constructor(
     private readonly cwd: string,
     private readonly workflowArgs: unknown,
-    private readonly signal: AbortSignal,
+    signal: AbortSignal,
     private readonly progress: (message: string) => void,
     private readonly executor: AgentExecutor,
     private readonly onState: (snap: WorkflowSnapshot) => void = () => {},
@@ -420,7 +701,15 @@ export class WorkflowRunner {
     private readonly origin: string = "",
     /** When set, an `events.log` timeline is appended here and agent transcripts land in `<logDir>/agents/`. */
     private readonly logDir?: string,
-  ) {}
+    /** Bounds all worker execution, including loops entered after an await. */
+    scriptTimeoutMs: number = DEFAULT_WORKFLOW_TIMEOUT_MS,
+    /** Test seam; production uses the shared worktree implementation. */
+    private readonly worktreeFactory: WorkflowWorktreeFactory = createWorktree,
+  ) {
+    this.externalSignal = signal;
+    this.runSignal = this.runController.signal;
+    this.scriptDeadline = this.startedAt + Math.max(1, scriptTimeoutMs);
+  }
 
   /** Append one timestamped line to the run's `events.log` (best-effort; file-only). */
   private writeLog(line: string): void {
@@ -456,49 +745,261 @@ export class WorkflowRunner {
     };
   }
 
+  private captureCallbackFailure(error: unknown): void {
+    if (this.hasCallbackFailure) return;
+    this.hasCallbackFailure = true;
+    this.callbackFailure = error;
+  }
+
+  private throwCallbackFailure(): void {
+    if (this.hasCallbackFailure) throw this.callbackFailure;
+  }
+
   private touch(): void {
-    this.onState(this.snapshot());
+    try {
+      this.onState(this.snapshot());
+    } catch (error) {
+      this.captureCallbackFailure(error);
+      throw error;
+    }
   }
 
   /** Emit a human-readable progress line and refresh the live snapshot. */
   private emit(message: string): void {
     this.lastMessage = message;
-    this.progress(message);
+    try {
+      this.progress(message);
+    } catch (error) {
+      this.captureCallbackFailure(error);
+      throw error;
+    }
     this.writeLog(message);
     this.touch();
   }
 
   async run(script: string): Promise<unknown> {
-    const api = {
-      agent: (task: string, opts?: AgentOptions) => this.agent(task, opts),
-      parallel: async <T, R>(items: T[], fn: (item: T, index: number) => Promise<R>): Promise<R[]> =>
-        Promise.all(items.map((item, index) => fn(item, index))),
-      pipeline: async <T>(items: T[], fns: Array<(value: unknown, index: number) => Promise<unknown>>): Promise<unknown[]> =>
-        Promise.all(items.map(async (item, index) => {
-          let value: unknown = item;
-          for (const fn of fns) value = await fn(value, index);
-          return value;
-        })),
-      workflow: (nestedScript: string) => this.run(nestedScript),
-      phase: (name: string) => {
-        this.currentPhase = name;
-        if (!this.phases.includes(name)) this.phases.push(name);
-        this.emit(`▸ phase: ${name}`);
-      },
-      log: (...values: unknown[]) => this.emit(values.map(stringifyLog).join(" ")),
-      args: () => this.workflowArgs,
-      failures: () => this.failuresList,
+    try {
+      this.throwIfAborted();
+      const output = await this.executeScriptWorker(script);
+      // The worker tracks detached agent chains, while this final parent-side
+      // join protects against a response/termination race at the RPC boundary.
+      await this.joinAgents();
+      if (this.worktreeStartupCleanupFailure) throw this.worktreeStartupCleanupFailure;
+      if (this.worktreeDisposalFailure) throw this.worktreeDisposalFailure;
+      this.throwCallbackFailure();
+      this.throwIfAborted();
+      return output;
+    } catch (error) {
+      // executeScriptWorker does not reject for cancellation until terminate()
+      // has completed. Only then do we abort and drain real parent-side agents.
+      this.runController.abort(error);
+      const forcedTermination = this.externalSignal.aborted || isScriptExecutionTimeout(error);
+      // Production agent executions are always fully drained. The bounded path
+      // only preserves recoverability for injected executors that ignore abort.
+      await this.drainAgents(forcedTermination && this.executor !== runSubagentInProcess);
+      // Cancellation is not allowed to hide a failed cleanup that may have left
+      // a worktree behind. Callback failures are likewise terminal even if
+      // workflow code happened to catch the affected hook/RPC rejection.
+      if (this.worktreeStartupCleanupFailure) throw this.worktreeStartupCleanupFailure;
+      if (this.worktreeDisposalFailure) throw this.worktreeDisposalFailure;
+      this.throwCallbackFailure();
+      throw error;
+    }
+  }
+
+  private async executeScriptWorker(script: string): Promise<unknown> {
+    const remainingMs = Math.floor(this.scriptDeadline - Date.now());
+    if (remainingMs <= 0) throw scriptExecutionTimeoutError();
+    if (this.externalSignal.aborted) throw this.abortError(this.externalSignal);
+
+    return await new Promise<unknown>((resolve, reject) => {
+      const worker = new Worker(WORKFLOW_WORKER_SOURCE, {
+        eval: true,
+        name: this.runId ? `workflow-${this.runId}` : "workflow",
+        workerData: { script, args: this.workflowArgs },
+      });
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      const cleanup = (): void => {
+        if (timer) clearTimeout(timer);
+        this.externalSignal.removeEventListener("abort", onAbort);
+        worker.removeListener("message", onMessage);
+        worker.removeListener("error", onError);
+        worker.removeListener("exit", onExit);
+      };
+
+      type WorkerOutcome = { ok: true; output: unknown } | { ok: false; error: unknown };
+      const finish = (outcome: WorkerOutcome): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        void worker.terminate().then(
+          () => outcome.ok ? resolve(outcome.output) : reject(outcome.error),
+          (terminationError) => reject(outcome.ok ? terminationError : outcome.error),
+        );
+      };
+      const fail = (error: unknown): void => finish({ ok: false, error });
+
+      const onAbort = (): void => fail(this.abortError(this.externalSignal));
+      const onError = (error: Error): void => fail(error);
+      const onExit = (code: number): void => {
+        if (!settled) fail(new Error(`workflow worker exited before returning a result (code ${code})`));
+      };
+      const onMessage = (message: WorkflowWorkerMessage): void => {
+        try {
+          if (!message || typeof message !== "object") return;
+          if (message.type === "agent") {
+            // Callback exceptions inside asynchronous agent state/progress paths
+            // are promoted to a worker-fatal error by handleWorkerAgentCall.
+            void this.handleWorkerAgentCall(worker, message).catch(fail);
+            return;
+          }
+          if (message.type === "phase") {
+            this.currentPhase = message.value;
+            if (!this.phases.includes(message.value)) this.phases.push(message.value);
+            this.emit(`▸ phase: ${message.value}`);
+            return;
+          }
+          if (message.type === "log") {
+            this.emit(message.value);
+            return;
+          }
+          if (message.type === "failure") {
+            fail(deserializeWorkerError(message.error));
+            return;
+          }
+          if (message.type === "result") finish({ ok: true, output: message.output });
+        } catch (error) {
+          // EventEmitter does not turn listener exceptions into worker "error"
+          // events. Catch here so hook callback failures reject run() instead of
+          // escaping as process-level uncaughtException.
+          fail(error);
+        }
+      };
+
+      worker.on("message", onMessage);
+      worker.once("error", onError);
+      worker.once("exit", onExit);
+      this.externalSignal.addEventListener("abort", onAbort, { once: true });
+      timer = setTimeout(() => fail(scriptExecutionTimeoutError()), Math.max(1, Math.min(2_147_483_647, remainingMs)));
+      timer.unref?.();
+      // Close the race between the pre-construction check and listener setup.
+      if (this.externalSignal.aborted) onAbort();
+    });
+  }
+
+  private async handleWorkerAgentCall(worker: Worker, call: WorkerAgentCall): Promise<void> {
+    const promise = this.trackAgent(this.agent(call.task, call.opts));
+    try {
+      const value = await promise;
+      this.postWorkerMessage(worker, { type: "agent-result", id: call.id, ok: true, value, failures: this.failuresList });
+    } catch (error) {
+      // Progress/state callbacks are runner infrastructure, not workflow RPC
+      // failures that script code may suppress with try/catch.
+      if (this.hasCallbackFailure) throw this.callbackFailure;
+      this.postWorkerMessage(worker, {
+        type: "agent-result",
+        id: call.id,
+        ok: false,
+        error: serializeWorkerError(error),
+        failures: this.failuresList,
+      });
+    }
+  }
+
+  private postWorkerMessage(worker: Worker, message: unknown): void {
+    try {
+      worker.postMessage(message);
+    } catch {
+      // The script may have been terminated while an agent was settling. The
+      // parent still owns and drains that agent promise.
+    }
+  }
+
+  private async joinAgents(): Promise<void> {
+    for (;;) {
+      const promises = [...this.agentPromises];
+      // The worker owns RPC rejection semantics. If workflow code caught an
+      // agent rejection, this defensive parent join must not throw it again.
+      await Promise.allSettled(promises);
+      if (this.agentPromises.size === promises.length) return;
+    }
+  }
+
+  private async drainAgents(bounded: boolean): Promise<void> {
+    const drain = async (): Promise<void> => {
+      for (;;) {
+        const agents = [...this.agentPromises];
+        const executions = [...this.executorPromises];
+        await Promise.allSettled([...agents, ...executions]);
+        if (this.agentPromises.size === agents.length && this.executorPromises.size === executions.length) return;
+      }
     };
-    // NOTE: sandboxing is intentionally out of scope for v1. The script is
-    // trusted (model-authored on explicit user opt-in) and runs with codegen
-    // available so async/await + closures work normally.
-    const context = vm.createContext({ ...api, console: { log: api.log, error: api.log } });
-    const wrapped = `(async () => {\n${script}\n})()`;
-    return await new vm.Script(wrapped, { filename: "workflow.vm.js" }).runInContext(context);
+    if (!bounded) {
+      await drain();
+      return;
+    }
+
+    // Real executors normally settle promptly after their signal aborts. Keep a
+    // finite escape hatch for injected/broken executors that ignore cancellation.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        drain(),
+        new Promise<void>((resolve) => { timer = setTimeout(resolve, EXTERNAL_AGENT_DRAIN_GRACE_MS); }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private trackAgent(promise: Promise<unknown>): Promise<unknown> {
+    this.agentPromises.add(promise);
+    // The worker receives the rejection over RPC; this parent-side handler also
+    // guarantees a detached call can never emit unhandledRejection here.
+    void promise.catch(() => {});
+    return promise;
+  }
+
+  private trackExecution(promise: Promise<SubagentResult>): Promise<SubagentResult> {
+    this.executorPromises.add(promise);
+    void promise.catch(() => {});
+    return promise;
+  }
+
+  private withAbort<T>(promise: Promise<T>, signal: AbortSignal = this.runSignal): Promise<T> {
+    if (signal.aborted) return Promise.reject(this.abortError(signal));
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = () => {
+        signal.removeEventListener("abort", onAbort);
+        reject(this.abortError(signal));
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      promise.then(
+        (value) => {
+          signal.removeEventListener("abort", onAbort);
+          resolve(value);
+        },
+        (error) => {
+          signal.removeEventListener("abort", onAbort);
+          reject(error);
+        },
+      );
+    });
+  }
+
+  private abortError(signal: AbortSignal = this.runSignal): Error {
+    return new Error("workflow aborted", { cause: signal.reason });
+  }
+
+  private throwIfAborted(): void {
+    if (this.runSignal.aborted) throw this.abortError(this.runSignal);
+    if (this.externalSignal.aborted) throw this.abortError(this.externalSignal);
   }
 
   private async agent(task: string, opts: AgentOptions = {}): Promise<unknown> {
-    if (this.signal.aborted) throw new Error("workflow aborted");
+    this.throwIfAborted();
     if (++this.launchedCount > MAX_AGENTS) throw new Error(`workflow agent cap exceeded (${MAX_AGENTS})`);
     const index = this.launchedCount - 1;
     const label = opts.label ?? `#${index}`;
@@ -513,11 +1014,26 @@ export class WorkflowRunner {
     let worktree: Awaited<ReturnType<typeof createWorktree>> | undefined;
     let succeeded = false;
     try {
+      // Cancellation may happen while this agent is queued. Do not provision a
+      // worktree (or start any other expensive work) after its slot arrives.
+      this.throwIfAborted();
       let effectiveCwd = baseCwd;
       if (opts.worktree) {
         try {
-          worktree = await createWorktree(baseCwd, { worktreeOverride: true });
+          // The shared worktree semaphore/provisioner uses this signal to remove
+          // cancelled queue entries and stop in-progress setup.
+          worktree = await this.worktreeFactory(baseCwd, { worktreeOverride: true, signal: this.runSignal });
         } catch (error) {
+          if (error instanceof WorktreeStartupCleanupError) {
+            this.worktreeStartupCleanupFailure ??= error;
+            const reason = this.recordFailure(index, opts.label, error.message);
+            view.status = "failed";
+            view.finishedAt = Date.now();
+            view.reason = reason;
+            this.emit(`agent ${label} failed: ${reason}`);
+            throw error;
+          }
+          if (this.runSignal.aborted || this.externalSignal.aborted) this.throwIfAborted();
           const detail = error instanceof Error ? error.message : String(error);
           // Non-git cwd is the common case; rephrase around worktree for the workflow author.
           throw new Error(
@@ -527,6 +1043,7 @@ export class WorkflowRunner {
           );
         }
         effectiveCwd = worktree.cwd;
+        this.throwIfAborted();
       }
       view.status = "running";
       view.startedAt = Date.now();
@@ -547,11 +1064,12 @@ export class WorkflowRunner {
         // in-flight agents via the shared signal. Surface it as a rejection so the
         // run fails loudly instead of resolving with silent nulls. A *per-agent*
         // timeout (signal not aborted) is a recorded failure, not a workflow abort.
-        if (this.signal.aborted) throw new Error("workflow aborted");
+        this.throwIfAborted();
         if (result.error) {
+          // opts.retries is exclusively for schema correction. Ordinary executor
+          // failures get the separate 429 backoff policy, but are never rerun here.
           lastReason = result.error.message;
-          if (result.error.reason === "timeout" || result.error.reason === "stop") break;
-          continue;
+          break;
         }
         const value = result.structuredOutput ?? result.output;
         const schemaError = validateSchema(value, opts.schema);
@@ -563,41 +1081,73 @@ export class WorkflowRunner {
           return value;
         }
         lastReason = schemaError;
+        if (attempt >= maxRetries) break;
         prompt = `${task}\n\nYour previous response was rejected: ${schemaError}. Return only valid JSON matching the required shape.`;
         view.status = "retrying";
         view.attempt = attempt + 1;
         this.emit(`agent ${label} retry ${attempt + 1}/${maxRetries}: ${schemaError}`);
       }
-      this.failures.push({ index, label: opts.label, reason: lastReason });
+      const failureReason = this.recordFailure(index, opts.label, lastReason);
       view.status = "failed";
       view.finishedAt = Date.now();
-      view.reason = lastReason;
-      this.emit(`agent ${label} failed: ${lastReason}`);
+      view.reason = failureReason;
+      this.emit(`agent ${label} failed: ${failureReason}`);
       return null;
     } finally {
-      if (worktree) await worktree.dispose(succeeded ? "completed" : "failed").catch(() => {});
-      this.release();
+      try {
+        if (worktree) {
+          try {
+            await worktree.dispose(succeeded ? "completed" : "failed");
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            const reason = this.recordFailure(index, opts.label, `worktree disposal failed: ${detail}`);
+            const terminalFailure = new Error(`agent ${label}: ${reason}`, { cause: error });
+            // Script code can catch the rejected agent() RPC, but a failed
+            // worktree cleanup is runner infrastructure and must still fail
+            // the overall workflow after all parent-owned agents are drained.
+            this.worktreeDisposalFailure ??= terminalFailure;
+            view.status = "failed";
+            view.finishedAt = Date.now();
+            view.reason = reason;
+            this.emit(`agent ${label} failed: ${reason}`);
+            throw terminalFailure;
+          }
+        }
+      } finally {
+        this.release();
+      }
     }
+  }
+
+  private recordFailure(index: number, label: string | undefined, reason: string): string {
+    const existing = this.failures.find((failure) => failure.index === index);
+    if (!existing) {
+      this.failures.push({ index, label, reason });
+      return reason;
+    }
+    if (!existing.reason.includes(reason)) existing.reason = `${existing.reason}; ${reason}`;
+    return existing.reason;
   }
 
   private async runWith429Backoff(task: string, opts: AgentOptions, cwd: string, sessionDir?: string, sessionId?: string) {
     for (let attempt = 0; ; attempt++) {
-      const result = await this.executor({
+      const execution = this.trackExecution(this.executor({
         task,
         cwd,
         tools: opts.tools ?? DEFAULT_WORKFLOW_TOOLS,
         systemPrompt: opts.systemPrompt,
         timeoutMs: opts.timeoutMs,
         mcp: opts.mcp,
-        signal: this.signal,
+        signal: this.runSignal,
         sessionDir,
         sessionId,
-      });
+      }));
+      const result = await this.withAbort(execution);
       if (result.error && isRateLimit(result.error.message) && attempt < MAX_429_RETRIES) {
         const delayMs = Math.min(30_000, 500 * 2 ** attempt) + Math.floor(Math.random() * 250);
         this.rateLimited = true;
         this.emit(`rate-limited; backing off ${delayMs}ms`);
-        await delay(delayMs, this.signal);
+        await delay(delayMs, this.runSignal);
         this.rateLimited = false;
         this.touch();
         continue;
@@ -607,6 +1157,7 @@ export class WorkflowRunner {
   }
 
   private async acquire(): Promise<void> {
+    this.throwIfAborted();
     if (this.active < DEFAULT_CONCURRENCY) {
       this.active++;
       return;
@@ -614,18 +1165,75 @@ export class WorkflowRunner {
     // Wait for a slot. release() hands its slot directly to the next waiter
     // (without decrementing), so we must NOT increment again on resume —
     // otherwise a fresh acquire() in the handoff window could over-subscribe.
-    await new Promise<void>((resolve) => this.queue.push(resolve));
+    await new Promise<void>((resolve, reject) => {
+      let waiter: QueueWaiter;
+      const onAbort = () => {
+        const index = this.queue.indexOf(waiter);
+        if (index < 0) return;
+        this.queue.splice(index, 1);
+        this.runSignal.removeEventListener("abort", onAbort);
+        try {
+          this.touch();
+        } catch (error) {
+          // AbortSignal listener exceptions are otherwise rethrown by Node on a
+          // later tick as uncaughtException. Route this through the waiter.
+          reject(error);
+          return;
+        }
+        reject(this.abortError());
+      };
+      waiter = {
+        resume: () => {
+          this.runSignal.removeEventListener("abort", onAbort);
+          resolve();
+        },
+      };
+      this.queue.push(waiter);
+      this.runSignal.addEventListener("abort", onAbort, { once: true });
+      // Close the race between the initial check and listener registration.
+      if (this.runSignal.aborted) onAbort();
+    });
   }
 
   private release(): void {
     const next = this.queue.shift();
     if (next) {
-      next(); // transfer the held slot to the waiter; active is unchanged
+      next.resume(); // transfer the held slot to the waiter; active is unchanged
     } else {
       this.active = Math.max(0, this.active - 1);
     }
     this.touch();
   }
+}
+
+function serializeWorkerError(error: unknown): SerializedWorkerError {
+  const object = error && (typeof error === "object" || typeof error === "function")
+    ? error as { name?: unknown; message?: unknown; stack?: unknown; code?: unknown }
+    : undefined;
+  return {
+    name: typeof object?.name === "string" ? object.name : "Error",
+    message: typeof object?.message === "string" ? object.message : String(error),
+    stack: typeof object?.stack === "string" ? object.stack : undefined,
+    code: typeof object?.code === "string" || typeof object?.code === "number" ? object.code : undefined,
+  };
+}
+
+function deserializeWorkerError(serialized: SerializedWorkerError): Error {
+  const error = new Error(serialized.message);
+  error.name = serialized.name;
+  if (serialized.stack) error.stack = serialized.stack;
+  if (serialized.code !== undefined) (error as NodeJS.ErrnoException).code = String(serialized.code);
+  return error;
+}
+
+function scriptExecutionTimeoutError(): Error {
+  const error = new Error("Script execution timed out");
+  (error as NodeJS.ErrnoException).code = "ERR_SCRIPT_EXECUTION_TIMEOUT";
+  return error;
+}
+
+function isScriptExecutionTimeout(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === "ERR_SCRIPT_EXECUTION_TIMEOUT";
 }
 
 function validateSchema(value: unknown, schema?: AgentSchema): string | undefined {
@@ -671,15 +1279,6 @@ function linkSignals(a: AbortSignal | undefined, b: AbortSignal): { signal: Abor
       b.removeEventListener("abort", onB);
     },
   };
-}
-
-function stringifyLog(value: unknown): string {
-  if (typeof value === "string") return value;
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
 }
 
 interface WorkflowView {

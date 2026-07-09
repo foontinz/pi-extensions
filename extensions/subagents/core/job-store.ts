@@ -12,6 +12,17 @@ export interface JobStorePaths {
   sessionsDir: string;
 }
 
+/** A short-lived, durable claim made before a job record exists. */
+export interface CapacityReservation {
+  schemaVersion: 1;
+  id: string;
+  ownerId: string;
+  instanceId: string;
+  parentPid: number;
+  repoKey: string;
+  createdAt: number;
+}
+
 export const JOB_STORE_ROOT = process.env.PI_SUBAGENTS_STORE_DIR
   ? path.resolve(process.env.PI_SUBAGENTS_STORE_DIR)
   : path.join(os.homedir(), ".pi", "agent", "subagents");
@@ -26,7 +37,7 @@ export function storePathsForOwner(owner: JobOwnerInfo): JobStorePaths {
 }
 
 export function ensureJobStoreDirsFor(store: JobStorePaths): void {
-  for (const dir of [JOB_STORE_ROOT, JOB_OWNERS_DIR, store.root, store.jobsDir, store.logsDir, store.sessionsDir]) {
+  for (const dir of [JOB_STORE_ROOT, JOB_OWNERS_DIR, store.root, store.jobsDir, store.logsDir, store.sessionsDir, capacityReservationsDirForStore(store)]) {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     try {
       fs.chmodSync(dir, 0o700);
@@ -57,8 +68,76 @@ export function callbackMarkerPathForStore(store: JobStorePaths, id: string): st
   return path.join(store.jobsDir, `${id}.callback.json`);
 }
 
+/** Directory for durable pre-launch capacity claims for one stable owner. */
+export function capacityReservationsDirForStore(store: JobStorePaths): string {
+  return path.join(store.root, "reservations");
+}
+
+export function capacityReservationPathForStore(store: JobStorePaths, reservationId: string): string {
+  return path.join(capacityReservationsDirForStore(store), `${reservationId}.json`);
+}
+
+/**
+ * A single owner-wide lock used only to count records/reservations and create
+ * or remove a reservation. Never hold it while preparing a worktree or
+ * starting a model session.
+ */
+export function capacityLockPathForStore(store: JobStorePaths): string {
+  return path.join(store.root, ".capacity.lock");
+}
+
+export function withOwnerCapacityLock<T>(store: JobStorePaths, action: () => T): T {
+  ensureJobStoreDirsFor(store);
+  return withFileLock(capacityLockPathForStore(store), action);
+}
+
+export function readCapacityReservationsForStore(store: JobStorePaths): CapacityReservation[] {
+  let fileNames: string[];
+  try {
+    fileNames = fs.readdirSync(capacityReservationsDirForStore(store));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+
+  const reservations: CapacityReservation[] = [];
+  for (const fileName of fileNames) {
+    if (!fileName.endsWith(".json")) continue;
+    try {
+      const reservation = JSON.parse(fs.readFileSync(path.join(capacityReservationsDirForStore(store), fileName), "utf-8")) as unknown;
+      if (isCapacityReservation(reservation) && fileName === `${reservation.id}.json`) reservations.push(reservation);
+    } catch {
+      // A concurrent atomic rename or a corrupt stale reservation is not a
+      // usable claim. The next successful reservation writes a fresh record.
+    }
+  }
+  return reservations;
+}
+
+/** Remove reservation records whose owning process no longer exists. */
+export function pruneDeadCapacityReservationsForStore(store: JobStorePaths): CapacityReservation[] {
+  const live: CapacityReservation[] = [];
+  for (const reservation of readCapacityReservationsForStore(store)) {
+    if (isProcessAlive(reservation.parentPid)) {
+      live.push(reservation);
+      continue;
+    }
+    try {
+      fs.rmSync(capacityReservationPathForStore(store, reservation.id), { force: true });
+    } catch {
+      // Keep the claim in this scan if it could not be removed. This is
+      // conservative: a failed cleanup must not permit over-capacity starts.
+      live.push(reservation);
+    }
+  }
+  return live;
+}
+
 export function withJobFileLock<T>(store: JobStorePaths, jobId: string, action: () => T): T {
-  const lockPath = `${jobStatePathForStore(store, jobId)}.lock`;
+  return withFileLock(`${jobStatePathForStore(store, jobId)}.lock`, action);
+}
+
+function withFileLock<T>(lockPath: string, action: () => T): T {
   const started = Date.now();
   while (true) {
     let fd: number | undefined;
@@ -84,6 +163,20 @@ export function withJobFileLock<T>(store: JobStorePaths, jobId: string, action: 
       }
     }
   }
+}
+
+function isCapacityReservation(value: unknown): value is CapacityReservation {
+  if (!value || typeof value !== "object") return false;
+  const reservation = value as Partial<CapacityReservation>;
+  return reservation.schemaVersion === 1
+    && typeof reservation.id === "string"
+    && typeof reservation.ownerId === "string"
+    && typeof reservation.instanceId === "string"
+    && typeof reservation.parentPid === "number"
+    && Number.isInteger(reservation.parentPid)
+    && reservation.parentPid > 0
+    && typeof reservation.repoKey === "string"
+    && typeof reservation.createdAt === "number";
 }
 
 export function writeTextAtomicForStore(store: JobStorePaths, filePath: string, text: string): void {

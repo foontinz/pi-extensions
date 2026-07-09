@@ -24,6 +24,7 @@ import { hydrateJobRecord, serializeJobRecord, UnsupportedJobRecordSchemaError }
 import { createJobId, shortJobId } from "./core/ids.js";
 import {
   callbackMarkerPathForStore,
+  capacityReservationPathForStore,
   ensureJobStoreDirsFor,
   JOB_OWNERS_DIR,
   JOB_STORE_ROOT,
@@ -31,8 +32,10 @@ import {
   jobLogPathForStore,
   jobSessionDirForStore,
   jobStatePathForStore,
+  pruneDeadCapacityReservationsForStore,
   storePathsForOwner,
   withJobFileLock,
+  withOwnerCapacityLock,
   writeJsonAtomicForStore,
   writeTextAtomicForStore,
   type JobStorePaths,
@@ -69,6 +72,8 @@ import {
   prepareWorktree,
   readWorktreeConfig,
   shouldRetainWorktree,
+  WorktreePreparationCleanupError,
+  WorktreeStartupCleanupError,
 } from "./workspace/create-worktree.js";
 import type {
   GitRootError,
@@ -173,6 +178,7 @@ interface AgentJob {
   inProcessHandle?: InProcessHandle;
   cleanupPending?: boolean;
   cleanupError?: string;
+  cleanupPromise?: Promise<void>;
   repoKey?: string;
   phase?: JobPhase;
   cleanupPhase?: CleanupPhase;
@@ -192,10 +198,13 @@ interface StoreDiagnosticWarning {
 
 const INSTANCE_ID_SYMBOL = Symbol.for("pi.subagents.instanceId");
 const jobs = new Map<string, AgentJob>();
-const launchReservations: Array<{ ownerId: string; repoKey: string }> = [];
+const launchReservations: Array<{ ownerId: string; reservationId: string }> = [];
 let launchCapacityMutex: Promise<void> = Promise.resolve();
 let currentOwner: JobOwnerInfo | undefined;
+let sessionStartGeneration = 0;
+let sessionStartHook: ((ctx: ExtensionContext) => void | Promise<void>) | undefined;
 let currentStorePaths: JobStorePaths | undefined;
+let currentSessionContext: ExtensionContext | undefined;
 let extensionApi: ExtensionAPI | undefined;
 let statusContext: ExtensionContext | undefined;
 let statusRefreshTimer: NodeJS.Timeout | undefined;
@@ -278,8 +287,10 @@ function getSubagentsInstanceId(): string {
   return globalState[INSTANCE_ID_SYMBOL]!;
 }
 
-function ownerIdFor(instanceId: string, sessionId: string): string {
-  const digest = createHash("sha256").update(instanceId).update("\0").update(sessionId).digest("hex").slice(0, 16);
+function ownerIdFor(_instanceId: string, sessionId: string): string {
+  // The directory identity must survive a parent process restart. instanceId is
+  // intentionally excluded; it remains useful in records for live-owner checks.
+  const digest = createHash("sha256").update("pi-subagents-owner-v2\0").update(sessionId).digest("hex").slice(0, 16);
   return `owner_${digest}`;
 }
 
@@ -328,6 +339,20 @@ function jobBelongsToCurrentOwner(job: AgentJob): boolean {
   return ownerMatchesCurrent(job.owner);
 }
 
+function clearInMemoryJobsForOwner(ownerId: string): void {
+  for (const [id, job] of jobs) {
+    if (job.owner.id !== ownerId) continue;
+    if (job.timeout) clearTimeout(job.timeout);
+    jobs.delete(id);
+  }
+  for (let index = launchReservations.length - 1; index >= 0; index--) {
+    if (launchReservations[index]!.ownerId === ownerId) launchReservations.splice(index, 1);
+  }
+  for (const [id, job] of pendingFinishedCallbacks) {
+    if (job.owner.id === ownerId) pendingFinishedCallbacks.delete(id);
+  }
+}
+
 function clearInMemoryJobs(): void {
   for (const job of jobs.values()) {
     if (job.timeout) clearTimeout(job.timeout);
@@ -363,20 +388,323 @@ function cleanupLegacyRootStore(): void {
   }
 }
 
+interface ScannedOwnerArtifacts {
+  store: JobStorePaths;
+  records: JobRecord[];
+  malformed: boolean;
+  modifiedAt: number;
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function belongsToOtherLiveProcess(owner: JobOwnerInfo): boolean {
+  if (owner.parentPid === process.pid) {
+    // The process-instance token distinguishes a genuinely active sibling owner
+    // from a dead record whose PID was later reused by this process.
+    return Boolean(currentOwner && owner.instanceId === currentOwner.instanceId && owner.id !== currentOwner.id);
+  }
+  return isProcessAlive(owner.parentPid);
+}
+
+function scanOwnerArtifacts(ownerDirName: string): ScannedOwnerArtifacts {
+  const store: JobStorePaths = {
+    root: path.join(JOB_OWNERS_DIR, ownerDirName),
+    jobsDir: path.join(JOB_OWNERS_DIR, ownerDirName, "jobs"),
+    logsDir: path.join(JOB_OWNERS_DIR, ownerDirName, "logs"),
+    sessionsDir: path.join(JOB_OWNERS_DIR, ownerDirName, "sessions"),
+  };
+  const records: JobRecord[] = [];
+  let malformed = false;
+  let modifiedAt = 0;
+  try { modifiedAt = fs.statSync(store.root).mtimeMs; } catch {}
+  try {
+    for (const fileName of fs.existsSync(store.jobsDir) ? fs.readdirSync(store.jobsDir) : []) {
+      if (!fileName.endsWith(".json") || fileName.endsWith(".callback.json")) continue;
+      const filePath = path.join(store.jobsDir, fileName);
+      try {
+        const record = hydrateJobRecord(fs.readFileSync(filePath, "utf-8"));
+        if (record.owner.id !== ownerDirName || fileName !== `${record.id}.json`) {
+          malformed = true;
+          continue;
+        }
+        records.push(record);
+        modifiedAt = Math.max(modifiedAt, record.updatedAt);
+      } catch {
+        malformed = true;
+      }
+    }
+  } catch {
+    malformed = true;
+  }
+  return { store, records, malformed, modifiedAt };
+}
+
+/** Move only artifacts whose destination is absent; conflicts remain at source. */
+function moveArtifact(source: string, target: string): boolean {
+  if (!fs.existsSync(source)) return true;
+  fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+  if (fs.existsSync(target)) {
+    const sourceStat = fs.lstatSync(source);
+    const targetStat = fs.lstatSync(target);
+    if (!sourceStat.isDirectory() || !targetStat.isDirectory()) return false;
+    for (const entry of fs.readdirSync(source)) {
+      moveArtifact(path.join(source, entry), path.join(target, entry));
+    }
+    try { fs.rmdirSync(source); } catch {}
+    return !fs.existsSync(source);
+  }
+  try {
+    fs.renameSync(source, target);
+  } catch {
+    const isDirectory = fs.lstatSync(source).isDirectory();
+    fs.cpSync(source, target, { recursive: isDirectory, force: false, errorOnExist: true });
+    fs.rmSync(source, { recursive: isDirectory, force: true });
+  }
+  return true;
+}
+
+function removeEmptyDirectoryTree(root: string): void {
+  if (!fs.existsSync(root) || !fs.lstatSync(root).isDirectory()) return;
+  for (const entry of fs.readdirSync(root)) {
+    const child = path.join(root, entry);
+    if (fs.lstatSync(child).isDirectory()) removeEmptyDirectoryTree(child);
+  }
+  try { fs.rmdirSync(root); } catch {}
+}
+
+function recordsDescribeSameLogicalJob(source: JobRecord, destination: JobRecord): boolean {
+  // These fields are immutable after job creation. Matching only the random id
+  // is insufficient: independently created jobs can collide across owner dirs.
+  return source.id === destination.id
+    && source.owner.sessionId === destination.owner.sessionId
+    && source.createdAt === destination.createdAt
+    && source.label === destination.label
+    && source.task === destination.task
+    && source.sourceCwd === destination.sourceCwd
+    && source.supervisor === destination.supervisor;
+}
+
+function claimMigratedRecord(
+  target: JobStorePaths,
+  original: JobRecord,
+  owner: JobOwnerInfo,
+): { claimed: boolean; targetCreated: boolean } {
+  return withJobFileLock(target, original.id, () => {
+    const targetState = jobStatePathForStore(target, original.id);
+    if (fs.existsSync(targetState)) {
+      const existing = hydrateJobRecord(fs.readFileSync(targetState, "utf-8"));
+      if (existing.owner.id !== owner.id || !recordsDescribeSameLogicalJob(original, existing)) {
+        // A same-id collision is not a partial migration: leave the state,
+        // callback, transcript, and logs untouched in both owner directories.
+        return { claimed: false, targetCreated: false };
+      }
+      if (belongsToOtherLiveProcess(existing.owner)) return { claimed: false, targetCreated: false };
+      // Claim dead-owner metadata before any callback can be discovered. The
+      // file lock plus atomic rename prevents two Pi processes from adopting it.
+      existing.owner = structuredClone(owner);
+      writeTextAtomicForStore(target, targetState, serializeJobRecord(existing));
+      return { claimed: true, targetCreated: false };
+    }
+
+    const adopted = structuredClone(original);
+    adopted.owner = structuredClone(owner);
+    writeTextAtomicForStore(target, targetState, serializeJobRecord(adopted));
+    return { claimed: true, targetCreated: true };
+  });
+}
+
+function writeCallbackMarkerExclusive(filePath: string, marker: CallbackMarker): boolean {
+  let fd: number | undefined;
+  let created = false;
+  try {
+    fd = fs.openSync(filePath, "wx", 0o600);
+    created = true;
+    fs.writeFileSync(fd, JSON.stringify(marker) + "\n", "utf-8");
+    fs.fsyncSync(fd);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    if (created) {
+      try { fs.rmSync(filePath, { force: true }); } catch {}
+    }
+    throw error;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+}
+
+function migrateOwnerArtifacts(scan: ScannedOwnerArtifacts, owner: JobOwnerInfo): void {
+  const target = storePathsForOwner(owner);
+  ensureJobStoreDirsFor(target);
+  for (const original of scan.records) {
+    const claim = claimMigratedRecord(target, original, owner);
+    if (!claim.claimed) continue;
+
+    let allAncillaryArtifactsMoved = true;
+    const sourceMarker = callbackMarkerPathForStore(scan.store, original.id);
+    if (fs.existsSync(sourceMarker)) {
+      const parsed = JSON.parse(fs.readFileSync(sourceMarker, "utf-8")) as Partial<CallbackMarker>;
+      if (parsed.id !== original.id || parsed.ownerId !== original.owner.id || (parsed.state !== "pending" && parsed.state !== "delivered")) {
+        throw new Error(`invalid callback marker while migrating job ${original.id}`);
+      }
+      const marker = { ...parsed, ownerId: owner.id } as CallbackMarker;
+      const targetMarker = callbackMarkerPathForStore(target, original.id);
+      if (!writeCallbackMarkerExclusive(targetMarker, marker)) {
+        // Never delete a source marker merely because a destination marker won
+        // the race; its state may contain information absent at destination.
+        allAncillaryArtifactsMoved = false;
+      } else {
+        fs.rmSync(sourceMarker, { force: true });
+      }
+    }
+
+    allAncillaryArtifactsMoved = moveArtifact(
+      jobSessionDirForStore(scan.store, original.id),
+      jobSessionDirForStore(target, original.id),
+    ) && allAncillaryArtifactsMoved;
+    for (const suffix of ["stdout.jsonl", "stderr.log", "exit"] as const) {
+      const source = path.join(scan.store.logsDir, `${original.id}.${suffix}`);
+      allAncillaryArtifactsMoved = moveArtifact(source, path.join(target.logsDir, `${original.id}.${suffix}`)) && allAncillaryArtifactsMoved;
+    }
+
+    // A newly created target record is an exact atomic copy, so its source may
+    // be removed only after every ancillary artifact moved. If the destination
+    // already existed, retain the source record as the conflict-safe backup.
+    if (claim.targetCreated && allAncillaryArtifactsMoved) {
+      fs.rmSync(jobStatePathForStore(scan.store, original.id), { force: true });
+    }
+  }
+  removeEmptyDirectoryTree(scan.store.root);
+}
+
+async function revisitStaleOwnerStore(scan: ScannedOwnerArtifacts): Promise<void> {
+  let touched = false;
+  for (const record of scan.records) {
+    const job = runtimeJobFromRecord(record);
+    if (job.status === "running") {
+      touched = true;
+      finalizeJob(job, "failed", undefined, undefined, "in-process subagent did not survive the parent Pi process");
+    } else if (job.worktree && job.cleanupPhase === "none") {
+      touched = true;
+      cleanupWorktree(job, job.status);
+    }
+    if (job.cleanupPending) {
+      touched = true;
+      await retryWorktreeCleanup(job);
+    }
+  }
+
+  const allTerminalAndClean = scan.records.every((record) =>
+    jobStatusFromPhase(record.phase) !== "running"
+    && (record.cleanupPhase === "complete" || record.cleanupPhase === "retained" || !record.worktree));
+  if (!touched && !scan.malformed && allTerminalAndClean && Date.now() - scan.modifiedAt >= DEFAULT_RUN_RETENTION_MS) {
+    fs.rmSync(scan.store.root, { recursive: true, force: true });
+  }
+}
+
+async function revisitStaleOwnerArtifacts(owner: JobOwnerInfo): Promise<void> {
+  let entries: fs.Dirent[];
+  try {
+    if (!fs.existsSync(JOB_OWNERS_DIR)) return;
+    entries = fs.readdirSync(JOB_OWNERS_DIR, { withFileTypes: true });
+  } catch (error) {
+    recordStoreWarning({ path: JOB_OWNERS_DIR, kind: "unreadable", message: `could not inspect owner artifacts: ${errorMessage(error)}` });
+    return;
+  }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name === owner.id) continue;
+    const scan = scanOwnerArtifacts(entry.name);
+    if (scan.records.some((record) => belongsToOtherLiveProcess(record.owner))) continue;
+    try {
+      const sameSession = scan.records.length > 0 && scan.records.every((record) => record.owner.sessionId === owner.sessionId);
+      if (sameSession && !scan.malformed) migrateOwnerArtifacts(scan, owner);
+      else await revisitStaleOwnerStore(scan);
+    } catch (error) {
+      recordStoreWarning({ path: scan.store.root, kind: "persistence", message: `could not revisit stale owner artifacts: ${errorMessage(error)}` });
+    }
+  }
+}
+
 async function handleSubagentsSessionStart(ctx: ExtensionContext): Promise<void> {
+  // Event delivery can overlap during reload/session replacement. Only the
+  // newest handler may mutate the shared binding after it has yielded.
+  const generation = ++sessionStartGeneration;
+  const isCurrentStart = () => generation === sessionStartGeneration;
   const nextOwner = makeOwner(ctx);
   if (currentOwner && currentOwner.id !== nextOwner.id) {
     await stopRunningJobsForOwner(currentOwner.id, "cancelled because subagents are bounded to the parent Pi session and the previous session ended", 0);
+    if (!isCurrentStart()) return;
   }
+  if (!isCurrentStart()) return;
   bindOwner(nextOwner);
+  currentSessionContext = ctx;
   statusContext = ctx;
   cleanupLegacyRootStore();
+  // Test-only coordination also models any future asynchronous startup work;
+  // always revalidate the generation after an await before binding/loading/
+  // stopping shared session state.
+  if (sessionStartHook) {
+    await sessionStartHook(ctx);
+    if (!isCurrentStart()) return;
+  }
+  await revisitStaleOwnerArtifacts(nextOwner);
+  if (!isCurrentStart()) return;
   // Age out old persisted transcripts for this owner (retention: DEFAULT_RUN_RETENTION_MS).
   if (currentStorePaths) pruneOldRuns(currentStorePaths.sessionsDir, DEFAULT_RUN_RETENTION_MS);
+  if (!isCurrentStart()) return;
   loadPersistedJobs();
+  if (!isCurrentStart()) return;
   await stopRunningJobsForSessionBoundary("cancelled because subagents are bounded to the parent Pi session and the previous session ended", 0);
+  if (!isCurrentStart()) return;
   scheduleRunningJobTimeouts();
   refreshSubagentStatus();
+}
+
+async function handleSubagentsSessionShutdown(ctx: ExtensionContext): Promise<void> {
+  const shutdownOwner = makeOwner(ctx);
+  // A reload can deliver an old context's shutdown after a newer context has
+  // started. It must not invalidate or otherwise touch the newer context.
+  if (currentSessionContext && currentSessionContext !== ctx) return;
+
+  // Invalidate a start that is currently suspended at any await before this
+  // shutdown itself yields. Without this, that start can resume after cleanup
+  // and bind/load jobs into a session that has already shut down.
+  ++sessionStartGeneration;
+
+  await stopRunningJobsForOwner(
+    shutdownOwner.id,
+    "cancelled because the parent Pi session shut down",
+    DEFAULT_STOP_WAIT_MS,
+  );
+  clearInMemoryJobsForOwner(shutdownOwner.id);
+
+  // Re-check after awaiting stops: session_start may have installed a newer
+  // owner while this shutdown handler was suspended.
+  const ownsCurrentSession = currentOwner?.id === shutdownOwner.id
+    && (!currentSessionContext || currentSessionContext === ctx);
+  if (!ownsCurrentSession) return;
+
+  await disposeSharedMcpGateway().catch(() => {});
+  storeWarnings.length = 0;
+  clearCallbackFlushTimer();
+  clearStatusRefreshTimer();
+  currentOwner = undefined;
+  currentStorePaths = undefined;
+  currentSessionContext = undefined;
+  if (ctx.hasUI) ctx.ui.setStatus("subagents", undefined);
+  if (ctx.hasUI) ctx.ui.setWidget("subagents", undefined);
+  if (statusContext === ctx) statusContext = undefined;
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
@@ -412,8 +740,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     ],
     parameters: RunAgentParams,
 
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      bindOwnerToContext(ctx);
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      throwIfAborted(signal);
+      const initiatingOwner = bindOwnerToContext(ctx);
       if (ctx.hasUI) statusContext = ctx;
       loadPersistedJobs();
       refreshSubagentStatus();
@@ -448,7 +777,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
       }
 
-      const capacity = await reserveSubagentCapacity(sourceCwd);
+      throwIfAborted(signal);
+      const capacity = await reserveSubagentCapacity(sourceCwd, signal, initiatingOwner);
       if (!capacity.ok) {
         return {
           content: [{ type: "text", text: capacity.message }],
@@ -458,12 +788,31 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       let job: AgentJob;
       try {
-        job = await startAgentJob(sourceCwd, params, namedAgent, toolSelection.tools, ctx, capacity.repoKey);
+        throwIfAborted(signal);
+        job = await startAgentJob(
+          sourceCwd,
+          params,
+          namedAgent,
+          toolSelection.tools,
+          initiatingOwner,
+          capacity.repoKey,
+          signal,
+          capacity.release,
+        );
+        if (signal?.aborted) {
+          forceStartupWorktreeRemoval(job);
+          forceTerminateJob(job, "cancelled because the run_agent tool call was aborted", "stop");
+          if (job.cleanupPending) await retryWorktreeCleanup(job);
+          throwIfAborted(signal);
+        }
       } finally {
         capacity.release();
       }
       const details = summarizeJob(job);
       const text = formatRunAgentStartResult(job);
+      // The result is now ready to acknowledge the durable background job. A
+      // later abort of the completed parent turn is no longer job cancellation.
+      job.inProcessHandle?.detachStartupSignal?.();
 
       return {
         content: [{ type: "text", text }],
@@ -580,16 +929,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
-    // Subagents are bounded to the parent Pi session. Stop live in-process children
-    // on graceful shutdown/reload.
-    await stopRunningJobsForSessionBoundary("cancelled because the parent Pi session shut down", DEFAULT_STOP_WAIT_MS);
-    await disposeSharedMcpGateway().catch(() => {});
-    clearInMemoryJobs();
-    currentOwner = undefined;
-    currentStorePaths = undefined;
-    if (ctx.hasUI) ctx.ui.setStatus("subagents", undefined);
-    if (ctx.hasUI) ctx.ui.setWidget("subagents", undefined);
-    if (statusContext === ctx) statusContext = undefined;
+    await handleSubagentsSessionShutdown(ctx);
   });
 }
 
@@ -630,23 +970,116 @@ function formatListAgentsResult(agents: AgentConfig[]): string {
   return lines.join("\n");
 }
 
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException("The operation was aborted", "AbortError");
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw abortReason(signal);
+}
+
+async function awaitWithAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return await promise;
+  throwIfAborted(signal);
+  return await new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      cleanup();
+      reject(abortReason(signal));
+    };
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => { cleanup(); resolve(value); },
+      (error) => { cleanup(); reject(error); },
+    );
+  });
+}
+
 type CapacityDetails = { running: number; maxRunning: number; runningForRepo: number; maxRunningPerRepo: number; repoKey: string };
 type CapacityResult =
   | { ok: true; repoKey: string; details: CapacityDetails }
   | { ok: false; repoKey: string; message: string; details: CapacityDetails };
 
-async function checkSubagentCapacity(sourceCwd: string): Promise<CapacityResult> {
-  const repoKey = await subagentRepoKey(sourceCwd);
-  return checkSubagentCapacityForRepo(repoKey);
+function liveRunningRecordsFromOtherProcesses(owner: JobOwnerInfo): JobRecord[] {
+  const store = storePathsForOwner(owner);
+  let fileNames: string[];
+  try {
+    fileNames = fs.readdirSync(store.jobsDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      recordStoreWarning({ path: store.jobsDir, kind: "unreadable", message: `could not count live subagent jobs: ${errorMessage(error)}` });
+    }
+    return [];
+  }
+
+  const records: JobRecord[] = [];
+  for (const fileName of fileNames) {
+    if (!fileName.endsWith(".json") || fileName.endsWith(".callback.json")) continue;
+    try {
+      const record = hydrateJobRecord(fs.readFileSync(path.join(store.jobsDir, fileName), "utf-8"));
+      if (fileName !== `${record.id}.json` || record.owner.id !== owner.id) continue;
+      if (jobStatusFromPhase(record.phase) === "running" && belongsToOtherLiveProcess(record.owner)) records.push(record);
+    } catch {
+      // Capacity scans are observational. Hydration owns diagnostics/quarantine,
+      // and another process may replace a record immediately after this read.
+    }
+  }
+  return records;
 }
 
-function checkSubagentCapacityForRepo(repoKey: string): CapacityResult {
-  const owner = requireCurrentOwner();
-  const runningJobs = [...jobs.values()].filter((job) => job.status === "running" && jobBelongsToCurrentOwner(job));
-  const ownerReservations = launchReservations.filter((reservation) => reservation.ownerId === owner.id);
-  const running = runningJobs.length + ownerReservations.length;
-  const runningForRepo = runningJobs.filter((job) => (job.repoKey ?? job.worktree?.originalRoot ?? job.sourceCwd) === repoKey).length
-    + ownerReservations.filter((reservation) => reservation.repoKey === repoKey).length;
+/** Canonicalize aliases when possible, while retaining deleted persisted paths. */
+function canonicalRepoKey(candidate: string): string {
+  try {
+    return fs.realpathSync(candidate);
+  } catch {
+    return path.resolve(candidate);
+  }
+}
+
+function hasGitMetadataEntry(candidate: string): boolean {
+  try {
+    const stat = fs.statSync(path.join(candidate, ".git"));
+    // Linked worktrees use a .git *file* while ordinary repositories use a
+    // directory. Both are repository roots for Git's --show-toplevel output.
+    return stat.isDirectory() || stat.isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Determine the repository key without yielding while the owner capacity lock
+ * is held. Canonicalize persisted paths before comparing them with a newly
+ * reserved key so symlink aliases do not evade the per-repository limit.
+ */
+function persistedRecordRepoKey(record: JobRecord): string {
+  if (record.worktree?.originalRoot) return canonicalRepoKey(record.worktree.originalRoot);
+  let candidate = canonicalRepoKey(record.sourceCwd);
+  const fallback = candidate;
+  while (true) {
+    if (hasGitMetadataEntry(candidate)) return canonicalRepoKey(candidate);
+    const parent = path.dirname(candidate);
+    if (parent === candidate) return fallback;
+    candidate = parent;
+  }
+}
+
+function checkSubagentCapacityForRepo(repoKey: string, owner: JobOwnerInfo): CapacityResult {
+  repoKey = canonicalRepoKey(repoKey);
+  // In-memory jobs belong to this process; persisted records below cover only
+  // live sibling processes sharing the stable owner directory.
+  const runningJobs = [...jobs.values()].filter((job) => job.status === "running" && job.owner.id === owner.id);
+  const foreignRecords = liveRunningRecordsFromOtherProcesses(owner);
+  const store = storePathsForOwner(owner);
+  // This runs under withOwnerCapacityLock. Dead process claims are pruned
+  // before they participate in the same atomic count-and-reserve operation.
+  const reservations = pruneDeadCapacityReservationsForStore(store)
+    .filter((reservation) => reservation.ownerId === owner.id);
+
+  const running = runningJobs.length + foreignRecords.length + reservations.length;
+  const runningForRepo = runningJobs.filter((job) => canonicalRepoKey(job.repoKey ?? job.worktree?.originalRoot ?? job.sourceCwd) === repoKey).length
+    + foreignRecords.filter((record) => persistedRecordRepoKey(record) === repoKey).length
+    + reservations.filter((reservation) => canonicalRepoKey(reservation.repoKey) === repoKey).length;
   const details = { running, maxRunning: MAX_RUNNING_SUBAGENTS, runningForRepo, maxRunningPerRepo: MAX_RUNNING_SUBAGENTS_PER_REPO, repoKey };
   if (MAX_RUNNING_SUBAGENTS > 0 && running >= MAX_RUNNING_SUBAGENTS) {
     return { ok: false, repoKey, details, message: `Refusing to start subagent: ${running} running jobs already meet PI_SUBAGENTS_MAX_RUNNING=${MAX_RUNNING_SUBAGENTS}. Stop or wait for an existing job, or raise/disable the limit.` };
@@ -657,35 +1090,73 @@ function checkSubagentCapacityForRepo(repoKey: string): CapacityResult {
   return { ok: true, repoKey, details };
 }
 
-async function reserveSubagentCapacity(sourceCwd: string): Promise<CapacityResult & ({ ok: true; release: () => void } | { ok: false })> {
+async function reserveSubagentCapacity(
+  sourceCwd: string,
+  signal?: AbortSignal,
+  owner: JobOwnerInfo = requireCurrentOwner(),
+): Promise<CapacityResult & ({ ok: true; release: () => void } | { ok: false })> {
   let unlock!: () => void;
+  let entered = false;
   const previous = launchCapacityMutex;
   launchCapacityMutex = new Promise<void>((resolve) => { unlock = resolve; });
-  await previous;
   try {
-    const repoKey = await subagentRepoKey(sourceCwd);
-    const capacity = checkSubagentCapacityForRepo(repoKey);
+    await awaitWithAbort(previous, signal);
+    entered = true;
+    throwIfAborted(signal);
+    const repoKey = await subagentRepoKey(sourceCwd, signal);
+    throwIfAborted(signal);
+
+    const store = storePathsForOwner(owner);
+    const reservationId = `reserve_${process.pid.toString(36)}_${randomBytes(8).toString("hex")}`;
+    const reservationPath = capacityReservationPathForStore(store, reservationId);
+    const capacity = withOwnerCapacityLock(store, () => {
+      const result = checkSubagentCapacityForRepo(repoKey, owner);
+      if (!result.ok) return result;
+      writeJsonAtomicForStore(store, reservationPath, {
+        schemaVersion: 1,
+        id: reservationId,
+        ownerId: owner.id,
+        instanceId: owner.instanceId,
+        parentPid: process.pid,
+        repoKey,
+        createdAt: Date.now(),
+      });
+      return result;
+    });
     if (!capacity.ok) return capacity;
-    const ownerId = requireCurrentOwner().id;
-    const reservation = { ownerId, repoKey };
-    launchReservations.push(reservation);
+
+    const localReservation = { ownerId: owner.id, reservationId };
+    launchReservations.push(localReservation);
     let released = false;
     return {
       ...capacity,
       release: () => {
         if (released) return;
-        released = true;
-        const index = launchReservations.indexOf(reservation);
-        if (index >= 0) launchReservations.splice(index, 1);
+        try {
+          withOwnerCapacityLock(store, () => {
+            fs.rmSync(reservationPath, { force: true });
+          });
+          released = true;
+          const index = launchReservations.indexOf(localReservation);
+          if (index >= 0) launchReservations.splice(index, 1);
+        } catch (error) {
+          // Leaving the durable claim behind is conservative. A later process
+          // prunes it after this process exits rather than admitting too many
+          // concurrent jobs after a transient filesystem failure.
+          recordStoreWarning({ path: reservationPath, kind: "persistence", message: `could not release subagent capacity reservation: ${errorMessage(error)}` });
+        }
       },
     };
   } finally {
-    unlock();
+    // A cancelled waiter must not let later reservations overtake the holder it
+    // was queued behind. Hand off its mutex slot only after that holder exits.
+    if (entered) unlock();
+    else void previous.then(unlock, unlock);
   }
 }
 
-async function subagentRepoKey(sourceCwd: string): Promise<string> {
-  return (await getGitRoot(sourceCwd)) ?? path.resolve(sourceCwd);
+async function subagentRepoKey(sourceCwd: string, signal?: AbortSignal): Promise<string> {
+  return canonicalRepoKey((await getGitRoot(sourceCwd, signal)) ?? sourceCwd);
 }
 
 function resolveAndValidateCwd(baseCwd: string, requestedCwd: string | undefined): { ok: true; cwd: string } | { ok: false; cwd: string; message: string } {
@@ -705,21 +1176,53 @@ async function startAgentJob(
   params: Static<typeof RunAgentParams>,
   agent: AgentConfig | undefined,
   effectiveTools: string[],
-  ctx: ExtensionContext,
+  owner: JobOwnerInfo,
   repoKey?: string,
+  signal?: AbortSignal,
+  onInitialRecordPersisted?: () => void,
 ): Promise<AgentJob> {
+  throwIfAborted(signal);
   const id = createJobId();
-  const owner = requireCurrentOwner();
   const store = storePathsForOwner(owner);
+  if (!ownerMatchesCurrent(owner)) {
+    return createFailedPreStartJob(id, sourceCwd, params, agent, "cancelled before launch because the parent Pi session changed", owner, store);
+  }
   let worktreePrep: { cwd: string; worktree?: WorktreeInfo; warning?: string };
   try {
-    worktreePrep = await prepareWorktree(sourceCwd, { worktreeOverride: params.worktree, keepWorktree: params.keepWorktree ?? "never" });
+    worktreePrep = await prepareWorktree(sourceCwd, {
+      worktreeOverride: params.worktree,
+      keepWorktree: params.keepWorktree ?? "never",
+      signal,
+    });
   } catch (error) {
+    if (signal?.aborted) {
+      if (error instanceof WorktreeStartupCleanupError) {
+        persistCancelledStartupCleanupRetry(id, sourceCwd, params, agent, owner, store, error.worktree, error.cleanupCause);
+      }
+      throwIfAborted(signal);
+    }
+    if (error instanceof WorktreePreparationCleanupError) {
+      return persistFailedPreparationCleanupRetry(
+        id,
+        sourceCwd,
+        params,
+        agent,
+        owner,
+        store,
+        error.worktree,
+        error.cleanupCause,
+        error.message,
+      );
+    }
     return createFailedPreStartJob(id, sourceCwd, params, agent, error instanceof Error ? error.message : String(error), owner, store);
   }
+  if (signal?.aborted) {
+    await cleanupCancelledPreparedWorktree(id, sourceCwd, params, agent, owner, store, worktreePrep.worktree);
+    throwIfAborted(signal);
+  }
   if (!ownerMatchesCurrent(owner)) {
-    cleanupWorktreeInfo(worktreePrep.worktree);
-    return createFailedPreStartJob(id, sourceCwd, params, agent, "cancelled before launch because the parent Pi session changed", owner, store);
+    const cleanupRetry = await cleanupCancelledPreparedWorktree(id, sourceCwd, params, agent, owner, store, worktreePrep.worktree);
+    return cleanupRetry ?? createFailedPreStartJob(id, sourceCwd, params, agent, "cancelled before launch because the parent Pi session changed", owner, store);
   }
   const cwd = worktreePrep.cwd;
   const label = params.label?.trim() || agent?.name || `agent-${id}`;
@@ -729,9 +1232,13 @@ async function startAgentJob(
   const thinking = params.thinking ?? agent?.thinking;
   const timeoutMs = params.timeoutMs === undefined ? DEFAULT_TIMEOUT_MS : params.timeoutMs;
 
+  if (signal?.aborted) {
+    await cleanupCancelledPreparedWorktree(id, sourceCwd, params, agent, owner, store, worktreePrep.worktree);
+    throwIfAborted(signal);
+  }
   if (!ownerMatchesCurrent(owner)) {
-    cleanupWorktreeInfo(worktreePrep.worktree);
-    return createFailedPreStartJob(id, sourceCwd, params, agent, "cancelled before launch because the parent Pi session changed", owner, store);
+    const cleanupRetry = await cleanupCancelledPreparedWorktree(id, sourceCwd, params, agent, owner, store, worktreePrep.worktree);
+    return cleanupRetry ?? createFailedPreStartJob(id, sourceCwd, params, agent, "cancelled before launch because the parent Pi session changed", owner, store);
   }
 
   const createdAt = Date.now();
@@ -812,23 +1319,33 @@ async function startAgentJob(
   }
   if (worktreePrep.warning) addLog(job, "error", worktreePrep.warning, "worktree");
 
-  launchInProcessJob(job, { combinedPrompt, model, thinking });
+  launchInProcessJob(job, { combinedPrompt, model, thinking, signal, onInitialRecordPersisted });
   return job;
 }
 
 // Seam so unit tests can drive the in-process supervisor without a live model.
 let inProcessLauncher: typeof startInProcessAgent = startInProcessAgent;
 
-function launchInProcessJob(job: AgentJob, opts: { combinedPrompt: string; model?: string; thinking?: string }): void {
+function launchInProcessJob(job: AgentJob, opts: {
+  combinedPrompt: string;
+  model?: string;
+  thinking?: string;
+  signal?: AbortSignal;
+  onInitialRecordPersisted?: () => void;
+}): void {
   addLog(job, "info", `starting in-process subagent session (cwd: ${job.cwd})`, "start");
   dispatchLifecycleEvent(job, {
     type: "SupervisorStarted",
     handle: { kind: "process", command: "<in-process>", args: [] },
   });
-  persistJob(job);
-  scheduleJobTimeout(job);
   try {
-    job.inProcessHandle = inProcessLauncher({
+    // Capacity reservations may be released only once this running record is
+    // durable. Unlike later best-effort updates, failure here prevents launch
+    // so there is never a count-free startup window between prep and startup.
+    persistJobRecord(job);
+    opts.onInitialRecordPersisted?.();
+    scheduleJobTimeout(job);
+    const handle = inProcessLauncher({
       cwd: job.cwd,
       task: job.task,
       tools: job.effectiveTools,
@@ -836,6 +1353,7 @@ function launchInProcessJob(job: AgentJob, opts: { combinedPrompt: string; model
       model: opts.model,
       thinking: opts.thinking,
       appendSystemPrompt: opts.combinedPrompt || undefined,
+      signal: opts.signal,
       // Persist the full transcript into an isolated per-job dir (read/grep-able).
       sessionDir: jobTranscriptDir(job),
       sessionId: job.id,
@@ -843,8 +1361,12 @@ function launchInProcessJob(job: AgentJob, opts: { combinedPrompt: string; model
         processEvent(job, event as any);
         refreshSubagentStatus();
       },
-      onDone: (outcome) => finalizeInProcessJob(job, outcome),
+      onDone: (outcome) => {
+        finalizeInProcessJob(job, outcome);
+      },
     });
+    if (job.finishedAt) handle.dispose?.();
+    else job.inProcessHandle = handle;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     finalizeJob(job, "failed", undefined, undefined, `failed to start in-process subagent: ${message}`);
@@ -862,8 +1384,11 @@ function finalizeInProcessJob(job: AgentJob, outcome: InProcessOutcome): void {
     return;
   }
   // Natural completion: derive status from the last assistant stopReason.
-  const failedReason = job.stopReason === "error" || job.stopReason === "aborted";
-  finalizeJob(job, failedReason ? "failed" : "completed", failedReason ? undefined : 0, undefined);
+  const failedReason = job.stopReason === "error" || job.stopReason === "aborted" || job.stopReason === "length";
+  const failureMessage = job.stopReason === "length"
+    ? job.errorMessage ?? "subagent output stopped because the model reached its length limit"
+    : job.errorMessage;
+  finalizeJob(job, failedReason ? "failed" : "completed", failedReason ? undefined : 0, undefined, failureMessage);
 }
 
 function createFailedPreStartJob(
@@ -936,6 +1461,154 @@ function createFailedPreStartJob(
   return job;
 }
 
+function persistCancelledStartupCleanupRetry(
+  id: string,
+  sourceCwd: string,
+  params: Static<typeof RunAgentParams>,
+  agent: AgentConfig | undefined,
+  owner: JobOwnerInfo,
+  store: JobStorePaths,
+  worktree: WorktreeInfo,
+  cleanupError: unknown,
+): AgentJob {
+  const now = Date.now();
+  const cleanupMessage = errorMessage(cleanupError);
+  const message = `cancelled during startup; worktree cleanup failed and is pending retry: ${cleanupMessage}`;
+  const retryWorktree: WorktreeInfo = { ...worktree, keepWorktree: "never", retained: undefined };
+  const label = params.label?.trim() || agent?.name || `agent-${id}`;
+  const terminal: TerminalInfo = { phase: "cancelled", reason: "stop", finishedAt: now, message };
+  const record: JobRecord = {
+    schemaVersion: JOB_RECORD_SCHEMA_VERSION,
+    id,
+    owner: structuredClone(owner),
+    label,
+    task: params.task,
+    sourceCwd,
+    cwd: retryWorktree.root,
+    phase: "cancelled",
+    cleanupPhase: "failed",
+    supervisor: "process",
+    createdAt: now,
+    updatedAt: now,
+    startedAt: now,
+    terminal,
+    worktree: structuredClone(retryWorktree),
+    logCursor: initialLogCursor(),
+    usage: emptyUsageStats(),
+  };
+  const job: AgentJob = {
+    record,
+    owner,
+    id,
+    label,
+    agent: agent?.name,
+    agentSource: agent?.source ?? "adhoc",
+    task: params.task,
+    effectiveTools: [],
+    repoKey: retryWorktree.originalRoot,
+    cwd: retryWorktree.root,
+    sourceCwd,
+    worktree: retryWorktree,
+    command: "<in-process>",
+    args: [],
+    startedAt: now,
+    updatedAt: now,
+    finishedAt: now,
+    status: "cancelled",
+    phase: "cancelled",
+    cleanupPhase: "failed",
+    terminal,
+    messageCount: 0,
+    logs: [],
+    nextSeq: 1,
+    latestAssistantText: "",
+    pendingAssistantDelta: "",
+    lastAssistantDeltaLogAt: 0,
+    errorMessage: message,
+    usage: emptyUsageStats(),
+    supervisor: "process",
+    cleanupPending: true,
+    cleanupError: cleanupMessage,
+    waiters: new Set(),
+    closeWaiters: new Set(),
+  };
+  job.result = buildSubagentResult(job);
+  jobs.set(job.id, job);
+  try {
+    // Persist before retrying: a crash during the retry must leave recoverable
+    // ownership rather than an in-memory warning and an orphaned worktree.
+    persistJobRecord(job);
+  } catch (error) {
+    recordStoreWarning({
+      path: jobStatePathForStore(store, id),
+      kind: "persistence",
+      message: `could not persist cancelled-startup cleanup retry: ${errorMessage(error)}`,
+    });
+  }
+  addLog(job, "error", message, "worktree");
+  void retryWorktreeCleanup(job);
+  return job;
+}
+
+function persistFailedPreparationCleanupRetry(
+  id: string,
+  sourceCwd: string,
+  params: Static<typeof RunAgentParams>,
+  agent: AgentConfig | undefined,
+  owner: JobOwnerInfo,
+  store: JobStorePaths,
+  worktree: WorktreeInfo,
+  cleanupError: unknown,
+  preparationMessage: string,
+): AgentJob {
+  // Reuse the durable cleanup-pending construction, then make the terminal
+  // state accurately reflect that provisioning itself failed (rather than a
+  // caller-requested cancellation). The retry worker only relies on cleanup
+  // ownership, so it remains valid after this terminal-state adjustment.
+  const job = persistCancelledStartupCleanupRetry(id, sourceCwd, params, agent, owner, store, worktree, cleanupError);
+  const finishedAt = job.finishedAt ?? Date.now();
+  const message = `worktree preparation failed; cleanup is pending retry: ${preparationMessage}`;
+  const terminal: TerminalInfo = {
+    phase: "failed",
+    reason: "prepare-failed",
+    finishedAt,
+    message,
+    error: message,
+  };
+  job.status = "failed";
+  job.phase = "failed";
+  job.finishedAt = finishedAt;
+  job.terminal = terminal;
+  job.pendingTerminal = undefined;
+  job.errorMessage = message;
+  job.record.phase = "failed";
+  job.record.terminal = terminal;
+  job.record.pendingTerminal = undefined;
+  job.record.updatedAt = Date.now();
+  job.result = buildSubagentResult(job);
+  persistJob(job);
+  return job;
+}
+
+async function cleanupCancelledPreparedWorktree(
+  id: string,
+  sourceCwd: string,
+  params: Static<typeof RunAgentParams>,
+  agent: AgentConfig | undefined,
+  owner: JobOwnerInfo,
+  store: JobStorePaths,
+  worktree: WorktreeInfo | undefined,
+): Promise<AgentJob | undefined> {
+  if (!worktree) return undefined;
+  const retryWorktree: WorktreeInfo = { ...worktree, keepWorktree: "never", retained: undefined };
+  try {
+    await runWorktreeCleanup(retryWorktree);
+    return undefined;
+  } catch (error) {
+    return persistCancelledStartupCleanupRetry(id, sourceCwd, params, agent, owner, store, retryWorktree, error);
+  }
+}
+
 function ensureJobStoreDirs(): void {
   ensureJobStoreDirsFor(requireStorePaths());
 }
@@ -952,13 +1625,17 @@ function jobExitCodePath(id: string): string {
   return jobExitCodePathForStore(requireStorePaths(), id);
 }
 
+function persistJobRecord(job: AgentJob): void {
+  const store = storePathsForOwner(job.owner);
+  ensureJobStoreDirsFor(store);
+  withJobFileLock(store, job.id, () => {
+    writeTextAtomicForStore(store, jobStatePathForStore(store, job.id), serializeJobRecord(lifecycleRecordForJob(job)));
+  });
+}
+
 function persistJob(job: AgentJob): void {
   try {
-    const store = storePathsForOwner(job.owner);
-    ensureJobStoreDirsFor(store);
-    withJobFileLock(store, job.id, () => {
-      writeTextAtomicForStore(store, jobStatePathForStore(store, job.id), serializeJobRecord(lifecycleRecordForJob(job)));
-    });
+    persistJobRecord(job);
   } catch {
     // Best effort: subagents should keep running even if metadata persistence fails.
   }
@@ -1029,6 +1706,7 @@ function applyLifecycleRecordToJob(job: AgentJob, record: JobRecord): void {
   job.terminal = record.terminal;
   job.cwd = record.cwd;
   job.sourceCwd = record.sourceCwd;
+  job.worktree = record.worktree as WorktreeInfo | undefined;
   job.updatedAt = record.updatedAt;
   job.startedAt = record.startedAt ?? record.createdAt;
   job.timeoutAt = record.timeoutAt;
@@ -1103,6 +1781,26 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function adoptPersistedRecordForCurrentOwner(
+  store: JobStorePaths,
+  id: string,
+  owner: JobOwnerInfo,
+): JobRecord | undefined {
+  return withJobFileLock(store, id, () => {
+    const statePath = jobStatePathForStore(store, id);
+    const latest = hydrateJobRecord(fs.readFileSync(statePath, "utf-8"));
+    if (latest.id !== id || latest.owner.id !== owner.id) {
+      throw new Error(`persisted job ${id} changed identity while adopting its owner`);
+    }
+    if (belongsToOtherLiveProcess(latest.owner)) return undefined;
+    latest.owner = structuredClone(owner);
+    // Persist the claim before hydration can finalize the job or enqueue its
+    // callback. Another process re-reading under the lock will now see us live.
+    writeTextAtomicForStore(store, statePath, serializeJobRecord(latest));
+    return latest;
+  });
+}
+
 function loadPersistedJobs(): void {
   const owner = requireCurrentOwner();
   let store: JobStorePaths;
@@ -1126,28 +1824,35 @@ function loadPersistedJobs(): void {
     if (!fileName.endsWith(".json") || fileName.endsWith(".callback.json")) continue;
     const filePath = path.join(store.jobsDir, fileName);
     try {
-      const raw = fs.readFileSync(filePath, "utf-8");
-      const record = hydrateJobRecord(raw);
-      if (record.owner.id !== owner.id) {
-        recordStoreWarning({ path: filePath, kind: "corrupt", message: `job record owner ${record.owner.id} does not match active owner ${owner.id}` });
-        quarantineJobRecord(filePath, "corrupt", `job record owner ${record.owner.id} does not match active owner ${owner.id}`);
+      const scanned = hydrateJobRecord(fs.readFileSync(filePath, "utf-8"));
+      if (scanned.owner.id !== owner.id) {
+        recordStoreWarning({ path: filePath, kind: "corrupt", message: `job record owner ${scanned.owner.id} does not match active owner ${owner.id}` });
+        quarantineJobRecord(filePath, "corrupt", `job record owner ${scanned.owner.id} does not match active owner ${owner.id}`);
         continue;
       }
-      if (fileName !== `${record.id}.json`) {
-        recordStoreWarning({ path: filePath, kind: "corrupt", message: `job record id ${record.id} does not match file name ${fileName}` });
-        quarantineJobRecord(filePath, "corrupt", `job record id ${record.id} does not match file name ${fileName}`);
+      if (fileName !== `${scanned.id}.json`) {
+        recordStoreWarning({ path: filePath, kind: "corrupt", message: `job record id ${scanned.id} does not match file name ${fileName}` });
+        quarantineJobRecord(filePath, "corrupt", `job record id ${scanned.id} does not match file name ${fileName}`);
+        continue;
+      }
+      const record = adoptPersistedRecordForCurrentOwner(store, scanned.id, owner);
+      if (!record) {
+        // Stable owner directories can be shared only if another Pi process was
+        // opened on the same session. Never abandon or rewrite that live owner.
         continue;
       }
       const existing = jobs.get(record.id);
       if (existing) {
         applyLifecycleRecordToJob(existing, record);
         if (existing.status === "running") reattachOrAbandonHydratedJob(existing);
+        else if (existing.worktree && existing.cleanupPhase === "none") cleanupWorktree(existing, existing.status);
         if (existing.cleanupPending) void retryWorktreeCleanup(existing);
         continue;
       }
       const job = runtimeJobFromRecord(record);
       jobs.set(job.id, job);
       if (job.status === "running") reattachOrAbandonHydratedJob(job);
+      else if (job.worktree && job.cleanupPhase === "none") cleanupWorktree(job, job.status);
       if (job.cleanupPending) void retryWorktreeCleanup(job);
     } catch (error) {
       const kind = classifyHydrationFailure(error);
@@ -1279,12 +1984,12 @@ function scheduleJobTimeout(job: AgentJob): void {
   const remaining = job.timeoutAt - Date.now();
   const timeoutReason = `timeout at ${new Date(job.timeoutAt).toISOString()}`;
   if (remaining <= 0) {
-    if (job.status === "running") terminateJob(job, timeoutReason, "timeout");
+    if (job.status === "running") void stopAgentJob(job, timeoutReason, DEFAULT_STOP_WAIT_MS, "timeout");
     return;
   }
   job.timeout = setTimeout(() => {
     job.timeout = undefined;
-    if (job.status === "running") terminateJob(job, timeoutReason, "timeout");
+    if (job.status === "running") void stopAgentJob(job, timeoutReason, DEFAULT_STOP_WAIT_MS, "timeout");
   }, remaining);
   job.timeout.unref?.();
 }
@@ -1551,16 +2256,55 @@ async function stopRunningJobsForOwner(ownerId: string | undefined, reason: stri
   }
 }
 
-async function stopAgentJob(job: AgentJob, reason: string, waitMs: number): Promise<boolean> {
+async function stopAgentJob(
+  job: AgentJob,
+  reason: string,
+  waitMs: number,
+  intent: "stop" | "timeout" | "error" = "stop",
+): Promise<boolean> {
   if (job.status !== "running") return true;
-  terminateJob(job, reason, "stop");
+  terminateJob(job, reason, intent);
   if (waitMs > 0) {
     const deadline = Date.now() + waitMs;
     while (Date.now() < deadline && job.status === "running") {
       await sleep(Math.min(100, Math.max(0, deadline - Date.now())));
     }
   }
+  if (job.status === "running") forceTerminateJob(job, reason, intent);
+  if (job.status !== "running" && job.cleanupPending) await retryWorktreeCleanup(job);
   return job.status !== "running";
+}
+
+function forceStartupWorktreeRemoval(job: AgentJob): void {
+  if (!job.worktree) return;
+  job.worktree.keepWorktree = "never";
+  delete job.worktree.retained;
+  if (job.record.worktree) {
+    job.record.worktree.keepWorktree = "never";
+    delete job.record.worktree.retained;
+  }
+  if (job.cleanupPhase === "retained") {
+    job.cleanupPhase = "none";
+    job.record.cleanupPhase = "none";
+  }
+  if (job.status !== "running") cleanupWorktree(job, job.status);
+}
+
+function forceTerminateJob(job: AgentJob, reason: string, intent: "stop" | "timeout" | "error" = "stop"): void {
+  if (job.status !== "running") return;
+  const handle = job.inProcessHandle;
+  try {
+    if (handle?.forceAbort) handle.forceAbort();
+    else {
+      handle?.abort();
+      handle?.dispose?.();
+    }
+  } catch {
+    // Terminalization below must run even if SDK teardown throws.
+  }
+  if (job.status === "running") {
+    finalizeJob(job, intent === "stop" ? "cancelled" : "failed", undefined, undefined, reason);
+  }
 }
 
 function terminateJob(job: AgentJob, reason: string, intent: "stop" | "timeout" | "error" = "stop"): boolean {
@@ -1577,13 +2321,10 @@ function terminateJob(job: AgentJob, reason: string, intent: "stop" | "timeout" 
 
   job.errorMessage = reason;
   if (job.timeout) clearTimeout(job.timeout);
-  // session.abort() resolves the in-flight prompt; finalizeInProcessJob runs on the
-  // resulting onDone(aborted) callback. Finalize directly if the session never started.
-  if (job.inProcessHandle) {
-    job.inProcessHandle.abort();
-  } else {
-    finalizeJob(job, intent === "stop" ? "cancelled" : "failed", undefined, undefined, reason);
-  }
+  // session.abort() normally resolves the in-flight prompt; stopAgentJob owns
+  // escalation to forceAbort() when it does not settle within the grace period.
+  if (job.inProcessHandle) job.inProcessHandle.abort();
+  else finalizeJob(job, intent === "stop" ? "cancelled" : "failed", undefined, undefined, reason);
   return true;
 }
 
@@ -1662,6 +2403,7 @@ function finalizeJob(
     job.finishedAt = finishedAt;
   }
   if (errorMessage) job.errorMessage = errorMessage;
+  job.inProcessHandle = undefined;
   job.result = buildSubagentResult(job);
   if (!job.finalOutput && job.result.output) job.finalOutput = job.result.output;
   cleanupWorktree(job, job.status);
@@ -1720,6 +2462,7 @@ function flushPendingFinishedCallbacks(): void {
   try {
     api.sendUserMessage(message, { deliverAs: ctx.isIdle() ? "followUp" : "steer" });
     for (const job of callbackJobs) markCallbackDelivered(job.id);
+    pruneFinishedJobs();
   } catch (error) {
     for (const job of callbackJobs) markCallbackDeliveryFailed(job.id, error);
     tryNotify(
@@ -1911,7 +2654,7 @@ function notifyCloseWaiters(job: AgentJob): void {
 
 function cleanupWorktree(job: AgentJob, status: JobStatus): void {
   const worktree = job.worktree;
-  if (!worktree) return;
+  if (!worktree || job.cleanupPhase === "complete") return;
   const before = job.cleanupPhase;
   try {
     dispatchLifecycleEvent(job, { type: "CleanupRequested" });
@@ -1922,6 +2665,11 @@ function cleanupWorktree(job: AgentJob, status: JobStatus): void {
     worktree.retained = true;
     job.cleanupPhase = "retained";
     job.cleanupPending = false;
+    job.record.cleanupPhase = "retained";
+    if (job.record.worktree) job.record.worktree.retained = true;
+    // Hydration/recovery has no later finish log to incidentally persist this
+    // transition, so make retained ownership durable before returning.
+    persistJob(job);
     return;
   }
   if (job.cleanupPhase !== "running") job.cleanupPhase = before === "failed" ? "failed" : "running";
@@ -1931,6 +2679,8 @@ function cleanupWorktree(job: AgentJob, status: JobStatus): void {
   void retryWorktreeCleanup(job);
 }
 
+let runWorktreeCleanup: (worktree: WorktreeInfo) => Promise<void> = cleanupWorktreeAsync;
+
 function retryPendingWorktreeCleanups(): void {
   for (const job of jobs.values()) {
     if (job.cleanupPending) void retryWorktreeCleanup(job);
@@ -1938,33 +2688,31 @@ function retryPendingWorktreeCleanups(): void {
 }
 
 async function retryWorktreeCleanup(job: AgentJob): Promise<void> {
+  if (job.cleanupPromise) return await job.cleanupPromise;
   const worktree = job.worktree;
   if (!worktree || !job.cleanupPending) return;
+  const cleanup = (async () => {
+    try {
+      await runWorktreeCleanup(worktree);
+      dispatchLifecycleEvent(job, { type: "CleanupSucceeded" });
+      job.cleanupPending = false;
+      job.cleanupError = undefined;
+      addLog(job, "info", `worktree cleanup ok: ${worktree.root}`, "worktree");
+    } catch (error) {
+      job.cleanupPending = true;
+      job.cleanupError = error instanceof Error ? error.message : String(error);
+      try { dispatchLifecycleEvent(job, { type: "CleanupFailed", error: job.cleanupError }); } catch {}
+      addLog(job, "error", `worktree cleanup failed: ${job.cleanupError}`, "worktree");
+    } finally {
+      persistJob(job);
+    }
+  })();
+  job.cleanupPromise = cleanup;
   try {
-    await cleanupWorktreeAsync(worktree);
-    dispatchLifecycleEvent(job, { type: "CleanupSucceeded" });
-    job.cleanupPending = false;
-    job.cleanupError = undefined;
-    addLog(job, "info", `worktree cleanup ok: ${worktree.root}`, "worktree");
-  } catch (error) {
-    job.cleanupPending = true;
-    job.cleanupError = error instanceof Error ? error.message : String(error);
-    try { dispatchLifecycleEvent(job, { type: "CleanupFailed", error: job.cleanupError }); } catch {}
-    addLog(job, "error", `worktree cleanup failed: ${job.cleanupError}`, "worktree");
+    await cleanup;
   } finally {
-    persistJob(job);
+    if (job.cleanupPromise === cleanup) job.cleanupPromise = undefined;
   }
-}
-
-function cleanupWorktreeInfo(worktree: WorktreeInfo | undefined, status: JobStatus = "failed"): void {
-  if (!worktree) return;
-  if (shouldRetainWorktree(worktree, status)) {
-    worktree.retained = true;
-    return;
-  }
-  void cleanupWorktreeAsync(worktree).catch(() => {
-    // ignore cleanup failures in pre-job error paths
-  });
 }
 
 function getLogsSince(job: AgentJob, sinceSeq: number, maxLogEntries: number): AgentLogEntry[] {
@@ -1996,12 +2744,20 @@ function formatPollResult(job: AgentJob, logs: AgentLogEntry[], nextSeq: number,
 function pruneFinishedJobs(): void {
   const pruneable = [...jobs.values()]
     .filter(jobBelongsToCurrentOwner)
-    .filter((job) => job.status !== "running" && !hasUnresolvedCleanup(job))
+    .filter((job) => job.status !== "running" && !hasUnresolvedCleanup(job) && !hasPendingCallbackMarker(job))
     .sort((a, b) => (b.finishedAt ?? b.updatedAt) - (a.finishedAt ?? a.updatedAt));
   for (const job of pruneable.slice(MAX_RETAINED_FINISHED_JOBS)) {
     jobs.delete(job.id);
     removePersistedJobFiles(job.id);
   }
+}
+
+function hasPendingCallbackMarker(job: AgentJob): boolean {
+  const markerPath = callbackMarkerPathForStore(storePathsForOwner(job.owner), job.id);
+  if (!fs.existsSync(markerPath)) return false;
+  // Preserve malformed/unreadable markers too: pruning must not destroy the job
+  // payload while callback state may still require recovery.
+  return readCallbackMarkerForOwner(job.owner, job.id)?.state !== "delivered";
 }
 
 function hasUnresolvedCleanup(job: AgentJob): boolean {
@@ -2054,6 +2810,7 @@ export const __subagentsTest = {
     return jobs.get(id);
   },
   clearJobs() {
+    sessionStartHook = undefined;
     for (const job of jobs.values()) {
       if (job.timeout) clearTimeout(job.timeout);
     }
@@ -2066,11 +2823,21 @@ export const __subagentsTest = {
   setInProcessLauncher(launcher: typeof startInProcessAgent | undefined) {
     inProcessLauncher = launcher ?? startInProcessAgent;
   },
+  setWorktreeCleanup(cleanup: ((worktree: WorktreeInfo) => Promise<void>) | undefined) {
+    runWorktreeCleanup = cleanup ?? cleanupWorktreeAsync;
+  },
+  retryWorktreeCleanup,
   finalizeInProcessJob,
   refreshSubagentStatus,
   loadPersistedJobs,
   recentStoreWarnings,
   stopRunningJobsForSessionBoundary,
+  stopAgentJob,
+  reserveSubagentCapacity,
+  ownerIdFor,
+  revisitStaleOwnerArtifacts,
+  handleSubagentsSessionShutdown,
+  pruneFinishedJobs,
   forgetJobForCallbackRetry(id: string) {
     jobs.delete(id);
   },
@@ -2084,6 +2851,9 @@ export const __subagentsTest = {
   flushPendingFinishedCallbacks,
   bindOwnerToContext,
   handleSubagentsSessionStart,
+  setSessionStartHook(hook: ((ctx: ExtensionContext) => void | Promise<void>) | undefined) {
+    sessionStartHook = hook;
+  },
   cleanupLegacyRootStore,
   makeTestOwner(id = `owner_test_${process.pid}`): JobOwnerInfo {
     return { version: 1, id, instanceId: id, sessionId: id, parentPid: process.pid, cwd: "/repo" };
@@ -2091,6 +2861,7 @@ export const __subagentsTest = {
   setOwnerHarness(owner: JobOwnerInfo | undefined) {
     currentOwner = owner;
     currentStorePaths = owner ? storePathsForOwner(owner) : undefined;
+    currentSessionContext = undefined;
   },
   getCurrentOwner() {
     return currentOwner;
