@@ -20,6 +20,11 @@ import { BoundedBackgroundLog } from "./background-log";
 const DEFAULT_TIMEOUT_S = 120;
 const MAX_TIMEOUT_S = 1800; // 30 min hard ceiling
 
+// --- Idle-sleep guardrail ----------------------------------------------------
+// Block foreground commands that burn a `sleep` just to wait: the agent should
+// instead launch a background watcher (background:true) and keep working.
+const MAX_SLEEP_S = 160;
+
 // --- Background job limits ---------------------------------------------------
 const MAX_RUNNING_JOBS = 10; // refuse to start more than this many at once
 const MAX_RETAINED_JOBS = 50; // prune oldest finished jobs beyond this
@@ -100,6 +105,83 @@ function tailFile(path: string, maxBytes: number): string {
 function oneLine(s: string, max = 120): string {
   const flat = s.replace(/\s+/g, " ").trim();
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
+
+// Parse the seconds implied by one `sleep` argument list (the text captured
+// after the `sleep` keyword up to the next shell separator). Handles unit
+// suffixes (s/m/h/d) and summed args (`sleep 1m 30` -> 90), matching coreutils
+// semantics. Returns null if the args aren't a plain literal duration
+// (e.g. `sleep $VAR`, options) so we don't guess.
+function parseSleepArgs(argStr: string): number | null {
+  const tokens = argStr.trim().split(/\s+/);
+  let total = 0;
+  let valid = false;
+  for (const tok of tokens) {
+    const tm = /^([0-9]+(?:\.[0-9]+)?)([smhd]?)$/.exec(tok);
+    if (!tm) break; // stop at first non-duration token (options / next cmd word)
+    valid = true;
+    const n = Number.parseFloat(tm[1]);
+    const unit = tm[2] || "s";
+    const mult = unit === "m" ? 60 : unit === "h" ? 3600 : unit === "d" ? 86400 : 1;
+    total += n * mult;
+  }
+  return valid ? total : null;
+}
+
+// Match `sleep` only at a command position: start of string, or after a shell
+// separator (; & | && || newline ( ) { } backtick) or a loop/cond keyword.
+const SLEEP_AT_CMD = /(?:^|[\n;&|(){}`]|\b(?:do|then|else)\b)\s*sleep\s+([0-9][^\n;&|(){}`]*)/gi;
+
+const isSleepStmt = (s: string) => /^sleep\s+/.test(s);
+// A "no-op" statement carries no real work: sleeps, echoes, comments, and the
+// `:`/`true`/`false` builtins. Used to decide whether a `sleep` is glued to
+// actual work or is just idling padded with filler.
+const isNoopStmt = (s: string) =>
+  isSleepStmt(s) || /^echo\b/.test(s) || s === ":" || s === "true" || s === "false" || s.startsWith("#");
+
+// Detect foreground commands that just idle. Three cases:
+//  - "poll-loop": a while/until loop whose body is nothing but sleeps
+//    (+ echoes) — a "wait for X to come up" spin; block regardless of the
+//    per-iteration duration, since it can idle indefinitely.
+//  - "bare-wait": the command is only sleep(s) (plus filler like echo/true),
+//    i.e. a pure wait with no real work — block regardless of duration, so
+//    tricks like `sleep 155` or `sleep 155 && echo done` don't slip under a cap.
+//  - "duration": a sleep is glued to real work but the total exceeds the
+//    threshold (e.g. `build && sleep 500`). Short inline sleeps stay allowed.
+// Returns a reason (+ total seconds for "duration"), or null when fine.
+function detectIdleWait(command: string, thresholdS: number): { reason: "duration"; seconds: number } | { reason: "poll-loop" | "bare-wait" } | null {
+  // Pure-wait loops: body between do…done contains a sleep and no real work.
+  const loopRe = /\b(?:while|until)\b[\s\S]*?\bdo\b([\s\S]*?)\bdone\b/gi;
+  let loop: RegExpExecArray | null;
+  while ((loop = loopRe.exec(command)) !== null) {
+    const stmts = loop[1].split(/[;\n]|&&|\|\|/).map((s) => s.trim()).filter(Boolean);
+    if (stmts.some(isSleepStmt) && !stmts.some((s) => !isNoopStmt(s))) return { reason: "poll-loop" };
+  }
+
+  // Bare wait: every statement is a no-op (with ≥1 sleep) — a pure wait with no
+  // real work. Real loops/conditionals carry non-no-op statements (the loop
+  // header, work commands) so they don't trip this; genuine wait loops are
+  // already caught above as "poll-loop".
+  const stmts = command.split(/[;\n]|&&|\|\|/).map((s) => s.trim()).filter(Boolean);
+  if (stmts.some(isSleepStmt) && !stmts.some((s) => !isNoopStmt(s))) {
+    return { reason: "bare-wait" };
+  }
+
+  // Duration: sum every literal sleep in the command (catches long sleeps that
+  // are glued to real work, e.g. `deploy && sleep 500`).
+  let total = 0;
+  let sawSleep = false;
+  let m: RegExpExecArray | null;
+  SLEEP_AT_CMD.lastIndex = 0;
+  while ((m = SLEEP_AT_CMD.exec(command)) !== null) {
+    const secs = parseSleepArgs(m[1]);
+    if (secs !== null) {
+      total += secs;
+      sawSleep = true;
+    }
+  }
+  if (sawSleep && total > thresholdS) return { reason: "duration", seconds: total };
+  return null;
 }
 
 // Keep untrusted command/output text inert in a custom message. This is not a
@@ -450,7 +532,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     ...(base as any),
     parameters: schema,
-    promptSnippet: "Execute bash commands (background:true for long-running servers/watchers/builds).",
+    promptSnippet: "Execute bash commands (background:true for long-running servers/watchers/builds; never idle in a foreground sleep/poll-loop — background a watcher instead).",
     description:
       "Execute a bash command. Foreground commands get a default timeout " +
       `(${DEFAULT_TIMEOUT_S}s, cap ${MAX_TIMEOUT_S}s) and run non-interactively. ` +
@@ -458,7 +540,9 @@ export default function (pi: ExtensionAPI) {
       "(read it with the read tool; a separately capped recovery file is reported if needed) and you are notified on completion. " +
       "After starting a background job, do NOT monitor it yourself: do not poll, sleep, or tail its log in a loop. " +
       "End your turn and wait for the completion notification. Only inspect a running job when genuinely needed " +
-      "(user asks for status, you suspect it is stuck and may `kill` it, or a later step this turn hard-depends on its output).",
+      "(user asks for status, you suspect it is stuck and may `kill` it, or a later step this turn hard-depends on its output). " +
+      `Do NOT wait by sleeping: foreground commands that idle in a \`sleep\`/poll-loop (or exceed ${MAX_SLEEP_S}s total) are blocked — ` +
+      "run the wait/poll as a background watcher (background:true) instead and keep working.",
     async execute(id: string, params: Params, signal: AbortSignal | undefined, onUpdate: any, ctx: ExtensionContext) {
       currentCtx = ctx;
       if (params.background) {
@@ -481,6 +565,30 @@ export default function (pi: ExtensionAPI) {
           const message = err instanceof Error ? err.message : String(err);
           throw new Error(`Could not start background job: ${message}`, { cause: err });
         }
+      }
+      const idle = detectIdleWait(params.command, MAX_SLEEP_S);
+      if (idle !== null) {
+        const why =
+          idle.reason === "duration"
+            ? `this command sleeps ~${Math.round(idle.seconds)}s total (> ${MAX_SLEEP_S}s limit)`
+            : idle.reason === "poll-loop"
+              ? "this is a foreground poll loop that only sleeps while waiting for a condition"
+              : "this command is a bare `sleep` whose only purpose is to wait";
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Blocked: ${why}. Do not idle in a foreground \`sleep\`/wait loop. ` +
+                "Instead, launch the wait/poll as a background job with background:true — e.g. a watcher " +
+                "that polls a URL/file/process and exits once the condition is met. You'll be notified when " +
+                "it finishes, so end your turn and keep working on something else meanwhile. " +
+                `A brief sleep chained to real work (e.g. \`start && sleep 3 && curl ...\`) is fine, up to ${MAX_SLEEP_S}s.`,
+            },
+          ],
+          isError: true,
+          details: undefined,
+        };
       }
       const requested = typeof params.timeout === "number" && params.timeout > 0 ? params.timeout : DEFAULT_TIMEOUT_S;
       const timeout = Math.min(Math.max(1, Math.floor(requested)), MAX_TIMEOUT_S);
