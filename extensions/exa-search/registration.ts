@@ -9,7 +9,10 @@ export interface ExaManagedEnvVar {
 export interface ExaCodeHandle {
 	name: string;
 	summary?: string;
+	aliases?: string[];
 	keywords?: string[];
+	capabilities?: string[];
+	exampleGoals?: string[];
 	envVars?: string[];
 	setupCode: string;
 	docs: string;
@@ -38,9 +41,21 @@ const EXA_ENV_VAR: ExaManagedEnvVar = {
 const EXA_HANDLE: ExaCodeHandle = {
 	name: "exa",
 	summary: "Search the public web, fetch page contents from URLs, and generate cited answers with Exa.",
+	aliases: ["exa search", "web search"],
 	keywords: [
 		"search", "web", "internet", "research", "docs", "documentation",
 		"news", "content", "crawl", "url", "urls", "fetch", "exa",
+	],
+	capabilities: [
+		"search the web and internet",
+		"find current news, research, and documentation",
+		"fetch and extract content from URLs",
+		"answer questions with web citations",
+	],
+	exampleGoals: [
+		"look up current information online",
+		"read the contents of this URL",
+		"research a topic and cite sources",
 	],
 	envVars: ["EXA_API_KEY"],
 	setupCode: `

@@ -5,6 +5,7 @@ export const PLAYWRIGHT_CODE_HANDLE = {
 	name: "playwright",
 	summary:
 		"Control a browser with Playwright: launch Chromium/Firefox/WebKit, navigate pages, click or fill elements, take screenshots, and execute JavaScript in the page context.",
+	aliases: ["pw", "playwright browser"],
 	keywords: [
 		"browser",
 		"playwright",
@@ -26,6 +27,18 @@ export const PLAYWRIGHT_CODE_HANDLE = {
 		"headless",
 		"website",
 		"webapp",
+	],
+	capabilities: [
+		"automate and control a web browser",
+		"navigate webpages and inspect the DOM",
+		"click elements and fill forms",
+		"capture webpage screenshots",
+		"run browser-based end-to-end tests",
+	],
+	exampleGoals: [
+		"open a website and submit a form",
+		"sign in to a site and click a button",
+		"take a screen shot of a page",
 	],
 	setupCode: `
 import * as pw from "playwright";

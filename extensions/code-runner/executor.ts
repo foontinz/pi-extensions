@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { CodeHandle } from "./hooks";
@@ -8,18 +9,34 @@ import { BoundedOutputPreview, RecoverableOutput } from "./output";
 import { getEnvVar } from "pi-extension-envvars/store";
 
 const workspaceRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-const tsxBin = join(workspaceRoot, "node_modules", ".bin", "tsx");
+const require = createRequire(import.meta.url);
+
+function resolvePackageBin(packageName: string, binName: string): string {
+  const packageJsonPath = require.resolve(`${packageName}/package.json`);
+  const manifest = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
+    bin?: string | Record<string, string>;
+  };
+  const relativeBin = typeof manifest.bin === "string" ? manifest.bin : manifest.bin?.[binName];
+  if (!relativeBin) throw new Error(`${packageName} does not declare the ${binName} executable`);
+  return join(dirname(packageJsonPath), relativeBin);
+}
+
+const tsxBin = resolvePackageBin("tsx", "tsx");
 // Prefer tsgo (the native, ~4x faster TypeScript compiler from
 // @typescript/native-preview); fall back to plain tsc if it's unavailable.
-const tsgoBin = join(workspaceRoot, "node_modules", ".bin", "tsgo");
-const tscBin = join(workspaceRoot, "node_modules", ".bin", "tsc");
-const typeCheckBin = existsSync(tsgoBin) ? tsgoBin : tscBin;
+let tsgoBin: string | undefined;
+try { tsgoBin = resolvePackageBin("@typescript/native-preview", "tsgo"); } catch {}
+const typeCheckBin = tsgoBin && existsSync(tsgoBin)
+  ? tsgoBin
+  : resolvePackageBin("typescript", "tsc");
 const TERMINATE_GRACE_MS = 1_000;
 
 export interface ExecuteResult {
   output: string;
   exitCode: number;
   stderr?: string;
+  /** Bounded stdout/stderr preview in observed event order, with channel labels. */
+  combinedOutput?: string;
   /** Complete, interleaved stdout/stderr when the visible result was truncated. */
   fullOutputPath?: string;
 }
@@ -27,6 +44,7 @@ export interface ExecuteResult {
 interface ProcessResult {
   output: string;
   stderr: string;
+  combinedOutput: string;
   exitCode: number;
   fullOutputPath?: string;
   reason?: "aborted" | "timedOut" | "outputLimit";
@@ -35,6 +53,7 @@ interface ProcessResult {
 
 interface TypeCheckResult {
   errors: string[];
+  failure?: string;
   fullOutputPath?: string;
 }
 
@@ -68,6 +87,12 @@ export async function executeCode(
   if (options.signal?.aborted) {
     return { output: "", exitCode: 1, stderr: "Cancelled before execution" };
   }
+
+  const timeoutMs = options.timeout ?? 30_000;
+  const deadline = Number.isFinite(timeoutMs) && timeoutMs > 0
+    ? Date.now() + timeoutMs
+    : Number.POSITIVE_INFINITY;
+  const remainingTime = () => Math.max(0, deadline - Date.now());
 
   // Resolve env vars from envvars store (keychain / process.env)
   const envVars: Record<string, string> = {};
@@ -119,17 +144,27 @@ export async function executeCode(
       const typeCheckResult = await typeCheck(
         tempDir,
         lineOffset,
-        options.timeout,
+        remainingTime(),
         options.signal,
       );
       if (options.signal?.aborted) {
         return { output: "", exitCode: 1, stderr: "Cancelled before execution" };
       }
-      if (typeCheckResult && typeCheckResult.errors.length > 0) {
+      const recoveryHint = typeCheckResult.fullOutputPath
+        ? `\n\nFull type-check output saved to: ${typeCheckResult.fullOutputPath}`
+        : "";
+      if (typeCheckResult.failure) {
+        return {
+          output: "",
+          exitCode: 2,
+          stderr:
+            `Type check could not complete: ${typeCheckResult.failure}${recoveryHint}\n\n` +
+            "Fix the checker/setup problem, or pass typecheck:false to run without checking.",
+          fullOutputPath: typeCheckResult.fullOutputPath,
+        };
+      }
+      if (typeCheckResult.errors.length > 0) {
         const count = `${typeCheckResult.errors.length} error${typeCheckResult.errors.length > 1 ? "s" : ""}`;
-        const recoveryHint = typeCheckResult.fullOutputPath
-          ? `\n\nFull type-check output saved to: ${typeCheckResult.fullOutputPath}`
-          : "";
         return {
           output: "",
           exitCode: 2,
@@ -141,37 +176,65 @@ export async function executeCode(
       }
     }
 
-    const result = await runCapturedProcess(tsxBin, [tempFile], {
+    const executionTimeout = remainingTime();
+    if (executionTimeout <= 0) {
+      return {
+        output: "",
+        exitCode: 1,
+        stderr: `Execution timed out after ${timeoutMs}ms before user code started`,
+      };
+    }
+
+    const result = await runCapturedProcess(process.execPath, [tsxBin, tempFile], {
       cwd: tempDir,
       env: { ...process.env, ...envVars },
-      timeout: options.timeout ?? 30_000,
+      timeout: executionTimeout,
       signal: options.signal,
       outputPrefix: "pi-exec-code-output",
     });
 
     let stderr = cleanStderr(result.stderr, tempDir, lineOffset);
+    let combinedOutput = cleanStderr(result.combinedOutput, tempDir, lineOffset);
     if (result.startError) {
       const isMissing = (result.startError as NodeJS.ErrnoException).code === "ENOENT";
       const hint = isMissing
         ? `\n\ntsx not found at: ${tsxBin}\nRun: cd ${workspaceRoot} && npm install`
         : "";
       stderr = `Failed to start executor: ${result.startError.message}${hint}`;
+      combinedOutput = appendStatus(combinedOutput, stderr);
     } else if (result.reason === "aborted") {
       stderr = appendStatus(stderr, "Execution cancelled");
+      combinedOutput = appendStatus(combinedOutput, "Execution cancelled");
     } else if (result.reason === "timedOut") {
-      stderr = appendStatus(stderr, `Execution timed out after ${options.timeout ?? 30_000}ms`);
+      const status = `Execution timed out after ${timeoutMs}ms total`;
+      stderr = appendStatus(stderr, status);
+      combinedOutput = appendStatus(combinedOutput, status);
     } else if (result.reason === "outputLimit") {
-      stderr = appendStatus(stderr, "Execution stopped after exceeding the recoverable output safety limit");
+      const status = "Execution stopped after exceeding the recoverable output safety limit";
+      stderr = appendStatus(stderr, status);
+      combinedOutput = appendStatus(combinedOutput, status);
     }
+
+    // A process may handle SIGTERM and exit zero. Cancellation, deadline, and
+    // output-limit termination are still failed executions regardless of the
+    // direct child's chosen exit code.
+    const exitCode = result.reason === "timedOut"
+      ? 124
+      : result.reason === "aborted"
+        ? 130
+        : result.reason === "outputLimit"
+          ? 1
+          : result.exitCode;
 
     return {
       output: result.output,
-      exitCode: result.exitCode,
+      exitCode,
       stderr: stderr || undefined,
+      combinedOutput: combinedOutput || undefined,
       fullOutputPath: result.fullOutputPath,
     };
   } finally {
-    rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    try { await rm(tempDir, { recursive: true, force: true }); } catch {}
   }
 }
 
@@ -198,7 +261,9 @@ function runCapturedProcess(
   return new Promise((resolve) => {
     const stdout = new BoundedOutputPreview();
     const stderr = new BoundedOutputPreview();
+    const combined = new BoundedOutputPreview();
     const fullOutput = new RecoverableOutput(options.outputPrefix);
+    let lastCombinedChannel: "stdout" | "stderr" | undefined;
     let proc: ChildProcess | undefined;
     let settled = false;
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
@@ -213,10 +278,13 @@ function runCapturedProcess(
       options.signal?.removeEventListener("abort", onAbort);
       stdout.finish();
       stderr.finish();
+      combined.finish();
+      if (combined.truncated) fullOutput.ensurePersisted();
       const fullOutputPath = fullOutput.finish();
       resolve({
         output: stdout.toString(),
         stderr: stderr.toString(),
+        combinedOutput: combined.toString(),
         exitCode,
         fullOutputPath,
         reason,
@@ -249,12 +317,22 @@ function runCapturedProcess(
       return;
     }
 
+    const appendCombined = (channel: "stdout" | "stderr", chunk: Buffer) => {
+      if (lastCombinedChannel !== channel) {
+        combined.append(Buffer.from(`${lastCombinedChannel ? "\n" : ""}[${channel}]\n`, "utf8"));
+        lastCombinedChannel = channel;
+      }
+      combined.append(chunk);
+    };
+
     proc.stdout?.on("data", (chunk: Buffer) => {
       stdout.append(chunk);
+      appendCombined("stdout", chunk);
       if (!fullOutput.append("stdout", chunk)) terminate("outputLimit");
     });
     proc.stderr?.on("data", (chunk: Buffer) => {
       stderr.append(chunk);
+      appendCombined("stderr", chunk);
       if (!fullOutput.append("stderr", chunk)) terminate("outputLimit");
     });
     proc.once("error", (err) => finish(1, err));
@@ -294,16 +372,16 @@ function cleanStderr(stderr: string, tempDir: string, lineOffset: number): strin
 }
 
 /**
- * Type-check the generated script with tsc. Returns user-facing type errors,
- * or null if the compiler could not be started. The compiler uses the same
- * process-tree termination and bounded output path as execution.
+ * Type-check the generated script with tsc. Compiler startup failures,
+ * cancellation, timeout, output overflow, and non-diagnostic failures are
+ * explicit results rather than silently allowing unchecked execution.
  */
 async function typeCheck(
   tempDir: string,
   lineOffset: number,
-  timeout: number | undefined,
+  timeout: number,
   signal: AbortSignal | undefined,
-): Promise<TypeCheckResult | null> {
+): Promise<TypeCheckResult> {
   const tsconfigPath = join(tempDir, "tsconfig.json");
   await writeFile(
     tsconfigPath,
@@ -326,20 +404,49 @@ async function typeCheck(
     "utf8",
   );
 
-  const result = await runCapturedProcess(typeCheckBin, ["--noEmit", "-p", tsconfigPath], {
+  if (timeout <= 0) {
+    return { errors: [], failure: "the overall deadline expired before the checker started" };
+  }
+
+  const result = await runCapturedProcess(process.execPath, [typeCheckBin, "--noEmit", "-p", tsconfigPath], {
     cwd: tempDir,
     env: process.env,
-    timeout: timeout ?? 30_000,
+    timeout,
     signal,
     outputPrefix: "pi-exec-code-typecheck",
   });
 
-  // tsc missing or failed to start: skip type checking rather than block.
-  if (result.startError) return null;
+  if (result.startError) {
+    return {
+      errors: [],
+      failure: `failed to start ${typeCheckBin}: ${result.startError.message}`,
+      fullOutputPath: result.fullOutputPath,
+    };
+  }
+  if (result.reason === "aborted") {
+    return { errors: [], failure: "checking was cancelled", fullOutputPath: result.fullOutputPath };
+  }
+  if (result.reason === "timedOut") {
+    return { errors: [], failure: "the overall deadline expired while checking", fullOutputPath: result.fullOutputPath };
+  }
+  if (result.reason === "outputLimit") {
+    return { errors: [], failure: "checker output exceeded the recovery limit", fullOutputPath: result.fullOutputPath };
+  }
+
   const raw = [result.output, result.stderr].filter(Boolean).join("\n");
-  if (!raw) return null;
+  if (result.exitCode === 0) {
+    return { errors: [], fullOutputPath: result.fullOutputPath };
+  }
+
+  const errors = filterUserTypeErrors(raw, lineOffset);
+  if (errors.length > 0) return { errors, fullOutputPath: result.fullOutputPath };
+
+  const diagnostic = remapTypeCheckOutput(raw, lineOffset);
   return {
-    errors: filterUserTypeErrors(raw, lineOffset),
+    errors: [],
+    failure: diagnostic
+      ? `compiler exited with code ${result.exitCode}:\n${diagnostic}`
+      : `compiler exited with code ${result.exitCode} without diagnostics`,
     fullOutputPath: result.fullOutputPath,
   };
 }
@@ -372,4 +479,18 @@ function filterUserTypeErrors(raw: string, lineOffset: number): string[] {
     }
   }
   return kept;
+}
+
+/** Label checker/setup diagnostics instead of silently discarding them. */
+function remapTypeCheckOutput(raw: string, lineOffset: number): string {
+  const locRe = /^(?:.*?[/\\])?script\.m?ts\((\d+),(\d+)\)(:.*)$/;
+  return raw.split("\n").map((line) => {
+    const match = line.match(locRe);
+    if (!match) return line;
+    const fileLine = Number(match[1]);
+    if (fileLine > lineOffset) {
+      return `exec_code.ts(${fileLine - lineOffset},${match[2]})${match[3]}`;
+    }
+    return `handle-setup.ts(${fileLine},${match[2]})${match[3]}`;
+  }).join("\n").trim();
 }

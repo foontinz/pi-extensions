@@ -12,23 +12,29 @@ function countNewlines(chunk: Buffer): number {
   return count;
 }
 
-function sliceBytesHead(text: string, maxBytes: number): string {
+export function sliceUtf8Head(text: string, maxBytes: number): string {
   const buffer = Buffer.from(text, "utf8");
-  return buffer.length <= maxBytes ? text : buffer.subarray(0, maxBytes).toString("utf8");
+  if (buffer.length <= maxBytes) return text;
+  let end = Math.max(0, maxBytes);
+  while (end > 0 && end < buffer.length && (buffer[end] & 0xc0) === 0x80) end--;
+  return buffer.subarray(0, end).toString("utf8");
 }
 
-function sliceBytesTail(text: string, maxBytes: number): string {
+export function sliceUtf8Tail(text: string, maxBytes: number): string {
   const buffer = Buffer.from(text, "utf8");
-  return buffer.length <= maxBytes ? text : buffer.subarray(buffer.length - maxBytes).toString("utf8");
+  if (buffer.length <= maxBytes) return text;
+  let start = Math.max(0, buffer.length - maxBytes);
+  while (start < buffer.length && (buffer[start] & 0xc0) === 0x80) start++;
+  return buffer.subarray(start).toString("utf8");
 }
 
 function keepHead(text: string, maxBytes: number, maxLines: number): string {
-  return sliceBytesHead(text.split("\n").slice(0, maxLines).join("\n"), maxBytes);
+  return sliceUtf8Head(text.split("\n").slice(0, maxLines).join("\n"), maxBytes);
 }
 
 function keepTail(text: string, maxBytes: number, maxLines: number): string {
   const lines = text.split("\n");
-  return sliceBytesTail(lines.slice(Math.max(0, lines.length - maxLines)).join("\n"), maxBytes);
+  return sliceUtf8Tail(lines.slice(Math.max(0, lines.length - maxLines)).join("\n"), maxBytes);
 }
 
 /**
@@ -96,9 +102,11 @@ export class BoundedOutputPreview {
       if (this.totalBytesValue <= this.maxBytes && this.totalLines <= this.maxLines) return;
 
       this.truncatedValue = true;
-      const halfBytes = Math.max(1, Math.floor(this.maxBytes / 2));
-      const headLines = Math.max(1, Math.ceil(this.maxLines / 2));
-      const tailLines = Math.max(1, Math.floor(this.maxLines / 2));
+      const payloadBytes = this.maxBytes >= 512 ? this.maxBytes - 256 : this.maxBytes;
+      const payloadLines = this.maxLines >= 8 ? this.maxLines - 4 : this.maxLines;
+      const halfBytes = Math.max(1, Math.floor(payloadBytes / 2));
+      const headLines = Math.max(1, Math.ceil(payloadLines / 2));
+      const tailLines = Math.max(1, Math.floor(payloadLines / 2));
       this.head = keepHead(this.text, halfBytes, headLines);
       this.tail = keepTail(this.text, halfBytes, tailLines);
       this.text = "";
@@ -107,8 +115,8 @@ export class BoundedOutputPreview {
 
     this.tail = keepTail(
       this.tail + value,
-      Math.max(1, Math.floor(this.maxBytes / 2)),
-      Math.max(1, Math.floor(this.maxLines / 2)),
+      Math.max(1, Math.floor((this.maxBytes >= 512 ? this.maxBytes - 256 : this.maxBytes) / 2)),
+      Math.max(1, Math.floor((this.maxLines >= 8 ? this.maxLines - 4 : this.maxLines) / 2)),
     );
   }
 }
@@ -170,6 +178,13 @@ export class RecoverableOutput {
 
   get hardLimitReached(): boolean {
     return this.hardLimitReachedValue;
+  }
+
+  /** Persist staged output when a derived preview (for example channel labels) truncates first. */
+  ensurePersisted(): void {
+    if (!this.closed && this.fd === undefined && !this.persistenceFailed && this.chunks.length > 0) {
+      this.persist();
+    }
   }
 
   finish(): string | undefined {

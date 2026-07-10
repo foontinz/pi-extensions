@@ -6,8 +6,19 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { executeCode } from "../executor";
-import { BoundedOutputPreview, RecoverableOutput } from "../output";
-import { cleanupStaleCodeHandleRegistries, getRegisteredHandles, registerCodeHandle, unregisterCodeHandle } from "../hooks";
+import installCodeRunner from "../index";
+import { BoundedOutputPreview, RecoverableOutput, sliceUtf8Head, sliceUtf8Tail } from "../output";
+import {
+  cleanupStaleCodeHandleRegistries,
+  findCodeHandle,
+  getRegisteredHandles,
+  listCodeHandles,
+  MIN_CODE_HANDLE_MATCH_SCORE,
+  rankCodeHandles,
+  registerCodeHandle,
+  searchCodeHandles,
+  unregisterCodeHandle,
+} from "../hooks";
 
 const waitFor = async (predicate: () => boolean, timeoutMs = 5_000): Promise<void> => {
   const deadline = Date.now() + timeoutMs;
@@ -46,6 +57,25 @@ test("bounded previews retain both ends and recoverable output persists the full
   } finally {
     rmSync(dirname(path!), { recursive: true, force: true });
   }
+
+  const forced = new RecoverableOutput("pi-code-runner-forced-test", 1024, 100);
+  forced.append("stdout", Buffer.from("small", "utf8"));
+  forced.ensurePersisted();
+  const forcedPath = forced.finish();
+  assert.ok(forcedPath, "a derived truncated preview can force recovery persistence");
+  rmSync(dirname(forcedPath!), { recursive: true, force: true });
+});
+
+test("UTF-8 truncation keeps code-point boundaries and reserves marker budget", () => {
+  assert.doesNotMatch(sliceUtf8Head("🙂🙂", 5), /�/);
+  assert.doesNotMatch(sliceUtf8Tail("🙂🙂", 5), /�/);
+
+  const preview = new BoundedOutputPreview(512, 20);
+  preview.append(Buffer.from(`${"🙂".repeat(200)}\n${"tail\n".repeat(30)}`, "utf8"));
+  const text = preview.toString();
+  assert.doesNotMatch(text, /�/);
+  assert.ok(Buffer.byteLength(text, "utf8") <= 512);
+  assert.ok(text.split("\n").length <= 20);
 });
 
 test("recoverable output enforces a hard disk safety limit", () => {
@@ -78,6 +108,153 @@ test("handles can be unregistered without clearing registrations from other exte
   assert.equal(unregisterCodeHandle(name), true);
   assert.ok(!getRegisteredHandles().some((handle) => handle.name === name));
   assert.equal(unregisterCodeHandle(name), false);
+});
+
+test("handle discovery supports catalog, aliases, capabilities, related terms, and typos", () => {
+  const suffix = process.pid;
+  const browserName = `browser_test_${suffix}`;
+  const searchName = `search_test_${suffix}`;
+  registerCodeHandle({
+    name: browserName,
+    aliases: [`pw-${suffix}`],
+    summary: "Automate a browser and interact with webpages.",
+    keywords: ["browser", "screenshot", "form"],
+    capabilities: ["capture webpage screenshots", "navigate pages and fill forms"],
+    setupCode: "",
+    docs: "Browser automation reference.",
+  });
+  registerCodeHandle({
+    name: searchName,
+    summary: "Search public information.",
+    keywords: ["search", "research"],
+    capabilities: ["find current information online"],
+    setupCode: "",
+    docs: "Web research reference.",
+  });
+
+  try {
+    assert.equal(findCodeHandle(`PW-${suffix}`)?.name, browserName);
+    const catalogNames = listCodeHandles().map((handle) => handle.name);
+    assert.deepEqual(catalogNames, [...catalogNames].sort((a, b) => a.localeCompare(b)));
+
+    const screenshot = searchCodeHandles("take a webpage screensht")[0];
+    assert.equal(screenshot.handle.name, browserName);
+    assert.ok(screenshot.score >= MIN_CODE_HANDLE_MATCH_SCORE);
+    assert.ok(screenshot.reasons.some((reason) => reason.includes("fuzzy match")));
+
+    const onlineLookup = searchCodeHandles("look up current information on the internet")[0];
+    assert.equal(onlineLookup.handle.name, searchName);
+    assert.ok(onlineLookup.score >= MIN_CODE_HANDLE_MATCH_SCORE);
+  } finally {
+    unregisterCodeHandle(browserName);
+    unregisterCodeHandle(searchName);
+  }
+});
+
+test("search_spec supports list, natural-language search, and exact get actions", async () => {
+  const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
+  const pi = {
+    registerTool(tool: { name: string; execute: (...args: any[]) => Promise<any> }) {
+      tools.set(tool.name, tool);
+    },
+  };
+  installCodeRunner(pi as never);
+
+  const name = `discovery_actions_${process.pid}`;
+  registerCodeHandle({
+    name,
+    aliases: [`discover-${process.pid}`],
+    summary: "Inspect action discovery.",
+    keywords: ["inspect"],
+    capabilities: ["inspect discovery actions"],
+    setupCode: "",
+    docs: "Complete action discovery documentation.",
+  });
+
+  try {
+    const tool = tools.get("search_spec");
+    assert.ok(tool);
+    const list = await tool!.execute("id", { action: "list" });
+    assert.match(list.content[0].text, new RegExp(name));
+
+    const search = await tool!.execute("id", { action: "search", goal: "inspect discovery" });
+    assert.match(search.content[0].text, new RegExp(name));
+    assert.match(search.content[0].text, /action=get/);
+    assert.doesNotMatch(search.content[0].text, /Complete action discovery documentation/);
+
+    const get = await tool!.execute("id", { action: "get", name: `DISCOVER-${process.pid}` });
+    assert.match(get.content[0].text, /Complete action discovery documentation/);
+  } finally {
+    unregisterCodeHandle(name);
+  }
+});
+
+test("pure discovery ranker extracts camel-case documentation symbols", () => {
+  const matches = rankCodeHandles("getContents", [{
+    name: "contentClient",
+    setupCode: "",
+    docs: "## Content methods\n\nCall `getContents(urls)` to fetch pages.",
+  }]);
+  assert.equal(matches[0].handle.name, "contentClient");
+  assert.ok(matches[0].score >= MIN_CODE_HANDLE_MATCH_SCORE);
+  assert.ok(matches[0].reasons.some((reason) => reason.includes("documentation symbol")));
+});
+
+test("incidental documentation tokens do not count as useful discovery matches", () => {
+  const name = `weak_match_test_${process.pid}`;
+  registerCodeHandle({
+    name,
+    setupCode: "",
+    docs: "This reference happens to mention an obscureword once.",
+  });
+  try {
+    const match = searchCodeHandles("obscureword").find((item) => item.handle.name === name);
+    assert.ok(match);
+    assert.ok(match.score < MIN_CODE_HANDLE_MATCH_SCORE);
+  } finally {
+    unregisterCodeHandle(name);
+  }
+});
+
+test("type-checker setup failures do not silently execute user code", async () => {
+  const result = await executeCode(
+    'console.log("SHOULD_NOT_RUN")',
+    [{ name: "broken", setupCode: 'const broken: number = "x";', docs: "test" }],
+    { timeout: 10_000 },
+  );
+  assert.equal(result.exitCode, 2);
+  assert.doesNotMatch(result.output, /SHOULD_NOT_RUN/);
+  assert.match(result.stderr ?? "", /handle-setup\.ts/);
+});
+
+test("combined output preserves observed stdout/stderr event order", async () => {
+  const result = await executeCode(
+    `
+process.stdout.write("out-one\\n");
+await new Promise((resolve) => setTimeout(resolve, 20));
+process.stderr.write("err-one\\n");
+await new Promise((resolve) => setTimeout(resolve, 20));
+process.stdout.write("out-two\\n");
+`,
+    [],
+    { typecheck: false, timeout: 5_000 },
+  );
+  assert.equal(result.exitCode, 0);
+  const combined = result.combinedOutput ?? "";
+  assert.ok(combined.indexOf("out-one") < combined.indexOf("err-one"));
+  assert.ok(combined.indexOf("err-one") < combined.indexOf("out-two"));
+  assert.match(combined, /\[stdout\]/);
+  assert.match(combined, /\[stderr\]/);
+});
+
+test("timeout remains a failed result when user code handles SIGTERM with exit zero", async () => {
+  const result = await executeCode(
+    'process.on("SIGTERM", () => process.exit(0)); setInterval(() => {}, 1000);',
+    [],
+    { typecheck: false, timeout: 150 },
+  );
+  assert.equal(result.exitCode, 124);
+  assert.match(result.stderr ?? "", /timed out/);
 });
 
 test("exec_code bounds visible output and retains a full recovery file", async () => {
