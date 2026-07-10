@@ -6,7 +6,8 @@
   "scripts": {
     "clean": "echo 'nothing to clean'",
     "build": "tsc --noEmit",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "node --test --experimental-transform-types ./index.test.ts"
   },
   "pi": {
     "extensions": [
@@ -15,10 +16,12 @@
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^0.80.5",
-    "@earendil-works/pi-tui": "^0.80.5"
+    "@earendil-works/pi-tui": "^0.80.5",
+    "proper-lockfile": "^4.1.2"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",
+    "@types/proper-lockfile": "^4.1.4",
     "typescript": "^7.0.2"
   },
   "engines": {

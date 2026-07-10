@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { registerCodeHandle } from "../code-runner/hooks";
+import { registerCodeHandle, unregisterCodeHandle } from "../code-runner/hooks";
 
-registerCodeHandle({
+export const PLAYWRIGHT_CODE_HANDLE = {
 	name: "playwright",
 	summary:
 		"Control a browser with Playwright: launch Chromium/Firefox/WebKit, navigate pages, click or fill elements, take screenshots, and execute JavaScript in the page context.",
@@ -30,13 +30,52 @@ registerCodeHandle({
 	setupCode: `
 import * as pw from "playwright";
 
-const browserTypes = {
+type BrowserKind = "chromium" | "firefox" | "webkit";
+type ViewportSize = Parameters<pw.Page["setViewportSize"]>[0];
+type GotoOptions = NonNullable<Parameters<pw.Page["goto"]>[1]>;
+
+interface LaunchBrowserOptions extends pw.LaunchOptions {
+  kind?: BrowserKind;
+}
+
+interface PageOptions {
+  viewportSize?: ViewportSize;
+  defaultTimeout?: number;
+  defaultNavigationTimeout?: number;
+}
+
+interface OpenPageOptions {
+  kind?: BrowserKind;
+  launchOptions?: pw.LaunchOptions;
+  contextOptions?: pw.BrowserContextOptions;
+  pageOptions?: PageOptions;
+  gotoOptions?: GotoOptions;
+}
+
+interface BrowserSession {
+  browser: pw.Browser;
+  context: pw.BrowserContext;
+  page: pw.Page;
+}
+
+interface BrowserContextSession {
+  browser: pw.Browser;
+  context: pw.BrowserContext;
+}
+
+const browserTypes: Record<BrowserKind, pw.BrowserType> = {
   chromium: pw.chromium,
   firefox: pw.firefox,
   webkit: pw.webkit,
 };
 
-async function launch(options = {}) {
+async function closeBrowserResources(resources: Partial<BrowserSession>): Promise<void> {
+  await resources.page?.close().catch(() => {});
+  await resources.context?.close().catch(() => {});
+  await resources.browser?.close().catch(() => {});
+}
+
+async function launch(options: LaunchBrowserOptions | null = {}): Promise<pw.Browser> {
   const { kind = "chromium", ...launchOptions } = options ?? {};
   const browserType = browserTypes[kind];
   if (!browserType) {
@@ -45,54 +84,64 @@ async function launch(options = {}) {
   return browserType.launch(launchOptions);
 }
 
-async function openPage(url, options = {}) {
-  const {
-    kind = "chromium",
-    launchOptions = {},
-    contextOptions = {},
-    pageOptions = {},
-    gotoOptions = {},
-  } = options ?? {};
+async function openPage(url?: string, options: OpenPageOptions | null = {}): Promise<BrowserSession> {
+  let browser: pw.Browser | undefined;
+  let context: pw.BrowserContext | undefined;
+  let page: pw.Page | undefined;
 
-  const browser = await launch({ kind, ...launchOptions });
-  const context = await browser.newContext(contextOptions);
-  const page = await context.newPage();
+  try {
+    const {
+      kind = "chromium",
+      launchOptions = {},
+      contextOptions = {},
+      pageOptions = {},
+      gotoOptions = {},
+    } = options ?? {};
 
-  if (pageOptions.viewportSize) {
-    await page.setViewportSize(pageOptions.viewportSize);
-  }
-  if (pageOptions.defaultTimeout != null) {
-    page.setDefaultTimeout(pageOptions.defaultTimeout);
-  }
-  if (pageOptions.defaultNavigationTimeout != null) {
-    page.setDefaultNavigationTimeout(pageOptions.defaultNavigationTimeout);
-  }
-  if (url) {
-    await page.goto(url, { waitUntil: "domcontentloaded", ...gotoOptions });
-  }
+    browser = await launch({ kind, ...launchOptions });
+    context = await browser.newContext(contextOptions);
+    page = await context.newPage();
 
-  return { browser, context, page };
+    if (pageOptions.viewportSize) {
+      await page.setViewportSize(pageOptions.viewportSize);
+    }
+    if (pageOptions.defaultTimeout != null) {
+      page.setDefaultTimeout(pageOptions.defaultTimeout);
+    }
+    if (pageOptions.defaultNavigationTimeout != null) {
+      page.setDefaultNavigationTimeout(pageOptions.defaultNavigationTimeout);
+    }
+    if (url) {
+      await page.goto(url, { waitUntil: "domcontentloaded", ...gotoOptions });
+    }
+
+    return { browser, context, page };
+  } catch (error) {
+    await closeBrowserResources({ browser, context, page });
+    throw error;
+  }
 }
 
-async function withBrowser(fn, options = {}) {
-  const { kind = "chromium", launchOptions = {}, contextOptions = {} } = options ?? {};
-  const browser = await launch({ kind, ...launchOptions });
-  const context = await browser.newContext(contextOptions);
+async function withBrowser<T>(fn: (session: BrowserContextSession) => Promise<T> | T, options: OpenPageOptions | null = {}): Promise<T> {
+  let browser: pw.Browser | undefined;
+  let context: pw.BrowserContext | undefined;
+
   try {
+    const { kind = "chromium", launchOptions = {}, contextOptions = {} } = options ?? {};
+    browser = await launch({ kind, ...launchOptions });
+    context = await browser.newContext(contextOptions);
     return await fn({ browser, context });
   } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
+    await closeBrowserResources({ browser, context });
   }
 }
 
-async function withPage(url, fn, options = {}) {
+async function withPage<T>(url: string | undefined, fn: (session: BrowserSession) => Promise<T> | T, options: OpenPageOptions | null = {}): Promise<T> {
   const session = await openPage(url, options);
   try {
     return await fn(session);
   } finally {
-    await session.context.close().catch(() => {});
-    await session.browser.close().catch(() => {});
+    await closeBrowserResources(session);
   }
 }
 
@@ -179,6 +228,9 @@ await playwright.withPage("https://httpbin.org/forms/post", async ({ page }) => 
 ### Keep the browser/page open manually
 
 \`\`\`typescript
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 const { browser, context, page } = await playwright.openPage("https://example.com", {
   kind: "chromium",
   launchOptions: { headless: true },
@@ -187,7 +239,10 @@ const { browser, context, page } = await playwright.openPage("https://example.co
 
 try {
   console.log(await page.title());
-  await page.screenshot({ path: "example.png", fullPage: true });
+  // Use an absolute path so exec_code's temporary working directory does not remove it.
+  const screenshotPath = join(homedir(), "pi-playwright-example.png");
+  await page.screenshot({ path: screenshotPath, fullPage: true });
+  console.log(\`Screenshot saved to \${screenshotPath}\`);
   const html = await page.content();
   console.log(html.slice(0, 1000));
 } finally {
@@ -222,6 +277,11 @@ console.log(await page.title());
 await browser.close();
 \`\`\`
 `.trim(),
-});
+};
 
-export default function (_pi: ExtensionAPI) {}
+export default function (pi: ExtensionAPI) {
+	registerCodeHandle(PLAYWRIGHT_CODE_HANDLE);
+	pi.on("session_shutdown", () => {
+		unregisterCodeHandle(PLAYWRIGHT_CODE_HANDLE.name);
+	});
+}

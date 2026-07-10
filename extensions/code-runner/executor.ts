@@ -1,23 +1,63 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { CodeHandle } from "./hooks";
+import { BoundedOutputPreview, RecoverableOutput } from "./output";
 import { getEnvVar } from "pi-extension-envvars/store";
 
-declare const __dirname: string;
-const workspaceRoot = join(__dirname, "..", "..");
+const workspaceRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const tsxBin = join(workspaceRoot, "node_modules", ".bin", "tsx");
 // Prefer tsgo (the native, ~4x faster TypeScript compiler from
 // @typescript/native-preview); fall back to plain tsc if it's unavailable.
 const tsgoBin = join(workspaceRoot, "node_modules", ".bin", "tsgo");
 const tscBin = join(workspaceRoot, "node_modules", ".bin", "tsc");
 const typeCheckBin = existsSync(tsgoBin) ? tsgoBin : tscBin;
+const TERMINATE_GRACE_MS = 1_000;
 
 export interface ExecuteResult {
   output: string;
   exitCode: number;
   stderr?: string;
+  /** Complete, interleaved stdout/stderr when the visible result was truncated. */
+  fullOutputPath?: string;
+}
+
+interface ProcessResult {
+  output: string;
+  stderr: string;
+  exitCode: number;
+  fullOutputPath?: string;
+  reason?: "aborted" | "timedOut" | "outputLimit";
+  startError?: Error;
+}
+
+interface TypeCheckResult {
+  errors: string[];
+  fullOutputPath?: string;
+}
+
+/** Kill the detached process group on Unix and the complete tree on Windows. */
+export function killProcessTree(pid: number, signal: NodeJS.Signals = "SIGKILL"): void {
+  if (process.platform === "win32") {
+    try {
+      // taskkill has no graceful equivalent of SIGTERM; /F is required to
+      // ensure children do not survive cancellation or session shutdown.
+      spawn("taskkill", ["/F", "/T", "/PID", String(pid)], {
+        stdio: "ignore",
+        detached: true,
+        windowsHide: true,
+      }).unref();
+    } catch {}
+    return;
+  }
+
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    try { process.kill(pid, signal); } catch {}
+  }
 }
 
 export async function executeCode(
@@ -34,8 +74,15 @@ export async function executeCode(
   for (const handle of handles) {
     if (handle.envVars) {
       for (const name of handle.envVars) {
-        const value = await getEnvVar(name);
-        if (value != null) envVars[name] = value;
+        try {
+          const value = await getEnvVar(name);
+          if (value != null) envVars[name] = value;
+        } catch {
+          // Stored credentials are optional and the Keychain backend is not
+          // available on every platform. An unavailable secret for one handle
+          // must not prevent unrelated exec_code programs from running; the
+          // handle's setup code can surface its own missing-key diagnostic.
+        }
       }
     }
   }
@@ -52,7 +99,8 @@ export async function executeCode(
   // Number of newlines the prefix contributes == line offset of user code.
   const lineOffset = prefix ? prefix.split("\n").length - 1 : 0;
 
-  // Temp dir inside workspace root so ESM resolution finds node_modules
+  // Temp dir inside workspace root so ESM resolution finds node_modules.
+  // exec_code intentionally uses this throwaway cwd for relative paths.
   const tempDir = await mkdtemp(join(workspaceRoot, ".run-"));
   const tempFile = join(tempDir, "script.mts");
 
@@ -68,73 +116,159 @@ export async function executeCode(
     // (e.g. assigning a string to a number, calling missing methods) so the
     // model gets fast, precise feedback instead of a runtime surprise.
     if (options.typecheck !== false) {
-      const typeErrors = await typeCheck(
+      const typeCheckResult = await typeCheck(
         tempDir,
         lineOffset,
         options.timeout,
         options.signal,
       );
-      if (typeErrors && typeErrors.length > 0) {
-        const count = `${typeErrors.length} error${typeErrors.length > 1 ? "s" : ""}`;
+      if (options.signal?.aborted) {
+        return { output: "", exitCode: 1, stderr: "Cancelled before execution" };
+      }
+      if (typeCheckResult && typeCheckResult.errors.length > 0) {
+        const count = `${typeCheckResult.errors.length} error${typeCheckResult.errors.length > 1 ? "s" : ""}`;
+        const recoveryHint = typeCheckResult.fullOutputPath
+          ? `\n\nFull type-check output saved to: ${typeCheckResult.fullOutputPath}`
+          : "";
         return {
           output: "",
           exitCode: 2,
           stderr:
-            `Type check failed (${count}):\n${typeErrors.join("\n")}\n\n` +
-            `Fix the type error(s) above, or pass typecheck:false to run anyway.`,
+            `Type check failed (${count}):\n${typeCheckResult.errors.join("\n")}${recoveryHint}\n\n` +
+            "Fix the type error(s) above, or pass typecheck:false to run anyway.",
+          fullOutputPath: typeCheckResult.fullOutputPath,
         };
       }
     }
 
-    return await new Promise<ExecuteResult>((resolve) => {
-      const stdoutChunks: Buffer[] = [];
-      const stderrChunks: Buffer[] = [];
-
-      // Run with cwd set to the throwaway temp dir so that relative file
-      // writes from user code land there (and get cleaned up) instead of
-      // polluting the workspace root. ESM resolution still finds node_modules
-      // by walking up to workspaceRoot.
-      const proc = spawn(tsxBin, [tempFile], {
-        cwd: tempDir,
-        env: { ...process.env, ...envVars },
-        timeout: options.timeout ?? 30_000,
-      });
-
-      proc.stdout.on("data", (chunk: Buffer) => stdoutChunks.push(chunk));
-      proc.stderr.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
-
-      const onAbort = () => {
-        proc.kill("SIGTERM");
-        setTimeout(() => {
-          if (proc.exitCode === null) proc.kill("SIGKILL");
-        }, 1000).unref();
-      };
-      options.signal?.addEventListener("abort", onAbort, { once: true });
-
-      proc.on("close", (code) => {
-        options.signal?.removeEventListener("abort", onAbort);
-        const output = Buffer.concat(stdoutChunks).toString("utf8").trimEnd();
-        const rawStderr = Buffer.concat(stderrChunks).toString("utf8").trimEnd();
-        const stderr = cleanStderr(rawStderr, tempDir, lineOffset);
-        resolve({ output, exitCode: code ?? 1, stderr: stderr || undefined });
-      });
-
-      proc.on("error", (err) => {
-        options.signal?.removeEventListener("abort", onAbort);
-        const isMissing = (err as NodeJS.ErrnoException).code === "ENOENT";
-        const hint = isMissing
-          ? `\n\ntsx not found at: ${tsxBin}\nRun: cd ${workspaceRoot} && npm install`
-          : "";
-        resolve({
-          output: "",
-          exitCode: 1,
-          stderr: `Failed to start executor: ${err.message}${hint}`,
-        });
-      });
+    const result = await runCapturedProcess(tsxBin, [tempFile], {
+      cwd: tempDir,
+      env: { ...process.env, ...envVars },
+      timeout: options.timeout ?? 30_000,
+      signal: options.signal,
+      outputPrefix: "pi-exec-code-output",
     });
+
+    let stderr = cleanStderr(result.stderr, tempDir, lineOffset);
+    if (result.startError) {
+      const isMissing = (result.startError as NodeJS.ErrnoException).code === "ENOENT";
+      const hint = isMissing
+        ? `\n\ntsx not found at: ${tsxBin}\nRun: cd ${workspaceRoot} && npm install`
+        : "";
+      stderr = `Failed to start executor: ${result.startError.message}${hint}`;
+    } else if (result.reason === "aborted") {
+      stderr = appendStatus(stderr, "Execution cancelled");
+    } else if (result.reason === "timedOut") {
+      stderr = appendStatus(stderr, `Execution timed out after ${options.timeout ?? 30_000}ms`);
+    } else if (result.reason === "outputLimit") {
+      stderr = appendStatus(stderr, "Execution stopped after exceeding the recoverable output safety limit");
+    }
+
+    return {
+      output: result.output,
+      exitCode: result.exitCode,
+      stderr: stderr || undefined,
+      fullOutputPath: result.fullOutputPath,
+    };
   } finally {
     rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+function appendStatus(text: string, status: string): string {
+  return text ? `${text}\n\n${status}` : status;
+}
+
+/**
+ * Start a detached child so its process group can be terminated as a unit.
+ * Output previews are bounded while RecoverableOutput keeps a full temp file
+ * whenever Pi's normal result budget is exceeded.
+ */
+function runCapturedProcess(
+  command: string,
+  args: string[],
+  options: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    timeout: number;
+    signal?: AbortSignal;
+    outputPrefix: string;
+  },
+): Promise<ProcessResult> {
+  return new Promise((resolve) => {
+    const stdout = new BoundedOutputPreview();
+    const stderr = new BoundedOutputPreview();
+    const fullOutput = new RecoverableOutput(options.outputPrefix);
+    let proc: ChildProcess | undefined;
+    let settled = false;
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    let forceKillHandle: ReturnType<typeof setTimeout> | undefined;
+    let reason: ProcessResult["reason"];
+
+    const finish = (exitCode: number, startError?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      if (forceKillHandle) clearTimeout(forceKillHandle);
+      options.signal?.removeEventListener("abort", onAbort);
+      stdout.finish();
+      stderr.finish();
+      const fullOutputPath = fullOutput.finish();
+      resolve({
+        output: stdout.toString(),
+        stderr: stderr.toString(),
+        exitCode,
+        fullOutputPath,
+        reason,
+        startError,
+      });
+    };
+
+    const terminate = (terminationReason: NonNullable<ProcessResult["reason"]>) => {
+      if (settled || !proc?.pid) return;
+      reason ??= terminationReason;
+      killProcessTree(proc.pid, "SIGTERM");
+      forceKillHandle ??= setTimeout(() => {
+        if (!settled && proc?.pid) killProcessTree(proc.pid, "SIGKILL");
+      }, TERMINATE_GRACE_MS);
+      forceKillHandle.unref?.();
+    };
+
+    const onAbort = () => terminate("aborted");
+
+    try {
+      proc = spawn(command, args, {
+        cwd: options.cwd,
+        env: options.env,
+        detached: process.platform !== "win32",
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+    } catch (err) {
+      finish(1, err instanceof Error ? err : new Error(String(err)));
+      return;
+    }
+
+    proc.stdout?.on("data", (chunk: Buffer) => {
+      stdout.append(chunk);
+      if (!fullOutput.append("stdout", chunk)) terminate("outputLimit");
+    });
+    proc.stderr?.on("data", (chunk: Buffer) => {
+      stderr.append(chunk);
+      if (!fullOutput.append("stderr", chunk)) terminate("outputLimit");
+    });
+    proc.once("error", (err) => finish(1, err));
+    proc.once("close", (code) => finish(code ?? 1));
+
+    if (options.signal) {
+      if (options.signal.aborted) onAbort();
+      else options.signal.addEventListener("abort", onAbort, { once: true });
+    }
+    if (Number.isFinite(options.timeout) && options.timeout > 0) {
+      timeoutHandle = setTimeout(() => terminate("timedOut"), options.timeout);
+      timeoutHandle.unref?.();
+    }
+  });
 }
 
 /**
@@ -160,17 +294,16 @@ function cleanStderr(stderr: string, tempDir: string, lineOffset: number): strin
 }
 
 /**
- * Type-check the generated script with tsc. Returns the user-facing type
- * errors (line numbers remapped to the caller's code), or null if the check
- * passed or could not run (e.g. tsc missing). Errors originating in the
- * handle preamble are filtered out so callers only see issues in their code.
+ * Type-check the generated script with tsc. Returns user-facing type errors,
+ * or null if the compiler could not be started. The compiler uses the same
+ * process-tree termination and bounded output path as execution.
  */
 async function typeCheck(
   tempDir: string,
   lineOffset: number,
   timeout: number | undefined,
   signal: AbortSignal | undefined,
-): Promise<string[] | null> {
+): Promise<TypeCheckResult | null> {
   const tsconfigPath = join(tempDir, "tsconfig.json");
   await writeFile(
     tsconfigPath,
@@ -193,30 +326,22 @@ async function typeCheck(
     "utf8",
   );
 
-  const raw = await new Promise<string | null>((resolve) => {
-    const chunks: Buffer[] = [];
-    const proc = spawn(typeCheckBin, ["--noEmit", "-p", tsconfigPath], {
-      cwd: tempDir,
-      env: process.env,
-      timeout: timeout ?? 30_000,
-    });
-    const onAbort = () => proc.kill("SIGTERM");
-    signal?.addEventListener("abort", onAbort, { once: true });
-    proc.stdout.on("data", (c: Buffer) => chunks.push(c));
-    proc.stderr.on("data", (c: Buffer) => chunks.push(c));
-    proc.on("close", () => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve(Buffer.concat(chunks).toString("utf8"));
-    });
-    // tsc missing or failed to start: skip type checking rather than block.
-    proc.on("error", () => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve(null);
-    });
+  const result = await runCapturedProcess(typeCheckBin, ["--noEmit", "-p", tsconfigPath], {
+    cwd: tempDir,
+    env: process.env,
+    timeout: timeout ?? 30_000,
+    signal,
+    outputPrefix: "pi-exec-code-typecheck",
   });
 
+  // tsc missing or failed to start: skip type checking rather than block.
+  if (result.startError) return null;
+  const raw = [result.output, result.stderr].filter(Boolean).join("\n");
   if (!raw) return null;
-  return filterUserTypeErrors(raw, lineOffset);
+  return {
+    errors: filterUserTypeErrors(raw, lineOffset),
+    fullOutputPath: result.fullOutputPath,
+  };
 }
 
 /**

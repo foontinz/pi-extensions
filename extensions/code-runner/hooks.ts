@@ -3,13 +3,14 @@
  * pre-initialized API clients and utilities injected into every
  * exec_code execution as top-level variables.
  *
- * Uses a JSON file as shared registry to work around jiti creating
- * separate module instances when the same file is imported from
- * different extensions.
+ * Uses a PID-scoped JSON file as shared registry to work around jiti creating
+ * separate module instances when the same file is imported from different
+ * extensions. A PID scope prevents handles from one pi process leaking into a
+ * later one; stale registry files are removed opportunistically.
  *
  * Usage (from another extension, at module top level):
  *
- *   import { registerCodeHandle } from "../code-runner/hooks";
+ *   import { registerCodeHandle, unregisterCodeHandle } from "../code-runner/hooks";
  *
  *   registerCodeHandle({
  *     name: "myClient",
@@ -17,10 +18,15 @@
  *     envVars: ["MY_KEY"],
  *     docs: "## `myClient` — My API client\n...",
  *   });
+ *
+ *   // Call from an extension's own shutdown/dispose path if it dynamically
+ *   // removes a handle.
+ *   unregisterCodeHandle("myClient");
  */
 
-import { readFileSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export interface CodeHandle {
   /** Variable name available in user code (e.g. `exa`, `github`). */
@@ -58,9 +64,14 @@ export interface CodeHandleMatch {
   reasons: string[];
 }
 
-// Registry file path — always resolves to the same absolute location
-// regardless of which jiti instance evaluates this module.
-const REGISTRY_FILE = join(dirname(fileURLToPathCompat(import.meta.url)), `.handle-registry.${process.pid}.json`);
+const registryDir = dirname(fileURLToPath(import.meta.url));
+const REGISTRY_PREFIX = ".handle-registry.";
+const REGISTRY_FILE = join(registryDir, `${REGISTRY_PREFIX}${process.pid}.json`);
+
+// This is intentionally non-destructive for the current process. Extensions
+// register at module evaluation time, so clearing here or at session_start can
+// erase handles registered by another extension during a reload.
+cleanupStaleCodeHandleRegistries();
 
 export function registerCodeHandle(handle: CodeHandle): void {
   const registry = readRegistry();
@@ -68,12 +79,43 @@ export function registerCodeHandle(handle: CodeHandle): void {
   writeRegistryAtomic(registry);
 }
 
+/** Remove one handle without disturbing registrations owned by other extensions. */
+export function unregisterCodeHandle(name: string): boolean {
+  const registry = readRegistry();
+  const removed = registry.delete(name);
+  if (removed) writeRegistryAtomic(registry);
+  return removed;
+}
+
 export function getRegisteredHandles(): CodeHandle[] {
   return [...readRegistry().values()];
 }
 
+/**
+ * @deprecated Prefer unregisterCodeHandle(name). This remains only for
+ * compatibility with explicit test/admin callers; code-runner never clears the
+ * shared registry during loading or session lifecycle events.
+ */
 export function clearCodeHandles(): void {
   writeRegistryAtomic(new Map());
+}
+
+/** Remove abandoned PID-scoped registries without touching a live process. */
+export function cleanupStaleCodeHandleRegistries(): void {
+  let entries: string[];
+  try {
+    entries = readdirSync(registryDir);
+  } catch {
+    return;
+  }
+
+  for (const entry of entries) {
+    const match = /^\.handle-registry\.(\d+)\.json$/.exec(entry);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    if (pid === process.pid || isProcessAlive(pid)) continue;
+    try { unlinkSync(join(registryDir, entry)); } catch {}
+  }
 }
 
 export function searchCodeHandles(goal: string): CodeHandleMatch[] {
@@ -134,29 +176,42 @@ export function searchCodeHandles(goal: string): CodeHandleMatch[] {
 
 // --- Internals ---
 
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM means another user owns a still-live process, so leave its file.
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 function readRegistry(): Map<string, CodeHandle> {
   try {
     const data = readFileSync(REGISTRY_FILE, "utf8");
-    const parsed = JSON.parse(data) as CodeHandle[];
-    return new Map(parsed.map((h) => [h.name, h]));
+    const parsed = JSON.parse(data) as unknown;
+    if (!Array.isArray(parsed)) return new Map();
+    return new Map(
+      parsed
+        .filter((handle): handle is CodeHandle =>
+          typeof handle === "object" && handle !== null &&
+          typeof (handle as CodeHandle).name === "string" &&
+          typeof (handle as CodeHandle).setupCode === "string" &&
+          typeof (handle as CodeHandle).docs === "string",
+        )
+        .map((handle) => [handle.name, handle]),
+    );
   } catch {
     return new Map();
   }
 }
 
 function writeRegistryAtomic(registry: Map<string, CodeHandle>): void {
-  mkdirSync(dirname(REGISTRY_FILE), { recursive: true });
+  mkdirSync(registryDir, { recursive: true });
   const tmp = `${REGISTRY_FILE}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
   writeFileSync(tmp, JSON.stringify([...registry.values()], null, 2), "utf8");
   renameSync(tmp, REGISTRY_FILE);
-}
-
-function fileURLToPathCompat(url: string): string {
-  if (url.startsWith("file://")) {
-    // Use URL API for proper decoding of percent-encoded chars
-    return decodeURIComponent(new URL(url).pathname);
-  }
-  return url;
 }
 
 const STOP_WORDS = new Set([

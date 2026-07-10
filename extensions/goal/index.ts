@@ -20,8 +20,10 @@ import type {
 //   [[GOAL_BLOCKED: <question>]]   -> loop pauses, asks you; resume with /goal
 
 const DEFAULT_MAX_ITERATIONS = 30;
-const ACHIEVED_RE = /\[\[GOAL_ACHIEVED\]\]/i;
-const BLOCKED_RE = /\[\[GOAL_BLOCKED:\s*([^\]]*)\]\]/i;
+const MAX_ITERATIONS = 500;
+const MAX_GOAL_LENGTH = 10_000;
+const MAX_BLOCKED_REASON_LENGTH = 4_000;
+const MAX_PERSISTED_TURNS = 1_000_000;
 const STATE_ENTRY = "goal-state";
 
 interface GoalState {
@@ -37,6 +39,55 @@ interface GoalState {
 interface AssistantLike {
   role: string;
   content: Array<{ type: string; text?: string }>;
+  stopReason?: unknown;
+}
+
+interface SessionEntryLike {
+  type?: unknown;
+  customType?: unknown;
+  data?: unknown;
+  message?: unknown;
+}
+
+type GoalSignal = { type: "achieved" } | { type: "blocked"; reason: string } | undefined;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isBoundedNonNegativeInteger(value: unknown, max: number): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= max;
+}
+
+function readGoalState(data: unknown): GoalState | undefined {
+  if (!isRecord(data)) return undefined;
+
+  const goal = typeof data.goal === "string" ? data.goal.trim() : "";
+  if (!goal || goal.length > MAX_GOAL_LENGTH) return undefined;
+  if (!isBoundedNonNegativeInteger(data.startedAt, Number.MAX_SAFE_INTEGER) || data.startedAt === 0) return undefined;
+  if (!isBoundedNonNegativeInteger(data.maxIterations, MAX_ITERATIONS) || data.maxIterations === 0) return undefined;
+  if (!isBoundedNonNegativeInteger(data.iterations, data.maxIterations)) return undefined;
+  if (!isBoundedNonNegativeInteger(data.turns, MAX_PERSISTED_TURNS)) return undefined;
+  if (typeof data.active !== "boolean") return undefined;
+
+  let blockedReason: string | undefined;
+  if (data.blockedReason !== undefined) {
+    if (typeof data.blockedReason !== "string") return undefined;
+    blockedReason = data.blockedReason.trim();
+    if (!blockedReason || blockedReason.length > MAX_BLOCKED_REASON_LENGTH) return undefined;
+  }
+
+  // Contradictory or exhausted state must never restart an automatic loop.
+  const active = data.active && !blockedReason && data.iterations < data.maxIterations;
+  return {
+    goal,
+    startedAt: data.startedAt,
+    iterations: data.iterations,
+    turns: data.turns,
+    maxIterations: data.maxIterations,
+    active,
+    ...(blockedReason ? { blockedReason } : {}),
+  };
 }
 
 function assistantText(msg: AssistantLike): string {
@@ -46,12 +97,32 @@ function assistantText(msg: AssistantLike): string {
     .join("\n");
 }
 
-function lastAssistantText(messages: unknown[]): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i] as AssistantLike | undefined;
-    if (m && m.role === "assistant" && Array.isArray(m.content)) return assistantText(m);
+function finalAssistantFromBranch(entries: unknown[]): AssistantLike | undefined {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i] as SessionEntryLike | undefined;
+    if (entry?.type !== "message") continue;
+
+    const message = entry.message as AssistantLike | undefined;
+    if (!message || message.role !== "assistant" || !Array.isArray(message.content)) continue;
+    return message;
   }
-  return "";
+  return undefined;
+}
+
+function finalGoalSignal(text: string): GoalSignal {
+  // A trailing line ending is conventional output formatting, but no blank line,
+  // text, or whitespace may follow the sentinel.
+  const withoutFinalNewline = text.endsWith("\r\n")
+    ? text.slice(0, -2)
+    : text.endsWith("\n")
+      ? text.slice(0, -1)
+      : text;
+  const finalLine = withoutFinalNewline.slice(withoutFinalNewline.lastIndexOf("\n") + 1);
+
+  if (finalLine === "[[GOAL_ACHIEVED]]") return { type: "achieved" };
+
+  const blocked = /^\[\[GOAL_BLOCKED: (\S(?:[^\]\r\n]*\S)?)\]\]$/.exec(finalLine);
+  return blocked ? { type: "blocked", reason: blocked[1] } : undefined;
 }
 
 function fmtDuration(ms: number): string {
@@ -114,6 +185,24 @@ export default function (pi: ExtensionAPI) {
     if (note && ctx.hasUI) ctx.ui.notify(note, "info");
   };
 
+  const restoreGoalState = (ctx: ExtensionContext) => {
+    state = undefined;
+    try {
+      const branch = ctx.sessionManager.getBranch() as unknown[];
+      for (let i = branch.length - 1; i >= 0; i--) {
+        const entry = branch[i] as SessionEntryLike | undefined;
+        if (entry?.type === "custom" && entry.customType === STATE_ENTRY) {
+          // The newest state entry is authoritative. Do not fall back to an
+          // older branch state when it is malformed or explicitly cleared.
+          state = readGoalState(entry.data);
+          break;
+        }
+      }
+    } catch {
+      state = undefined;
+    }
+  };
+
   // Inject the persistent objective + completion protocol into the system prompt
   // for every turn while the goal is active.
   pi.on("before_agent_start", (event: { systemPrompt: string }, _ctx: ExtensionContext) => {
@@ -142,14 +231,30 @@ export default function (pi: ExtensionAPI) {
     renderWidget(ctx);
   });
 
-  // After each agent run, decide whether the goal is done, blocked, or should continue.
-  pi.on("agent_end", (event: { messages: unknown[] }, ctx: ExtensionContext) => {
+  // Decide only after Pi has exhausted its own retries, compaction recovery,
+  // and queued messages. agent_end is too early: its final assistant state can
+  // still be replaced by a retry or follow-up.
+  pi.on("agent_settled", (_event: unknown, ctx: ExtensionContext) => {
     if (!state?.active) return;
+
+    const finalAssistant = finalAssistantFromBranch(ctx.sessionManager.getBranch() as unknown[]);
+    if (!finalAssistant || finalAssistant.stopReason !== "stop") {
+      // Pause after failed, aborted, truncated, or tool-use-only terminal state.
+      // Leaving the state active would inject an abandoned goal into the next
+      // unrelated user prompt and could restart the autonomous loop.
+      state.active = false;
+      persist();
+      renderWidget(ctx);
+      if (ctx.hasUI) {
+        ctx.ui.notify('🎯 goal paused after an incomplete agent run. Run "/goal" to resume.', "warning");
+      }
+      return;
+    }
+
     state.iterations++;
+    const signal = finalGoalSignal(assistantText(finalAssistant));
 
-    const text = lastAssistantText(event.messages ?? []);
-
-    if (ACHIEVED_RE.test(text)) {
+    if (signal?.type === "achieved") {
       const summary =
         `🎯 goal achieved in ${state.iterations} iters / ${state.turns} turns / ` +
         `${fmtDuration(Date.now() - state.startedAt)}.`;
@@ -157,10 +262,9 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const blocked = BLOCKED_RE.exec(text);
-    if (blocked) {
+    if (signal?.type === "blocked") {
       state.active = false;
-      state.blockedReason = blocked[1]?.trim() || "needs a decision";
+      state.blockedReason = signal.reason;
       persist();
       renderWidget(ctx);
       if (ctx.hasUI) {
@@ -185,7 +289,13 @@ export default function (pi: ExtensionAPI) {
 
     persist();
     renderWidget(ctx);
-    // Keep the loop going.
+    // A different extension may have started a run from its own settled hook.
+    // Do not corrupt that run by injecting a goal continuation into it.
+    if (!ctx.isIdle()) return;
+
+    // sendUserMessage is fire-and-forget (void): Pi exposes no dispatch or
+    // queue acknowledgement, so this is deliberately one enqueue request per
+    // agent_settled event rather than a delivery-guaranteed retry.
     pi.sendUserMessage(
       "Continue working toward the active goal. If it is already fully satisfied and verified, " +
         "reply with [[GOAL_ACHIEVED]]; if you are blocked and need a decision, reply with " +
@@ -194,17 +304,15 @@ export default function (pi: ExtensionAPI) {
     );
   });
 
-  // Reconstruct state after /reload or resume.
+  // Reconstruct state after /reload or resume from the selected branch only.
   pi.on("session_start", (_event: unknown, ctx: ExtensionContext) => {
-    state = undefined;
-    try {
-      for (const entry of ctx.sessionManager.getEntries() as Array<any>) {
-        if (entry?.type === "custom" && entry.customType === STATE_ENTRY) {
-          const d = entry.data;
-          state = d && typeof d.goal === "string" && d.goal ? (d as GoalState) : undefined;
-        }
-      }
-    } catch {}
+    restoreGoalState(ctx);
+    renderWidget(ctx);
+  });
+
+  // /tree changes the active branch without recreating the extension runtime.
+  pi.on("session_tree", (_event: unknown, ctx: ExtensionContext) => {
+    restoreGoalState(ctx);
     renderWidget(ctx);
   });
 
@@ -238,6 +346,19 @@ export default function (pi: ExtensionAPI) {
       const raw = (args ?? "").trim();
       const lower = raw.toLowerCase();
 
+      if (lower === "status" || (raw === "" && !state)) {
+        showStatus(ctx);
+        return;
+      }
+
+      // Commands run immediately even while an agent is streaming. Refuse
+      // mutations then so a command cannot replace or resume a goal halfway
+      // through another run.
+      if (!ctx.isIdle()) {
+        ctx.ui.notify("🎯 wait for the current agent run to finish before changing the goal.", "warning");
+        return;
+      }
+
       if (lower === "stop" || lower === "clear" || lower === "cancel" || lower === "done") {
         if (!state) {
           ctx.ui.notify("🎯 no active goal to clear.", "info");
@@ -247,19 +368,15 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      if (lower === "status" || (raw === "" && !state)) {
-        showStatus(ctx);
-        return;
-      }
-
       // No args but a goal exists -> resume the loop (e.g. after block/max).
       if (raw === "" && state) {
         state.active = true;
+        state.iterations = 0;
         state.blockedReason = undefined;
         persist();
         renderWidget(ctx);
         ctx.ui.notify("🎯 resuming goal loop.", "info");
-        if (ctx.hasUI) pi.sendUserMessage("Resume working toward the active goal now.", { deliverAs: "followUp" });
+        pi.sendUserMessage("Resume working toward the active goal now.", { deliverAs: "followUp" });
         return;
       }
 
@@ -268,11 +385,15 @@ export default function (pi: ExtensionAPI) {
       let goalText = raw;
       const maxMatch = /^max\s*=\s*(\d+)\s+(.*)$/is.exec(raw);
       if (maxMatch) {
-        maxIterations = Math.max(1, Math.min(500, parseInt(maxMatch[1], 10)));
+        maxIterations = Math.max(1, Math.min(MAX_ITERATIONS, parseInt(maxMatch[1], 10)));
         goalText = maxMatch[2].trim();
       }
       if (!goalText) {
         ctx.ui.notify("🎯 usage: /goal <objective>  (optional: /goal max=20 <objective>)", "warning");
+        return;
+      }
+      if (goalText.length > MAX_GOAL_LENGTH) {
+        ctx.ui.notify(`🎯 goal is too long (maximum ${MAX_GOAL_LENGTH} characters).`, "warning");
         return;
       }
 
@@ -287,7 +408,7 @@ export default function (pi: ExtensionAPI) {
       persist();
       renderWidget(ctx);
       ctx.ui.notify(`🎯 goal set (max ${maxIterations} iters). Working toward it now…`, "info");
-      if (ctx.hasUI) pi.sendUserMessage("Start working toward the active goal now.", { deliverAs: "followUp" });
+      pi.sendUserMessage("Start working toward the active goal now.", { deliverAs: "followUp" });
     },
   });
 }

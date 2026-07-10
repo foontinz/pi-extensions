@@ -4,10 +4,25 @@
   "version": "1.0.0",
   "type": "module",
   "description": "Pi extension for installing and enabling Agent Skills from GitHub repositories.",
+  "scripts": {
+    "clean": "echo 'nothing to clean'",
+    "build": "tsc --noEmit",
+    "check": "tsc --noEmit",
+    "test": "tsx --test test/**/*.test.ts"
+  },
   "pi": {
     "extensions": [
       "./index.ts"
     ]
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.5",
+    "@earendil-works/pi-tui": "^0.80.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "tsx": "^4.23.0",
+    "typescript": "^7.0.2"
   },
   "engines": {
     "node": ">=22.19.0"

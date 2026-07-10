@@ -3,12 +3,14 @@ import { installEnvVarStatus, onEnvVarChanged, registerManagedEnvVar } from "pi-
 import { getEnvVar } from "pi-extension-envvars/store";
 
 const PROVIDER_NAME = "openrouter-free";
+const API_KEY_ENV_VAR = "OPENROUTER_API_KEY";
+const API_KEY_FALLBACK = "$OPENROUTER_API_KEY";
 
 const MODELS = [
 	{
 		id: "liquid/lfm-2.5-1.2b-thinking:free",
 		name: "Liquid LFM 2.5 1.2B Thinking (Free)",
-		reasoning: false,
+		reasoning: true,
 		input: ["text" as "text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 32768,
@@ -16,23 +18,22 @@ const MODELS = [
 	},
 ];
 
-export default function (pi: ExtensionAPI) {
+export default async function (pi: ExtensionAPI) {
 	registerManagedEnvVar({
-		name: "OPENROUTER_API_KEY",
+		name: API_KEY_ENV_VAR,
 		label: "OpenRouter key",
 		description: "API key used by the openrouter-free provider",
 	});
 	installEnvVarStatus(pi, {
-		name: "OPENROUTER_API_KEY",
+		name: API_KEY_ENV_VAR,
 		statusId: "openrouter-free",
 		label: "OpenRouter key",
 	});
 
 	const register = async () => {
-		const apiKey = await getEnvVar("OPENROUTER_API_KEY");
 		pi.registerProvider(PROVIDER_NAME, {
 			baseUrl: "https://openrouter.ai/api/v1",
-			apiKey: apiKey ?? "$OPENROUTER_API_KEY",
+			apiKey: await resolveApiKey(),
 			api: "openai-completions",
 			headers: {
 				"HTTP-Referer": "https://github.com/earendil-works/pi-mono",
@@ -42,11 +43,23 @@ export default function (pi: ExtensionAPI) {
 		});
 	};
 
-	pi.on("session_start", async () => {
-		await register();
-	});
+	// Pi awaits async factories before startup and --list-models output.
+	await register();
 
-	onEnvVarChanged(pi, "OPENROUTER_API_KEY", async () => {
-		await register();
-	});
+	onEnvVarChanged(pi, API_KEY_ENV_VAR, register);
+}
+
+async function resolveApiKey(): Promise<string> {
+	const environmentKey = process.env[API_KEY_ENV_VAR];
+	if (environmentKey !== undefined) return environmentKey;
+
+	// The envvars store is backed by the macOS Keychain. Do not invoke it on
+	// platforms where it is unavailable, and let Pi's environment expansion
+	// resolve the key when no stored credential is available.
+	if (process.platform !== "darwin") return API_KEY_FALLBACK;
+	try {
+		return (await getEnvVar(API_KEY_ENV_VAR)) ?? API_KEY_FALLBACK;
+	} catch {
+		return API_KEY_FALLBACK;
+	}
 }

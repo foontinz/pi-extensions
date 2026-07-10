@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { clearManagedEnvVarRegistrations, listRegisteredEnvVars } from "./hooks";
+import { listRegisteredEnvVars } from "./hooks";
 import {
 	clearStoredEnvVar,
 	getEnvVar,
@@ -9,8 +9,6 @@ import {
 	saveStoredEnvVar,
 	validateEnvVarName,
 } from "./store";
-
-clearManagedEnvVarRegistrations();
 
 export default function (pi: ExtensionAPI) {
 	const getRegisteredNames = (): string[] => listRegisteredEnvVars().map((item) => item.name);
@@ -105,9 +103,12 @@ export default function (pi: ExtensionAPI) {
 			if (action === "clear") {
 				const ok = !ctx.hasUI || (await ctx.ui.confirm("Clear env var", `Delete ${name} from the macOS Keychain?`));
 				if (!ok) return;
-				await clearStoredEnvVar(name);
+				const deleted = await clearStoredEnvVar(name);
 				pi.events.emit("envvars:changed", { name, action: "clear" as const });
-				ctx.ui.notify(`Cleared ${name} from macOS Keychain`, "info");
+				ctx.ui.notify(
+					deleted ? `Cleared ${name} from macOS Keychain` : `${name} was not stored in macOS Keychain`,
+					"info",
+				);
 				return;
 			}
 
@@ -120,6 +121,10 @@ export default function (pi: ExtensionAPI) {
 			const value = inlineValue || (await ctx.ui.input(`Set ${name}`, `Enter a value to store for ${name} in the macOS Keychain`));
 			if (!value?.trim()) {
 				ctx.ui.notify("No value entered", "warning");
+				return;
+			}
+			if (/[\r\n]/.test(value)) {
+				ctx.ui.notify("Secrets cannot contain carriage returns or line feeds", "warning");
 				return;
 			}
 

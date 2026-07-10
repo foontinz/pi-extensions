@@ -1,8 +1,7 @@
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -12,6 +11,8 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
 	createBashToolDefinition,
+	getAgentDir,
+	SettingsManager,
 	createEditToolDefinition,
 	createFindToolDefinition,
 	createGrepToolDefinition,
@@ -35,7 +36,7 @@ const MODE_DESCRIPTION: Record<ViewMode, string> = {
 	verbose: "full output (pi default)",
 };
 
-const PREFS_PATH = join(homedir(), ".pi", "agent", "tool-view.json");
+const PREFS_PATH = join(getAgentDir(), "tool-view.json");
 const STATUS_KEY = "tool-view";
 
 // Built-in tools we wrap. Each factory returns the original ToolDefinition
@@ -51,26 +52,74 @@ const FACTORIES: Record<string, (cwd: string) => ToolDefinition<any, any, any>> 
 	ls: createLsToolDefinition,
 };
 
+/** Pi settings that affect managed tool execution. */
+export interface ToolViewToolSettings {
+	shellPath?: string;
+	commandPrefix?: string;
+	autoResizeImages: boolean;
+}
+
+type ToolSettingsReader = Pick<
+	SettingsManager,
+	"getShellPath" | "getShellCommandPrefix" | "getImageAutoResize"
+>;
+
+/** Read the settings that must be preserved when a built-in is re-registered. */
+export function getToolViewToolSettings(settings: ToolSettingsReader): ToolViewToolSettings {
+	return {
+		shellPath: settings.getShellPath(),
+		commandPrefix: settings.getShellCommandPrefix(),
+		autoResizeImages: settings.getImageAutoResize(),
+	};
+}
+
+/**
+ * Create a managed definition with Pi's configured execution options. Exported
+ * so other extensions can use the same setting-preserving wrapper behavior.
+ */
+export function createManagedToolDefinition(
+	name: string,
+	cwd: string,
+	settings: ToolViewToolSettings,
+): ToolDefinition<any, any, any> {
+	switch (name) {
+		case "bash":
+			return createBashToolDefinition(cwd, {
+				shellPath: settings.shellPath,
+				commandPrefix: settings.commandPrefix,
+			});
+		case "read":
+			return createReadToolDefinition(cwd, { autoResizeImages: settings.autoResizeImages });
+		default:
+			return FACTORIES[name]!(cwd);
+	}
+}
+
 // Tools whose details are stripped in "medium" mode.
 const DETAIL_HEAVY = new Set(["write", "edit"]);
 
-// Other extensions in this agent dir that own a built-in tool. tool-view must
-// NOT re-register those tools, otherwise it would clobber their behavior and
-// pi reports a conflict. Maps a sibling extension dir name -> tools it owns.
-const SIBLING_TOOL_OWNERS: Record<string, string[]> = {
-	"enhanced-bash": ["bash"],
+type ToolSource = {
+	name: string;
+	sourceInfo: { source: string };
 };
 
-function computeExcluded(prefsExclude: string[]): Set<string> {
+/**
+ * Tool provenance is the only reliable way to decide whether a built-in can be
+ * wrapped: sibling extensions may be installed but disabled, or enabled from a
+ * completely different location. `getAllTools()` exposes the canonical source.
+ */
+export function selectManagedTools(
+	activeTools: Iterable<string>,
+	allTools: Iterable<ToolSource>,
+	prefsExclude: Iterable<string>,
+): string[] {
+	const active = new Set(activeTools);
+	const sourceByName = new Map(Array.from(allTools, (tool) => [tool.name, tool.sourceInfo.source]));
 	const excluded = new Set(prefsExclude);
-	// .../extensions/tool-view -> .../extensions (independent of this dir's name)
-	const extensionsDir = dirname(dirname(fileURLToPath(import.meta.url)));
-	for (const [sibling, ownedTools] of Object.entries(SIBLING_TOOL_OWNERS)) {
-		if (existsSync(join(extensionsDir, sibling))) {
-			for (const tool of ownedTools) excluded.add(tool);
-		}
-	}
-	return excluded;
+
+	return Object.keys(FACTORIES).filter(
+		(name) => active.has(name) && sourceByName.get(name) === "builtin" && !excluded.has(name),
+	);
 }
 
 // ---------------------------------------------------------------------------
@@ -80,7 +129,8 @@ function computeExcluded(prefsExclude: string[]): Set<string> {
 export default function (pi: ExtensionAPI) {
 	const prefs = loadPrefs();
 	let mode: ViewMode = prefs.mode;
-	const excluded = computeExcluded(prefs.exclude ?? []);
+	let toolsRegistered = false;
+	let toolSettings: ToolViewToolSettings | undefined;
 
 	// `shouldStrip` is read at render time (inside the renderers below), so a
 	// mode change immediately affects every subsequent tool render without
@@ -91,47 +141,61 @@ export default function (pi: ExtensionAPI) {
 		return DETAIL_HEAVY.has(toolName); // medium
 	};
 
-	const cwd = process.cwd();
+	const registerManagedTools = (cwd: string) => {
+		if (toolsRegistered) return;
+		if (!toolSettings) throw new Error("tool-view settings must be loaded before tool registration");
 
-	for (const [name, factory] of Object.entries(FACTORIES)) {
-		if (excluded.has(name)) continue; // owned by another extension / opted out
-		const base = factory(cwd);
-		const baseRenderCall = base.renderCall;
-		const baseRenderResult = base.renderResult;
-		const label = base.label || name;
+		for (const name of selectManagedTools(pi.getActiveTools(), pi.getAllTools(), prefs.exclude ?? [])) {
+			// The base definition supplies schema, prompt metadata, and native
+			// renderers. Execution gets a fresh definition for the invocation cwd.
+			const base = createManagedToolDefinition(name, cwd, toolSettings);
+			const baseRenderCall = base.renderCall;
+			const baseRenderResult = base.renderResult;
+			const label = base.label || name;
 
-		pi.registerTool({
-			...base,
-			// Render our own framing so we can drop the default shell's vertical
-			// padding (a blank line above & below every row) while keeping the
-			// background tint + horizontal padding.
-			renderShell: "self",
-			renderCall(args: any, theme: Theme, context: any): Component {
-				const inner = shouldStrip(name)
-					? compactCall(label, name, args, theme, context)
-					: baseRenderCall
-						? baseRenderCall(args, theme, withInner(context))
-						: new Text("", 0, 0);
-				return tightBox(context, theme, inner);
-			},
-			renderResult(result: any, options: any, theme: Theme, context: any): Component {
-				let inner: Component;
-				if (shouldStrip(name)) {
-					if (context.isError) {
-						inner = errorResult(result, theme);
+			pi.registerTool({
+				...base,
+				async execute(toolCallId, params, signal, onUpdate, ctx) {
+					return createManagedToolDefinition(name, ctx.cwd, toolSettings!).execute(
+						toolCallId,
+						params,
+						signal,
+						onUpdate,
+						ctx,
+					);
+				},
+				// Render our own framing so we can drop the default shell's vertical
+				// padding (a blank line above & below every row) while keeping the
+				// background tint + horizontal padding.
+				renderShell: "self",
+				renderCall(args: any, theme: Theme, context: any): Component {
+					const inner = shouldStrip(name)
+						? compactCall(label, name, args, theme, context)
+						: baseRenderCall
+							? baseRenderCall(args, theme, withInner(context))
+							: new Text("", 0, 0);
+					return tightBox(context, theme, inner);
+				},
+				renderResult(result: any, options: any, theme: Theme, context: any): Component {
+					let inner: Component;
+					if (shouldStrip(name)) {
+						if (context.isError) {
+							inner = errorResult(result, theme);
+						} else {
+							// Hide the body; the compact call line already says which tool ran.
+							return new Container();
+						}
 					} else {
-						// Hide the body; the compact call line already says which tool ran.
-						return new Container();
+						inner = baseRenderResult
+							? baseRenderResult(result, options, theme, withInner(context))
+							: new Text(getResultText(result), 0, 0);
 					}
-				} else {
-					inner = baseRenderResult
-						? baseRenderResult(result, options, theme, withInner(context))
-						: new Text(getResultText(result), 0, 0);
-				}
-				return tightBox(context, theme, inner);
-			},
-		} as ToolDefinition<any, any, any>);
-	}
+					return tightBox(context, theme, inner);
+				},
+			} as ToolDefinition<any, any, any>);
+		}
+		toolsRegistered = true;
+	};
 
 	const refreshStatus = (ctx: ExtensionContext | ExtensionCommandContext) => {
 		ctx.ui.setStatus(STATUS_KEY, `tools: ${mode}`);
@@ -139,6 +203,13 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		mode = loadPrefs().mode;
+		// Load once from the session cwd, just as Pi does, before creating any
+		// replacement definitions. These options are reused for each call's cwd.
+		toolSettings = getToolViewToolSettings(
+			SettingsManager.create(ctx.cwd, getAgentDir(), { projectTrusted: ctx.isProjectTrusted?.() ?? false }),
+		);
+		// Tool metadata is only available after Pi binds the extension runtime.
+		registerManagedTools(ctx.cwd);
 		refreshStatus(ctx);
 	});
 

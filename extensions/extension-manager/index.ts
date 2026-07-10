@@ -1,55 +1,80 @@
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, extname, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
-import { Container, type SettingItem, SettingsList } from "@earendil-works/pi-tui";
+import lockfile from "proper-lockfile";
+import {
+	CONFIG_DIR_NAME,
+	DefaultPackageManager,
+	getAgentDir,
+	getSettingsListTheme,
+	SettingsManager,
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+	type ResolvedResource,
+} from "@earendil-works/pi-coding-agent";
+import { Container, type SettingItem, SettingsList, truncateToWidth } from "@earendil-works/pi-tui";
 
 const COMMAND_NAME = "extensions-ui";
-const GLOBAL_ROOT = join(homedir(), ".pi", "agent");
-const GLOBAL_EXTENSIONS_DIR = join(GLOBAL_ROOT, "extensions");
-const GLOBAL_SETTINGS_PATH = join(GLOBAL_ROOT, "settings.json");
-const PROJECT_SETTINGS_DIRNAME = ".pi";
-const PROJECT_EXTENSIONS_DIRNAME = "extensions";
-
 type Scope = "global" | "project";
 
-interface SettingsShape {
+type SettingsShape = Record<string, unknown> & {
 	extensions?: string[];
-	[key: string]: unknown;
-}
+};
+
+type SettingsReadResult =
+	| { kind: "missing"; settings: SettingsShape }
+	| { kind: "valid"; settings: SettingsShape }
+	| { kind: "invalid"; error: Error };
 
 interface ExtensionCandidate {
 	id: string;
 	path: string;
 	scope: Scope;
 	settingsPath: string;
+	settingsBaseDir: string;
+	settingsCwd: string;
+	settingsAgentDir: string;
 	label: string;
 	disabled: boolean;
 	origin: "auto" | "settings";
 	isSelf: boolean;
+	updateVersion: number;
 }
+
+const updateQueues = new Map<string, Promise<void>>();
 
 export default function extensionManager(pi: ExtensionAPI) {
 	pi.registerCommand(COMMAND_NAME, {
 		description: "Enable/disable discovered local extensions",
 		handler: async (_args, ctx) => {
-			let candidates = await discoverCandidates(ctx);
+			if (ctx.mode !== "tui") {
+				ctx.ui.notify("/extensions-ui is only available in the interactive terminal UI.", "info");
+				return;
+			}
+
+			const candidates = await discoverCandidates(ctx);
 			if (candidates.length === 0) {
-				ctx.ui.notify("No local extensions found in ~/.pi/agent/extensions, .pi/extensions, or settings.json extension paths.", "info");
+				ctx.ui.notify(
+					`No local extensions found in ${join(getAgentDir(), "extensions")}, ${CONFIG_DIR_NAME}/extensions, or settings.json extension paths.`,
+					"info",
+				);
 				return;
 			}
 
 			let dirty = false;
+			const pendingUpdates: Promise<void>[] = [];
 			await ctx.ui.custom((tui, theme, _kb, done) => {
 				const container = new Container();
 				container.addChild(
 					new (class {
-						render(_width: number) {
+						render(width: number) {
 							return [
-								theme.fg("accent", theme.bold("Extension Manager")),
-								theme.fg("dim", "Toggle local extensions. Changes are written to settings.json and applied after reload."),
+								truncateToWidth(theme.fg("accent", theme.bold("Extension Manager")), width),
+								truncateToWidth(
+									theme.fg("dim", "Toggle local extensions. Changes are written to settings.json and applied after reload."),
+									width,
+								),
 								"",
 							];
 						}
@@ -62,19 +87,28 @@ export default function extensionManager(pi: ExtensionAPI) {
 					Math.min(candidates.length + 2, 18),
 					getSettingsListTheme(),
 					(id, newValue) => {
-						void (async () => {
-							const candidate = candidates.find((item) => item.id === id);
-							if (!candidate) return;
-							const nextDisabled = newValue === "disabled";
-							if (candidate.disabled === nextDisabled) return;
-							await setCandidateDisabled(candidate, nextDisabled);
-							candidate.disabled = nextDisabled;
-							dirty = true;
-							settingsList.updateValue(id, nextDisabled ? "disabled" : "enabled");
-							tui.requestRender();
-						})().catch((error) => {
-							ctx.ui.notify(`Failed to update extension setting: ${error instanceof Error ? error.message : String(error)}`, "error");
-						});
+						const candidate = candidates.find((item) => item.id === id);
+						if (!candidate) return;
+						const nextDisabled = newValue === "disabled";
+						// SettingsList changes its own displayed value before calling us. Keep
+						// every rapid toggle: the per-file update queue preserves their order.
+						const updateVersion = ++candidate.updateVersion;
+						const update = setCandidateDisabled(candidate, nextDisabled)
+							.then(() => {
+								candidate.disabled = nextDisabled;
+								dirty = true;
+							})
+							.catch((error) => {
+								if (candidate.updateVersion === updateVersion) {
+									settingsList.updateValue(id, candidate.disabled ? "disabled" : "enabled");
+								}
+								ctx.ui.notify(
+									`Failed to update extension setting: ${error instanceof Error ? error.message : String(error)}`,
+									"error",
+								);
+							})
+							.finally(() => tui.requestRender());
+						pendingUpdates.push(update);
 					},
 					() => done(undefined),
 				);
@@ -83,7 +117,9 @@ export default function extensionManager(pi: ExtensionAPI) {
 
 				return {
 					render(width: number) {
-						return container.render(width);
+						// Child components are independently width-aware, but clipping here
+						// also protects the dialog if their implementation changes.
+						return container.render(width).map((line) => truncateToWidth(line, width));
 					},
 					invalidate() {
 						container.invalidate();
@@ -95,10 +131,13 @@ export default function extensionManager(pi: ExtensionAPI) {
 				};
 			});
 
+			// SettingsList callbacks cannot be awaited by the component. Do not offer
+			// reload until every queued, Pi-locked settings update has completed.
+			await Promise.all(pendingUpdates);
 			if (!dirty) return;
 			const ok = !ctx.hasUI || (await ctx.ui.confirm("Reload extensions", "Settings updated. Reload extensions now?"));
 			if (!ok) {
-				ctx.ui.notify(`Saved changes. Run /reload later to apply them.`, "info");
+				ctx.ui.notify("Saved changes. Run /reload later to apply them.", "info");
 				return;
 			}
 			await ctx.reload();
@@ -116,54 +155,76 @@ function toSettingItems(candidates: ExtensionCandidate[]): SettingItem[] {
 }
 
 async function discoverCandidates(ctx: ExtensionCommandContext): Promise<ExtensionCandidate[]> {
-	const projectRoot = ctx.cwd;
-	const projectSettingsPath = join(projectRoot, PROJECT_SETTINGS_DIRNAME, "settings.json");
-	const projectExtensionsDir = join(projectRoot, PROJECT_SETTINGS_DIRNAME, PROJECT_EXTENSIONS_DIRNAME);
-	const selfPath = resolve(dirname(fileURLToPath(import.meta.url)), "index.ts");
-
-	const [globalSettings, projectSettings] = await Promise.all([
-		readSettings(GLOBAL_SETTINGS_PATH),
-		readSettings(projectSettingsPath),
+	const agentDir = resolve(getAgentDir());
+	const projectRoot = resolve(ctx.cwd);
+	const projectBaseDir = join(projectRoot, CONFIG_DIR_NAME);
+	const projectTrusted = ctx.isProjectTrusted();
+	const globalSettingsPath = join(agentDir, "settings.json");
+	const projectSettingsPath = join(projectBaseDir, "settings.json");
+	const [globalSettingsResult, projectSettingsResult] = await Promise.all([
+		readSettings(globalSettingsPath),
+		projectTrusted ? readSettings(projectSettingsPath) : Promise.resolve<SettingsReadResult>({ kind: "missing", settings: {} }),
 	]);
 
-	const candidates = new Map<string, ExtensionCandidate>();
+	// DefaultPackageManager is Pi's public implementation of local extension
+	// discovery, manifests, ignore files, patterns, and +/-/! filter precedence.
+	// Use a snapshot with packages removed: package resources need package-specific
+	// filters and cannot be safely toggled through settings.extensions.
+	const settingsManager = SettingsManager.fromStorage(
+		new SnapshotSettingsStorage(
+			withoutPackages(readableSettings(globalSettingsResult)),
+			withoutPackages(readableSettings(projectSettingsResult)),
+		),
+		{ projectTrusted },
+	);
+	const packageManager = new DefaultPackageManager({ cwd: projectRoot, agentDir, settingsManager });
+	const resolvedPaths = await packageManager.resolve(async () => "skip");
+	const selfPath = resolve(dirname(fileURLToPath(import.meta.url)), "index.ts");
 
-	for (const path of await listDiscoveredExtensionEntryPoints(GLOBAL_EXTENSIONS_DIR)) {
-		candidates.set(path, createCandidate(path, "global", GLOBAL_SETTINGS_PATH, globalSettings, selfPath, projectRoot, "auto"));
-	}
-	for (const path of await listDiscoveredExtensionEntryPoints(projectExtensionsDir)) {
-		candidates.set(path, createCandidate(path, "project", projectSettingsPath, projectSettings, selfPath, projectRoot, "auto"));
-	}
-
-	for (const path of await listExplicitSettingsPaths(globalSettings.extensions ?? [], GLOBAL_ROOT)) {
-		candidates.set(path, createCandidate(path, "global", GLOBAL_SETTINGS_PATH, globalSettings, selfPath, projectRoot, "settings"));
-	}
-	for (const path of await listExplicitSettingsPaths(projectSettings.extensions ?? [], join(projectRoot, PROJECT_SETTINGS_DIRNAME))) {
-		candidates.set(path, createCandidate(path, "project", projectSettingsPath, projectSettings, selfPath, projectRoot, "settings"));
-	}
-
-	return [...candidates.values()].sort((a, b) => a.label.localeCompare(b.label));
+	return resolvedPaths.extensions
+		.filter((resource) => resource.metadata.origin === "top-level")
+		.map((resource) =>
+			createCandidate(
+				resource,
+				globalSettingsPath,
+				projectSettingsPath,
+				agentDir,
+				projectBaseDir,
+				selfPath,
+				projectRoot,
+			),
+		)
+		.sort((a, b) => a.label.localeCompare(b.label));
 }
 
 function createCandidate(
-	path: string,
-	scope: Scope,
-	settingsPath: string,
-	settings: SettingsShape,
+	resource: ResolvedResource,
+	globalSettingsPath: string,
+	projectSettingsPath: string,
+	agentDir: string,
+	projectBaseDir: string,
 	selfPath: string,
-	projectRoot: string,
-	origin: "auto" | "settings",
+	settingsCwd: string,
 ): ExtensionCandidate {
-	const resolvedPath = resolve(path);
+	const scope: Scope = resource.metadata.scope === "project" ? "project" : "global";
+	const path = resolve(resource.path);
+	const settingsPath = scope === "global" ? globalSettingsPath : projectSettingsPath;
+	const settingsBaseDir = scope === "global" ? agentDir : projectBaseDir;
+	const origin = resource.metadata.source === "auto" ? "auto" : "settings";
+	const isSelf = path === selfPath;
 	return {
-		id: `${scope}:${resolvedPath}`,
-		path: resolvedPath,
+		id: `${scope}:${path}`,
+		path,
 		scope,
 		settingsPath,
-		label: formatLabel(resolvedPath, scope, projectRoot, origin, resolvedPath === selfPath),
-		disabled: isPathDisabled(settings.extensions ?? [], resolvedPath),
+		settingsBaseDir,
+		settingsCwd,
+		settingsAgentDir: agentDir,
+		label: formatLabel(path, scope, projectBaseDir, origin, isSelf),
+		disabled: !resource.enabled,
 		origin,
-		isSelf: resolvedPath === selfPath,
+		isSelf,
+		updateVersion: 0,
 	};
 }
 
@@ -175,149 +236,204 @@ function formatLabel(path: string, scope: Scope, projectRoot: string, origin: "a
 }
 
 function displayPath(path: string, projectRoot: string): string {
-	const home = homedir();
-	if (path.startsWith(projectRoot + "/")) {
+	if (isWithin(path, projectRoot)) {
 		return relative(projectRoot, path) || ".";
 	}
-	if (path.startsWith(home + "/")) {
+	const home = homedir();
+	if (isWithin(path, home)) {
 		return `~/${relative(home, path)}`;
 	}
 	return path;
 }
 
-function isPathDisabled(entries: string[], targetPath: string): boolean {
-	return entries.some((entry) => normalizeDisableEntry(entry) === targetPath);
-}
-
-function normalizeDisableEntry(entry: string): string | undefined {
-	if (!entry.startsWith("-")) return undefined;
-	const raw = entry.slice(1).trim();
-	if (!raw || looksLikePattern(raw)) return undefined;
-	return resolve(raw);
-}
-
-function looksLikePattern(value: string): boolean {
-	return value.includes("*") || value.includes("?") || value.includes("[") || value.startsWith("!") || value.startsWith("+");
-}
-
-async function listExplicitSettingsPaths(entries: string[], baseDir: string): Promise<string[]> {
-	const results = new Set<string>();
-	for (const entry of entries) {
-		const trimmed = entry.trim();
-		if (!trimmed || trimmed.startsWith("-") || trimmed.startsWith("!")) continue;
-		if (looksLikePattern(trimmed)) continue;
-		const raw = trimmed.startsWith("+") ? trimmed.slice(1) : trimmed;
-		const resolved = resolvePathLikePi(raw, baseDir);
-		for (const item of await expandExtensionSource(resolved)) {
-			results.add(item);
-		}
-	}
-	return [...results];
-}
-
-async function listDiscoveredExtensionEntryPoints(rootDir: string): Promise<string[]> {
-	const results = new Set<string>();
-	for (const source of await listImmediateChildren(rootDir)) {
-		for (const item of await expandExtensionSource(source)) {
-			results.add(item);
-		}
-	}
-	return [...results];
-}
-
-async function listImmediateChildren(dir: string): Promise<string[]> {
-	try {
-		const fs = await import("node:fs/promises");
-		const entries = await fs.readdir(dir, { withFileTypes: true });
-		return entries
-			.filter((entry) => !entry.name.startsWith("."))
-			.map((entry) => join(dir, entry.name));
-	} catch {
-		return [];
-	}
-}
-
-async function expandExtensionSource(sourcePath: string): Promise<string[]> {
-	try {
-		const stat = await import("node:fs/promises").then((fs) => fs.stat(sourcePath));
-		if (stat.isFile()) {
-			const ext = extname(sourcePath);
-			if (ext === ".ts" || ext === ".js" || ext === ".mjs" || ext === ".cjs") {
-				return [resolve(sourcePath)];
-			}
-			if (basename(sourcePath) === "package.json") {
-				return await expandPackageJson(dirname(sourcePath));
-			}
-			return [];
-		}
-		if (!stat.isDirectory()) return [];
-		const packageEntries = await expandPackageJson(sourcePath);
-		if (packageEntries.length > 0) return packageEntries;
-		const candidates = ["index.ts", "index.js", "index.mjs", "index.cjs"];
-		const results: string[] = [];
-		for (const candidate of candidates) {
-			const fullPath = join(sourcePath, candidate);
-			if (await pathExists(fullPath)) results.push(resolve(fullPath));
-		}
-		return results;
-	} catch {
-		return [];
-	}
-}
-
-async function expandPackageJson(dir: string): Promise<string[]> {
-	const packagePath = join(dir, "package.json");
-	if (!(await pathExists(packagePath))) return [];
-	try {
-		const raw = await readFile(packagePath, "utf8");
-		const parsed = JSON.parse(raw) as { pi?: { extensions?: unknown } };
-		const entries = Array.isArray(parsed.pi?.extensions) ? parsed.pi!.extensions : [];
-		return entries
-			.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
-			.map((entry) => resolve(dir, entry));
-	} catch {
-		return [];
-	}
+function isWithin(path: string, root: string): boolean {
+	const pathFromRoot = relative(root, path);
+	return pathFromRoot === "" || (!pathFromRoot.startsWith(`..${sep}`) && pathFromRoot !== ".." && !isAbsolute(pathFromRoot));
 }
 
 async function setCandidateDisabled(candidate: ExtensionCandidate, disabled: boolean): Promise<void> {
-	const settings = await readSettings(candidate.settingsPath);
-	const current = Array.isArray(settings.extensions) ? [...settings.extensions] : [];
-	const normalizedTarget = resolve(candidate.path);
-	const filtered = current.filter((entry) => normalizeDisableEntry(entry) !== normalizedTarget);
-	if (disabled) {
-		filtered.push(`-${normalizedTarget}`);
-	}
-	settings.extensions = filtered;
-	await writeSettings(candidate.settingsPath, settings);
+	await updateSettings(
+		candidate.settingsPath,
+		(current) => {
+			const filtered = current.filter(
+				(entry) => !isExactOverrideForPath(entry, candidate.path, candidate.settingsBaseDir),
+			);
+			// Pi's filter order gives exact '-' overrides final precedence, while '+'
+			// re-enables an extension excluded by a glob. Use those same operations.
+			filtered.push(`${disabled ? "-" : "+"}${toPosixPath(candidate.path)}`);
+			return filtered;
+		},
+		candidate.settingsCwd,
+		candidate.settingsAgentDir,
+		candidate.scope,
+	);
 }
 
-async function readSettings(path: string): Promise<SettingsShape> {
+function isExactOverrideForPath(entry: string, targetPath: string, baseDir: string): boolean {
+	if (!entry.startsWith("+") && !entry.startsWith("-")) return false;
+	const pattern = normalizeExactPattern(entry.slice(1));
+	return pattern === toPosixPath(targetPath) || pattern === toPosixPath(relative(baseDir, targetPath));
+}
+
+function normalizeExactPattern(pattern: string): string {
+	return toPosixPath(pattern.startsWith("./") || pattern.startsWith(".\\") ? pattern.slice(2) : pattern);
+}
+
+function toPosixPath(path: string): string {
+	return path.split(sep).join("/");
+}
+
+async function readSettings(path: string): Promise<SettingsReadResult> {
 	try {
-		const raw = await readFile(path, "utf8");
-		const parsed = JSON.parse(raw) as SettingsShape;
-		return typeof parsed === "object" && parsed !== null ? parsed : {};
-	} catch {
-		return {};
+		await assertNotSymlink(path);
+		return parseSettings(await readFile(path, "utf8"));
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			return { kind: "missing", settings: {} };
+		}
+		return {
+			kind: "invalid",
+			error: new Error(`settings.json cannot be read as JSON: ${error instanceof Error ? error.message : String(error)}`),
+		};
 	}
 }
 
-async function writeSettings(path: string, settings: SettingsShape): Promise<void> {
-	await mkdir(dirname(path), { recursive: true });
-	await writeFile(path, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
-}
-
-async function pathExists(path: string): Promise<boolean> {
+function parseSettings(raw: string): SettingsReadResult {
 	try {
-		await access(path);
-		return true;
-	} catch {
-		return false;
+		const parsed: unknown = JSON.parse(raw);
+		if (!isRecord(parsed)) {
+			return { kind: "invalid", error: new Error("settings.json must contain an object") };
+		}
+		if (parsed.extensions !== undefined && (!Array.isArray(parsed.extensions) || !parsed.extensions.every(isString))) {
+			return { kind: "invalid", error: new Error("settings.json extensions must be an array of strings") };
+		}
+		return { kind: "valid", settings: parsed as SettingsShape };
+	} catch (error) {
+		return {
+			kind: "invalid",
+			error: new Error(`settings.json cannot be read as JSON: ${error instanceof Error ? error.message : String(error)}`),
+		};
 	}
 }
 
-function resolvePathLikePi(value: string, baseDir: string): string {
-	if (value === "~") return homedir();
-	if (value.startsWith("~/")) return join(homedir(), value.slice(2));
-	return resolve(baseDir, value);
+function readableSettings(result: SettingsReadResult): SettingsShape {
+	return result.kind === "invalid" ? {} : result.settings;
 }
+
+function withoutPackages(settings: SettingsShape): SettingsShape {
+	return { ...settings, packages: [] };
+}
+
+async function updateSettings(
+	path: string,
+	updateExtensions: (current: string[]) => string[],
+	cwd: string = dirname(path),
+	agentDir: string = dirname(path),
+	scope: Scope = "global",
+): Promise<string[]> {
+	return serializeUpdate(path, () =>
+		withExtensionUpdateLock(path, async () => {
+			// SettingsManager deliberately records load/write errors instead of
+			// throwing. Validate the target before scheduling its public write so a
+			// malformed file or pre-existing symlink is never silently replaced.
+			await assertNotSymlink(path);
+			const current = await readSettings(path);
+			if (current.kind === "invalid") {
+				throw new Error(`Refusing to overwrite malformed settings.json: ${current.error.message}`);
+			}
+			const paths = updateExtensions([...(current.settings.extensions ?? [])]);
+			if (!paths.every(isString)) {
+				throw new Error("settings.json extensions must be an array of strings");
+			}
+
+			// Use SettingsManager's public persistence API. Its own settings lock
+			// coordinates the write with Pi and merges only the extensions field.
+			// The outer extension-manager lock makes our read/modify/write atomic
+			// across multiple Pi processes using this extension.
+			const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: scope === "project" });
+			await assertNotSymlink(path);
+			if (scope === "project") settingsManager.setProjectExtensionPaths(paths);
+			else settingsManager.setExtensionPaths(paths);
+			await settingsManager.flush();
+			const errors = settingsManager.drainErrors().filter((error) => error.scope === scope);
+			if (errors.length > 0) throw errors[0]!.error;
+			return paths;
+		}),
+	);
+}
+
+async function withExtensionUpdateLock<T>(settingsPath: string, operation: () => Promise<T>): Promise<T> {
+	await mkdir(dirname(settingsPath), { recursive: true });
+	// Use a distinct target from Pi's own settings lock to avoid recursive lock
+	// acquisition when SettingsManager.flush() runs inside this critical section.
+	const target = `${settingsPath}.extensions-ui-rmw`;
+	const release = await lockfile.lock(target, {
+		realpath: false,
+		stale: 30_000,
+		update: 10_000,
+		retries: { retries: 50, minTimeout: 20, maxTimeout: 100 },
+	});
+	try {
+		return await operation();
+	} finally {
+		await release();
+	}
+}
+
+function serializeUpdate<T>(path: string, operation: () => Promise<T>): Promise<T> {
+	const previous = updateQueues.get(path) ?? Promise.resolve();
+	const result = previous.catch(() => undefined).then(operation);
+	const tail = result.then(
+		() => undefined,
+		() => undefined,
+	);
+	updateQueues.set(path, tail);
+	void tail.finally(() => {
+		if (updateQueues.get(path) === tail) updateQueues.delete(path);
+	});
+	return result;
+}
+
+async function assertNotSymlink(path: string): Promise<void> {
+	try {
+		if ((await lstat(path)).isSymbolicLink()) {
+			throw new Error("Refusing to use a symlinked settings.json");
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isString(value: unknown): value is string {
+	return typeof value === "string";
+}
+
+class SnapshotSettingsStorage {
+	constructor(
+		private global: SettingsShape,
+		private project: SettingsShape,
+	) {}
+
+	withLock(scope: "global" | "project", fn: (current: string | undefined) => string | undefined): void {
+		const current = JSON.stringify(scope === "global" ? this.global : this.project);
+		const next = fn(current);
+		if (next === undefined) return;
+		const parsed = JSON.parse(next) as SettingsShape;
+		if (scope === "global") this.global = parsed;
+		else this.project = parsed;
+	}
+}
+
+// Focused tests use these to exercise the public command without duplicating
+// filesystem and Pi filter semantics in test-only copies.
+export const __testing = {
+	discoverCandidates,
+	readSettings,
+	setCandidateDisabled,
+	updateSettings,
+	isExactOverrideForPath,
+};

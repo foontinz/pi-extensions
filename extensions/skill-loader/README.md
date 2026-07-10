@@ -34,12 +34,14 @@ Disabled skills are not added to discovery. They can still be loaded explicitly 
 
 ## Storage
 
-- Registry: `~/.pi/agent/skill-loader/registry.json`
-- Cloned repos: `~/.pi/agent/skill-loader/sources/`
+- Registry: `<Pi agent dir>/skill-loader/registry.json` (default: `~/.pi/agent/skill-loader/registry.json`)
+- Cloned repos: `<Pi agent dir>/skill-loader/sources/`
+
+The registry is atomically written and locked across concurrent Pi processes. Reinstalling a URL refreshes its fetched ref and reconciles skills that were removed from that source.
 
 ## Supported URLs
 
 - `https://github.com/org/repo`
 - `https://github.com/org/repo.git`
-- `https://github.com/org/repo/tree/ref/path`
+- `https://github.com/org/repo/tree/ref/path` (including branch names containing `/` when the ref can be resolved from the remote)
 - `git@github.com:org/repo.git`

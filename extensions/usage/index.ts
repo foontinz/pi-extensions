@@ -10,7 +10,8 @@
  *   Esc / q   close
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { join } from "node:path";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { matchesKey, Key, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { loadUsageData, todayCostFrom, type UsageData } from "./core.js";
 
@@ -247,7 +248,17 @@ export default function (pi: ExtensionAPI) {
     description: "Show token/cost usage heatmap across all sessions",
     handler: async (_args, ctx) => {
       ctx.ui.notify("Loading session data…", "info");
-      const data = await loadUsageData();
+      // The default SessionManager directory is scoped to the current cwd, but
+      // this panel advertises totals across all projects. Scan the common
+      // default sessions root in that case; honor an explicitly configured
+      // session directory exactly.
+      const sessionManager = ctx.sessionManager as typeof ctx.sessionManager & {
+        usesDefaultSessionDir?: () => boolean;
+      };
+      const sessionsRoot = sessionManager.usesDefaultSessionDir?.() === true
+        ? join(getAgentDir(), "sessions")
+        : sessionManager.getSessionDir();
+      const data = await loadUsageData(sessionsRoot);
 
       await ctx.ui.custom<void>((tui, theme, _kb, done) => {
         const panel = new UsagePanel(data, theme, done);

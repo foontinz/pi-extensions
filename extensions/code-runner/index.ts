@@ -6,14 +6,12 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { executeCode } from "./executor";
-import { clearCodeHandles, getRegisteredHandles, searchCodeHandles } from "./hooks";
+import { getRegisteredHandles, searchCodeHandles } from "./hooks";
 
 export default function (pi: ExtensionAPI) {
-  // Clear the file-backed registry so extensions re-register fresh.
-  // code-runner loads first (alphabetically), so by the time other extensions
-  // evaluate their top-level registerCodeHandle() calls, the file is empty.
-  clearCodeHandles();
-
+  // Handle registration happens at extension module evaluation time. Do not
+  // clear the shared registry here: doing so races other extensions and drops
+  // their handles on reload/session replacement.
   pi.on("session_start", async () => {
     registerTools(pi);
   });
@@ -135,18 +133,27 @@ function registerTools(pi: ExtensionAPI): void {
       if (result.output) parts.push(result.output);
       if (result.stderr) parts.push(`[stderr]\n${result.stderr}`);
       if (result.exitCode !== 0) parts.push(`[exit code: ${result.exitCode}]`);
+      if (result.fullOutputPath) {
+        parts.push(`[Full combined output saved to: ${result.fullOutputPath}]`);
+      }
 
       const text = truncateText(parts.join("\n\n") || "(no output)");
 
       if (result.exitCode !== 0) {
         const err = new Error(text);
-        (err as Error & { details?: unknown }).details = { exitCode: result.exitCode };
+        (err as Error & { details?: unknown }).details = {
+          exitCode: result.exitCode,
+          fullOutputPath: result.fullOutputPath,
+        };
         throw err;
       }
 
       return {
         content: [{ type: "text", text }],
-        details: { exitCode: result.exitCode },
+        details: {
+          exitCode: result.exitCode,
+          fullOutputPath: result.fullOutputPath,
+        },
       };
     },
   });

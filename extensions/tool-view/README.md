@@ -3,10 +3,9 @@
 Granular control over how built-in tool calls (`read`, `write`, `edit`, `bash`,
 `grep`, `find`, `ls`) are displayed in the TUI. Three verbosity modes:
 
-> Note: `tool-view` works by re-registering the built-in tools, so it cannot
-> manage a tool that another extension already owns. It auto-detects such
-> extensions and defers. In this agent dir, `enhanced-bash` owns `bash`, so
-> `bash` is left untouched (its output stays verbose). See **Excluding tools**.
+> Note: `tool-view` works by re-registering active built-ins. It defers when
+> Pi's canonical tool metadata says another extension owns a tool. See
+> **Excluding tools**.
 
 | Mode        | What you see                                                            |
 | ----------- | ----------------------------------------------------------------------- |
@@ -26,14 +25,16 @@ Errors are always shown, even in stripped modes.
 ```
 
 The current mode is shown in the status bar (`tools: <mode>`) and persisted to
-`~/.pi/agent/tool-view.json`, so it survives restarts. Mode changes apply to
-subsequent tool calls.
+`<Pi agent dir>/tool-view.json` (default: `~/.pi/agent/tool-view.json`), so it
+survives restarts. Mode changes apply to subsequent tool calls.
 
 ## Excluding tools
 
-`tool-view` automatically skips built-ins owned by sibling extensions (e.g.
-`bash` while `enhanced-bash` is installed) to avoid conflicts. You can also opt
-tools out manually via `~/.pi/agent/tool-view.json`:
+`tool-view` only wraps tools that are both active and canonically reported by Pi
+as built-ins. If an active tool is overridden by another extension (for example,
+`enhanced-bash`), it is left untouched regardless of where that extension lives.
+You can also opt tools out manually via `<Pi agent dir>/tool-view.json` (default:
+`~/.pi/agent/tool-view.json`):
 
 ```json
 {
@@ -43,7 +44,8 @@ tools out manually via `~/.pi/agent/tool-view.json`:
 }
 ```
 
-To let `tool-view` manage `bash` instead, remove/disable `enhanced-bash`.
+To let `tool-view` manage `bash`, disable the active override and reload Pi so
+`bash` is again reported as a built-in.
 
 ## Compact rows
 
