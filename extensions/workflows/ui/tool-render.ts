@@ -1,4 +1,5 @@
 import { Box, type Component, Text } from "@earendil-works/pi-tui";
+import { compact, firstLineClamped } from "./format.js";
 
 /** Minimal theme surface we depend on (matches the pi `Theme` class). */
 export interface ToolRenderTheme {
@@ -99,7 +100,7 @@ function compactLine(details: ResultDetails | undefined, text: string, theme: To
     if (failed) line += theme.fg("error", ` · ${failed} failed`);
     return line;
   }
-  return theme.fg("dim", firstLine(text));
+  return theme.fg("dim", firstLineClamped(text));
 }
 
 function resultText(result: ToolResultLike | undefined): string {
@@ -110,13 +111,3 @@ function resultText(result: ToolResultLike | undefined): string {
     .join("\n");
 }
 
-function firstLine(text: string): string {
-  const line = text.split("\n")[0] ?? "";
-  return line.length <= 80 ? line : `${line.slice(0, 79)}…`;
-}
-
-function compact(n: number): string {
-  if (n < 1000) return `${n}`;
-  if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k`;
-  return `${(n / 1_000_000).toFixed(1)}m`;
-}

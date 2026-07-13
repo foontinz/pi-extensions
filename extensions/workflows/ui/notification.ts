@@ -1,5 +1,6 @@
 import { Box, type Component, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import type { UsageStats } from "../../subagents/core/types.js";
+import { compact, firstLine } from "./format.js";
 
 /** Structured payload attached to the `workflow-notification` custom message. */
 export interface WorkflowNotificationDetails {
@@ -68,18 +69,8 @@ export function renderWorkflowNotification(
   return box;
 }
 
-function firstLine(text: string): string {
-  return text.split("\n")[0] ?? text;
-}
-
 function stripTags(content: string): string {
   return content
     .replace(/<\/?workflow-notification>\n?/g, "")
     .trim();
-}
-
-function compact(n: number): string {
-  if (n < 1000) return `${n}`;
-  if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k`;
-  return `${(n / 1_000_000).toFixed(1)}m`;
 }

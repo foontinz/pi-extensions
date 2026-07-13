@@ -1,6 +1,5 @@
 import { readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type {
 	ExtensionAPI,
@@ -21,14 +20,19 @@ import {
 	createWriteToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Box, type Component, Container, Text } from "@earendil-works/pi-tui";
+import {
+	errorResult,
+	getResultText,
+	MODES,
+	shortenPath,
+	tightBox,
+	type ViewMode,
+	withInner,
+} from "./render-helpers.js";
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
-
-type ViewMode = "minimized" | "medium" | "verbose";
-
-const MODES: ViewMode[] = ["minimized", "medium", "verbose"];
 
 const MODE_DESCRIPTION: Record<ViewMode, string> = {
 	minimized: "show only which tool ran (no output)",
@@ -252,32 +256,6 @@ export default function (pi: ExtensionAPI) {
 // Compact renderers
 // ---------------------------------------------------------------------------
 
-// Wrap a slot's inner component in a Box with horizontal padding + background
-// tint but NO vertical padding, reusing the existing Box across renders. The
-// inner component is stored as the Box's only child so the wrapped native
-// renderer keeps receiving its own component via `withInner()`.
-function tightBox(context: any, theme: Theme, inner: Component): Component {
-	const bgKey = context.isPartial
-		? "toolPendingBg"
-		: context.isError
-			? "toolErrorBg"
-			: "toolSuccessBg";
-	const bgFn = (text: string) => theme.bg(bgKey, text);
-	const box = context.lastComponent instanceof Box ? context.lastComponent : new Box(1, 0, bgFn);
-	box.setBgFn(bgFn);
-	box.clear();
-	box.addChild(inner);
-	return box;
-}
-
-// Give a native renderer a context whose `lastComponent` is the inner component
-// it returned last time (the Box's child), not our Box wrapper.
-function withInner(context: any): any {
-	const prevInner =
-		context.lastComponent instanceof Box ? context.lastComponent.children[0] : context.lastComponent;
-	return { ...context, lastComponent: prevInner };
-}
-
 function compactCall(
 	label: string,
 	toolName: string,
@@ -296,11 +274,6 @@ function compactCall(
 	}
 	text.setText(content);
 	return text;
-}
-
-function errorResult(result: any, theme: Theme): Component {
-	const out = getResultText(result);
-	return new Text(out ? theme.fg("error", out) : theme.fg("error", "Error"), 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -328,14 +301,6 @@ function describeTarget(toolName: string, args: any, cwd: string): string {
 	}
 }
 
-function getResultText(result: any): string {
-	if (!result || !Array.isArray(result.content)) return "";
-	return result.content
-		.filter((c: any) => c?.type === "text")
-		.map((c: any) => c.text || "")
-		.join("\n");
-}
-
 function firstLine(text: string, max: number): string {
 	const line = text.split("\n")[0] ?? "";
 	const extra = text.includes("\n") ? " …" : "";
@@ -349,13 +314,6 @@ function truncate(text: string, max: number): string {
 
 function str(value: unknown): string {
 	return typeof value === "string" ? value : "";
-}
-
-function shortenPath(path: string, cwd: string): string {
-	const home = homedir();
-	if (cwd && path.startsWith(`${cwd}/`)) return path.slice(cwd.length + 1);
-	if (path.startsWith(home)) return `~${path.slice(home.length)}`;
-	return path;
 }
 
 function isMode(value: string): value is ViewMode {

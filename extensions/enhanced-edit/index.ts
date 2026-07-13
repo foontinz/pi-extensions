@@ -7,6 +7,15 @@ import {
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { Box, type Component, Container, Text } from "@earendil-works/pi-tui";
+import {
+	errorResult,
+	getResultText,
+	MODES,
+	shortenPath,
+	tightBox,
+	type ViewMode,
+	withInner,
+} from "../tool-view/render-helpers.js";
 
 // enhanced-edit: overrides the built-in `edit` tool to (1) harden argument
 // parsing before schema validation and (2) own its own display minimizing.
@@ -89,8 +98,6 @@ function harden(input: unknown): unknown {
 // Selected level (owned by tool-view, read from its persisted prefs)
 // ---------------------------------------------------------------------------
 
-type ViewMode = "minimized" | "medium" | "verbose";
-const MODES: ViewMode[] = ["minimized", "medium", "verbose"];
 const TOOL_VIEW_PREFS = join(homedir(), ".pi", "agent", "tool-view.json");
 
 // Small mtime-guarded cache so we don't re-read the prefs file on every partial
@@ -124,30 +131,6 @@ function shouldStripEdit(): boolean {
 // Compact rendering (mirrors tool-view's framing for a single tool)
 // ---------------------------------------------------------------------------
 
-function tightBox(context: any, theme: Theme, inner: Component): Component {
-	const bgKey = context.isPartial ? "toolPendingBg" : context.isError ? "toolErrorBg" : "toolSuccessBg";
-	const bgFn = (text: string) => theme.bg(bgKey, text);
-	const box = context.lastComponent instanceof Box ? context.lastComponent : new Box(1, 0, bgFn);
-	box.setBgFn(bgFn);
-	box.clear();
-	box.addChild(inner);
-	return box;
-}
-
-// Give the native renderer a context whose lastComponent is the inner component
-// it returned last time (the Box's child), not our Box wrapper.
-function withInner(context: any): any {
-	const prevInner = context.lastComponent instanceof Box ? context.lastComponent.children[0] : context.lastComponent;
-	return { ...context, lastComponent: prevInner };
-}
-
-function shortenPath(path: string, cwd: string): string {
-	const home = homedir();
-	if (cwd && path.startsWith(`${cwd}/`)) return path.slice(cwd.length + 1);
-	if (path.startsWith(home)) return `~${path.slice(home.length)}`;
-	return path;
-}
-
 function compactCall(label: string, args: any, theme: Theme, context: any): Component {
 	const prev = context.lastComponent instanceof Box ? context.lastComponent.children[0] : undefined;
 	const text = prev instanceof Text ? prev : new Text("", 0, 0);
@@ -156,19 +139,6 @@ function compactCall(label: string, args: any, theme: Theme, context: any): Comp
 	if (p) content += theme.fg("accent", shortenPath(p, context.cwd));
 	text.setText(content);
 	return text;
-}
-
-function getResultText(result: any): string {
-	if (!result || !Array.isArray(result.content)) return "";
-	return result.content
-		.filter((c: any) => c?.type === "text")
-		.map((c: any) => c.text || "")
-		.join("\n");
-}
-
-function errorResult(result: any, theme: Theme): Component {
-	const out = getResultText(result);
-	return new Text(out ? theme.fg("error", out) : theme.fg("error", "Error"), 0, 0);
 }
 
 // ---------------------------------------------------------------------------

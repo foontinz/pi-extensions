@@ -1,5 +1,6 @@
 import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { WorkflowSnapshot } from "../index.js";
+import { clamp, compact, elapsed, joinEnds, padEnd } from "./format.js";
 
 /** Minimal theme surface we depend on (matches the pi `Theme` class). */
 export interface DashboardTheme {
@@ -167,37 +168,3 @@ function agentDetail(view: WorkflowSnapshot["agents"][number]): string {
   return "";
 }
 
-function clamp(value: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, value));
-}
-
-function elapsed(startedAt: number, finishedAt?: number): string {
-  const total = Math.max(0, Math.floor(((finishedAt ?? Date.now()) - startedAt) / 1000));
-  const m = Math.floor(total / 60);
-  const sec = total % 60;
-  if (m < 60) return `${m}:${sec.toString().padStart(2, "0")}`;
-  const h = Math.floor(m / 60);
-  return `${h}:${(m % 60).toString().padStart(2, "0")}:${sec.toString().padStart(2, "0")}`;
-}
-
-function compact(n: number): string {
-  if (n < 1000) return `${n}`;
-  if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k`;
-  return `${(n / 1_000_000).toFixed(1)}m`;
-}
-
-/** Right-pad accounting for ANSI escapes; truncate if too wide. */
-function padEnd(s: string, w: number): string {
-  const vis = visibleWidth(s);
-  if (vis === w) return s;
-  if (vis > w) return truncateToWidth(s, w, "…", true);
-  return s + " ".repeat(w - vis);
-}
-
-/** Place `left` and `right` on one line of width `w`, right-aligning `right`. */
-function joinEnds(left: string, right: string, w: number): string {
-  const rw = visibleWidth(right);
-  if (rw >= w) return truncateToWidth(right, w, "…", true);
-  const lw = w - rw - 1;
-  return `${padEnd(left, lw)} ${right}`;
-}
