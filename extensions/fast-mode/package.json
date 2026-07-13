@@ -7,7 +7,7 @@
     "clean": "echo 'nothing to clean'",
     "build": "tsc --noEmit",
     "check": "tsc --noEmit",
-    "test": "node --test --experimental-transform-types ./index.test.ts"
+    "test": "node --test --experimental-transform-types ./*.test.ts"
   },
   "pi": {
     "extensions": [

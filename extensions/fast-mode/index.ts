@@ -3,6 +3,7 @@ import { lstat, mkdir, open, readFile, rename, rm, stat, unlink } from "node:fs/
 import { dirname, join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai/compat";
 import { getAgentDir, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { registerTpsStatus } from "./tps-status.ts";
 
 const PREFS_FILE_NAME = "fast-mode.json";
 const PREFS_LOCK_SUFFIX = ".fast-mode.lock";
@@ -80,15 +81,18 @@ export default function fastMode(pi: ExtensionAPI) {
 	const refreshStatus = (ctx: ExtensionContext | ExtensionCommandContext) => {
 		ctx.ui.setStatus("fast-mode", undefined);
 	};
+	const tpsStatus = registerTpsStatus(pi, (ctx) => isFastEnabled(prefs, ctx.model) ? "fast" : "standard");
 
 	pi.on("session_start", async (_event, ctx) => {
 		const result = await getPrefsStore().load();
 		prefs = result.kind === "invalid" ? copyPrefs(DEFAULT_PREFS) : copyPrefs(result.document);
 		refreshStatus(ctx);
+		tpsStatus.refresh(ctx);
 	});
 
 	pi.on("model_select", async (_event, ctx) => {
 		refreshStatus(ctx);
+		tpsStatus.refresh(ctx);
 	});
 
 	pi.on("before_provider_request", (event, ctx) => {
@@ -122,6 +126,7 @@ export default function fastMode(pi: ExtensionAPI) {
 					"info",
 				);
 				refreshStatus(ctx);
+				tpsStatus.refresh(ctx);
 				return;
 			}
 
@@ -141,6 +146,7 @@ export default function fastMode(pi: ExtensionAPI) {
 			}
 
 			refreshStatus(ctx);
+			tpsStatus.refresh(ctx);
 			const disabledMessage =
 				supported.disabledTier !== undefined
 					? `service_tier=${supported.disabledTier}`
