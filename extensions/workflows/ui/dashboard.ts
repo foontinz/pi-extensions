@@ -8,19 +8,19 @@ export interface DashboardTheme {
 }
 
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const BAR_SLOTS = 8;
 const MAX_AGENT_ROWS = 6;
-const MAX_WIDTH = 96;
 const LABEL_MIN = 6;
 const LABEL_MAX = 24;
 const PHASE_MIN = 4;
 const PHASE_MAX = 12;
 
 /**
- * A responsive, boxed live view of a running (or just-finished) workflow.
- * Rendered as a `belowEditor` widget. The extension keeps the component
- * registered and updates it in place so multiple workflow widgets retain their
- * insertion order while the spinner advances.
+ * A live view of a running (or just-finished) workflow, rendered as a
+ * `belowEditor` widget in the same visual language as the goal widget:
+ * a borderless header line (state ◆ + phase, metrics right-aligned) with
+ * tree-connector agent rows beneath it. The extension keeps the component
+ * registered and updates it in place so multiple workflow widgets retain
+ * their insertion order while the spinner advances.
  */
 export class WorkflowDashboard implements Component {
   constructor(
@@ -39,95 +39,83 @@ export class WorkflowDashboard implements Component {
   }
 
   render(width: number): string[] {
-    const w = Math.min(width, MAX_WIDTH);
-    const inner = Math.max(1, w - 4); // "│ " + content + " │"
     const t = this.theme;
     const s = this.snap;
 
-    const lines: string[] = [];
-    lines.push(this.topBorder(w));
-    lines.push(this.row(this.headline(inner), inner));
-    lines.push(this.row(this.metrics(inner), inner));
-    lines.push(this.divider(w));
+    const lines: string[] = [this.header(width)];
 
     const rows = this.pickAgents();
+    const hidden = s.agents.length - rows.length;
     if (rows.length === 0) {
-      lines.push(this.row(t.fg("dim", "waiting for agents…"), inner));
-    } else {
-      const labelW = clamp(Math.max(0, ...rows.map((r) => visibleWidth(r.label))), LABEL_MIN, Math.min(LABEL_MAX, inner));
-      const phaseW = clamp(Math.max(0, ...rows.map((r) => (r.phase ? visibleWidth(r.phase) : 0))), PHASE_MIN, PHASE_MAX);
-      for (const view of rows) lines.push(this.row(this.agentRow(view, inner, labelW, phaseW), inner));
-      const hidden = s.agents.length - rows.length;
-      if (hidden > 0) lines.push(this.row(t.fg("dim", `… ${hidden} more`), inner));
+      lines.push(truncateToWidth(`   ${t.fg("dim", "└─ waiting for agents…")}`, width));
+      return lines;
     }
-    lines.push(this.bottomBorder(w));
+    const labelW = clamp(Math.max(0, ...rows.map((r) => visibleWidth(r.label))), LABEL_MIN, Math.min(LABEL_MAX, width));
+    const phaseW = clamp(Math.max(0, ...rows.map((r) => (r.phase ? visibleWidth(r.phase) : 0))), PHASE_MIN, PHASE_MAX);
+    for (const [i, view] of rows.entries()) {
+      const last = hidden === 0 && i === rows.length - 1;
+      lines.push(this.agentRow(view, width, labelW, phaseW, last));
+    }
+    if (hidden > 0) lines.push(truncateToWidth(`   ${t.fg("dim", `└─ … ${hidden} more`)}`, width));
     return lines;
   }
 
   // --- sections ---------------------------------------------------------
 
-  private headline(inner: number): string {
+  /** `◆  RUNNING  │  PHASE 2/2  synthesize` with dim metrics right-aligned. */
+  private header(width: number): string {
     const t = this.theme;
     const s = this.snap;
-    const { icon, role } = statusGlyph(s.status, this.frame);
-    const label =
-      s.status === "completed"
-        ? t.fg("success", "completed")
-        : s.status === "failed"
-          ? t.fg("error", "failed")
-          : s.status === "cancelled"
-            ? t.fg("warning", "cancelled")
-            : this.phaseLabel();
+    const paint = (text: string): string => t.fg(statusRole(s.status), text);
+    const left = paint("◆") + "  " + paint(t.bold(statusLabel(s.status, this.frame))) + t.fg("dim", "  │  ") + this.phaseLabel();
+
     const done = s.agents.filter((a) => a.status === "completed").length;
-    const bar = progressBar(done, Math.max(s.launched, 1), t);
-    const count = t.fg("muted", `${done}/${s.launched || 0}`);
-    const left = `${t.fg(role, icon)} ${label}`;
-    const right = `${bar} ${count}`;
-    return joinEnds(left, right, inner);
+    // Active/queued counts are visible in the agent rows; the header keeps
+    // only run progress, token/cost totals, and elapsed time.
+    const dimParts: string[] = [`RUN ${done}/${s.launched || 0}`];
+    dimParts.push(`↑${compact(s.usage.input)} ↓${compact(s.usage.output)}`);
+    // The workflow's own cost — always shown so a run's spend is visible at a glance.
+    dimParts.push(`$${s.usage.cost.toFixed(s.usage.cost < 1 ? 3 : 2)}`);
+    dimParts.push(elapsed(s.startedAt, s.finishedAt));
+    let right = "";
+    if (s.failures > 0) right += t.fg("error", t.bold(`${s.failures} FAILED`)) + t.fg("dim", " · ");
+    if (s.rateLimited) right += t.fg("warning", t.bold("RATE-LIMITED")) + t.fg("dim", " · ");
+    right += t.fg("dim", dimParts.join(" · "));
+
+    const rightWidth = visibleWidth(right);
+    if (rightWidth + 12 >= width) return truncateToWidth(`${left}  ${right}`, width);
+    const leftFit = truncateToWidth(left, Math.max(1, width - rightWidth - 3), "…");
+    const gap = " ".repeat(Math.max(2, width - visibleWidth(leftFit) - rightWidth));
+    return truncateToWidth(leftFit + gap + right, width);
   }
 
-  /** Phase breadcrumb (current highlighted) while running, else the plain phase. */
+  /** `PHASE 2/2  synthesize` while running, else the workflow origin/run id. */
   private phaseLabel(): string {
     const t = this.theme;
     const s = this.snap;
-    if (s.phases.length > 1) {
-      return s.phases
-        .map((p) => (p === s.phase ? t.bold(t.fg("accent", p)) : t.fg("dim", p)))
-        .join(t.fg("dim", " › "));
+    if (s.phase && s.phases.length > 0) {
+      const ordinal = Math.max(1, s.phases.indexOf(s.phase) + 1);
+      return t.fg("muted", `PHASE ${ordinal}/${s.phases.length}`) + "  " + t.fg("text", s.phase);
     }
-    return s.phase ? t.fg("accent", s.phase) : t.fg("dim", "running");
+    if (s.status === "running") return t.fg("muted", "STARTING");
+    return t.fg("muted", s.runId || s.origin);
   }
 
-  private metrics(inner: number): string {
-    const t = this.theme;
-    const s = this.snap;
-    const parts: string[] = [];
-    const running = s.status === "running";
-    if (running) {
-      parts.push(t.fg("accent", `${s.active} active`));
-      if (s.queued > 0) parts.push(t.fg("muted", `${s.queued} queued`));
-    } else {
-      parts.push(t.fg("muted", `${s.launched} agent${s.launched === 1 ? "" : "s"}`));
-    }
-    parts.push(t.fg("muted", `↑${compact(s.usage.input)} ↓${compact(s.usage.output)}`));
-    // The workflow's own cost — always shown so a run's spend is visible at a glance.
-    parts.push(t.fg("accent", `$${s.usage.cost.toFixed(s.usage.cost < 1 ? 3 : 2)}`));
-    if (s.failures > 0) parts.push(t.fg("error", `${s.failures} failed`));
-    if (s.rateLimited) parts.push(t.fg("warning", "rate-limited"));
-    const left = parts.join(t.fg("dim", " · "));
-    const right = t.fg("muted", elapsed(s.startedAt, s.finishedAt));
-    return joinEnds(left, right, inner);
-  }
-
-  private agentRow(view: WorkflowSnapshot["agents"][number], inner: number, labelW: number, phaseW: number): string {
+  private agentRow(
+    view: WorkflowSnapshot["agents"][number],
+    width: number,
+    labelW: number,
+    phaseW: number,
+    last: boolean,
+  ): string {
     const t = this.theme;
     const { icon, role } = agentGlyph(view.status, this.frame);
     const label = truncateToWidth(view.label, labelW, "…");
     const phase = view.phase ? truncateToWidth(view.phase, phaseW, "…") : "";
     const detail = agentDetail(view);
-    const left = `${t.fg(role, icon)} ${t.fg("text", padEnd(label, labelW))}  ${t.fg("muted", padEnd(phase, phaseW))}`;
+    const left = `   ${t.fg("dim", last ? "└─" : "├─")} ${t.fg(role, icon)} ${t.fg("text", padEnd(label, labelW))}  ${t.fg("muted", padEnd(phase, phaseW))}`;
     const right = t.fg(view.status === "failed" ? "error" : "muted", detail);
-    return joinEnds(left, right, inner);
+    return joinEnds(left, right, width);
   }
 
   private pickAgents(): WorkflowSnapshot["agents"] {
@@ -140,40 +128,20 @@ export class WorkflowDashboard implements Component {
       .slice(0, MAX_AGENT_ROWS)
       .sort((a, b) => a.index - b.index);
   }
-
-  // --- box helpers ------------------------------------------------------
-
-  private topBorder(w: number): string {
-    const t = this.theme;
-    // Budget: "╭─" (2) + title + fill + "╮" (1) must equal w, so title ≤ w - 3.
-    const maxTitleW = Math.max(0, w - 3);
-    let title = ` ${t.bold(t.fg("accent", "Workflow"))} ${t.fg("muted", this.snap.runId || "")} `;
-    if (visibleWidth(title) > maxTitleW) title = truncateToWidth(title, maxTitleW, "…", false);
-    const fill = Math.max(0, w - 3 - visibleWidth(title));
-    return t.fg("border", "╭─") + title + t.fg("border", "─".repeat(fill) + "╮");
-  }
-
-  private bottomBorder(w: number): string {
-    return this.theme.fg("border", `╰${"─".repeat(w - 2)}╯`);
-  }
-
-  private divider(w: number): string {
-    return this.theme.fg("border", `├${"─".repeat(w - 2)}┤`);
-  }
-
-  private row(content: string, inner: number): string {
-    const b = this.theme.fg("border", "│");
-    return `${b} ${padEnd(content, inner)} ${b}`;
-  }
 }
 
 // --- pure formatting ----------------------------------------------------
 
-function statusGlyph(status: WorkflowSnapshot["status"], frame: number): { icon: string; role: string } {
-  if (status === "completed") return { icon: "✓", role: "success" };
-  if (status === "failed") return { icon: "✗", role: "error" };
-  if (status === "cancelled") return { icon: "⊘", role: "warning" };
-  return { icon: SPINNER[frame % SPINNER.length], role: "accent" };
+function statusRole(status: WorkflowSnapshot["status"]): string {
+  if (status === "completed") return "success";
+  if (status === "failed") return "error";
+  if (status === "cancelled") return "warning";
+  return "accent";
+}
+
+function statusLabel(status: WorkflowSnapshot["status"], frame: number): string {
+  if (status === "running") return `${SPINNER[frame % SPINNER.length]} RUNNING`;
+  return status.toUpperCase();
 }
 
 function agentGlyph(status: WorkflowSnapshot["agents"][number]["status"], frame: number): { icon: string; role: string } {
@@ -197,11 +165,6 @@ function agentDetail(view: WorkflowSnapshot["agents"][number]): string {
   if (view.status === "retrying") return `retry ${view.attempt}/${view.maxRetries}`;
   if (view.startedAt) return elapsed(view.startedAt, view.finishedAt);
   return "";
-}
-
-function progressBar(done: number, total: number, theme: DashboardTheme): string {
-  const filled = Math.max(0, Math.min(BAR_SLOTS, Math.round((done / total) * BAR_SLOTS)));
-  return theme.fg("success", "▰".repeat(filled)) + theme.fg("dim", "▱".repeat(BAR_SLOTS - filled));
 }
 
 function clamp(value: number, lo: number, hi: number): number {

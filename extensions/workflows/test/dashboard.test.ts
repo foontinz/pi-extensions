@@ -41,29 +41,30 @@ test("every rendered line fits within the requested width", () => {
   }
 });
 
-test("box lines (borders/divider) are all exactly the box width", () => {
-  for (const width of [40, 56, 76]) {
-    const lines = new WorkflowDashboard(snap(), plainTheme, 0).render(width);
-    // Top border, divider, bottom border, and content rows all share one width.
-    const top = visibleWidth(lines[0]);
-    assert.equal(top, width, `top border width ${top} != ${width}`);
-    for (const line of lines) assert.equal(visibleWidth(line), width, `line width mismatch at ${width}: ${JSON.stringify(line)}`);
-  }
+test("renders a borderless header plus one row per agent", () => {
+  const lines = new WorkflowDashboard(snap(), plainTheme, 0).render(96);
+  assert.equal(lines.length, 1 + 4); // header + 4 agents, no box chrome
+  assert.doesNotMatch(lines[0], /[╭╰│├]─/);
+  assert.match(lines[0], /◆ {2}⠋ RUNNING {2}│ {2}PHASE 2\/2 {2}synthesize/);
+  assert.match(lines[1], /^ {3}├─ /);
+  assert.match(lines[4], /^ {3}└─ /);
 });
 
-test("a long runId never overflows the top border", () => {
-  const long = new WorkflowDashboard(snap({ runId: "a".repeat(80) }), plainTheme, 0).render(60);
+test("a long runId never overflows when shown after finish", () => {
+  const long = new WorkflowDashboard(
+    snap({ runId: "a".repeat(80), status: "completed", phase: undefined, phases: [] }),
+    plainTheme,
+    0,
+  ).render(60);
   for (const line of long) assert.ok(visibleWidth(line) <= 60, `overflow: ${JSON.stringify(line)}`);
 });
 
 test("running dashboard shows phase, counts, tokens and agent glyphs", () => {
-  const text = new WorkflowDashboard(snap(), plainTheme, 0).render(76).join("\n");
-  assert.match(text, /Workflow a1b2c3d4/);
-  assert.match(text, /synthesize/);
-  assert.match(text, /8 active/);
-  assert.match(text, /3 queued/);
+  const text = new WorkflowDashboard(snap(), plainTheme, 0).render(120).join("\n");
+  assert.match(text, /PHASE 2\/2 {2}synthesize/);
+  assert.match(text, /RUN 1\/4/);
   assert.match(text, /↑12k ↓4.1k/);
-  assert.match(text, /1 failed/);
+  assert.match(text, /1 FAILED/);
   assert.match(text, /✓ crawl-docs/);
   assert.match(text, /✗ fetch-legacy/);
   assert.match(text, /↻ verify/);
@@ -101,13 +102,13 @@ test("live view updates one registered widget without changing its order", () =>
 
 test("completed dashboard replaces the phase with a status label", () => {
   const text = new WorkflowDashboard(snap({ status: "completed", phase: undefined }), plainTheme, 0).render(76).join("\n");
-  assert.match(text, /✓ completed/);
-  assert.doesNotMatch(text, /running/);
+  assert.match(text, /◆ {2}COMPLETED/);
+  assert.doesNotMatch(text, /RUNNING/);
 });
 
-test("cancelled dashboard shows the cancelled glyph and label", () => {
+test("cancelled dashboard shows the cancelled label", () => {
   const text = new WorkflowDashboard(snap({ status: "cancelled", phase: undefined }), plainTheme, 0).render(76).join("\n");
-  assert.match(text, /⊘ cancelled/);
+  assert.match(text, /◆ {2}CANCELLED/);
 });
 
 test("collapses to a bounded number of agent rows", () => {
