@@ -1289,26 +1289,46 @@ interface WorkflowView {
 
 /**
  * Owns the live `belowEditor` dashboard for a single run.
- * Re-renders on every state change and on a spinner tick while running; keeps
- * the finished view visible briefly, then clears it.
+ * Registers its widget once, then mutates the component and requests a render
+ * on state/spinner updates. Re-registering would move the widget to the end of
+ * pi's insertion-ordered widget map, making concurrent workflows swap places.
+ * The finished view remains visible briefly, then is cleared.
  */
-function createWorkflowView(ctx: ExtensionContext, runId: string, origin: string): WorkflowView {
+export function createWorkflowView(ctx: ExtensionContext, runId: string, origin: string): WorkflowView {
   const key = `workflow:${runId}`;
   let snap: WorkflowSnapshot | undefined;
   let frame = 0;
   let ticker: ReturnType<typeof setInterval> | undefined;
   let finished = false;
+  let registered = false;
+  let dashboard: WorkflowDashboard | undefined;
+  let requestRender: (() => void) | undefined;
 
   const render = (): void => {
     if (!ctx.hasUI || !snap) return;
-    const current = snap;
+    if (dashboard) {
+      dashboard.update(snap, frame);
+      requestRender?.();
+      return;
+    }
+    if (registered) return;
+
+    registered = true;
+    const initial = snap;
     // Dashboard widget only — no footer status line for workflows.
-    ctx.ui.setWidget(key, (_tui, theme) => new WorkflowDashboard(current, theme, frame), { placement: "belowEditor" });
+    ctx.ui.setWidget(key, (tui, theme) => {
+      dashboard = new WorkflowDashboard(initial, theme, frame);
+      requestRender = () => tui.requestRender();
+      return dashboard;
+    }, { placement: "belowEditor" });
   };
 
   const clear = (): void => {
     if (!ctx.hasUI) return;
     ctx.ui.setWidget(key, undefined);
+    registered = false;
+    dashboard = undefined;
+    requestRender = undefined;
   };
 
   return {

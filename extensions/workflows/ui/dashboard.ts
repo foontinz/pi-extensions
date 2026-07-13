@@ -18,18 +18,24 @@ const PHASE_MAX = 12;
 
 /**
  * A responsive, boxed live view of a running (or just-finished) workflow.
- * Rendered as a `belowEditor` widget; recreated by the extension on every
- * animation tick so `frame` and elapsed time advance.
+ * Rendered as a `belowEditor` widget. The extension keeps the component
+ * registered and updates it in place so multiple workflow widgets retain their
+ * insertion order while the spinner advances.
  */
 export class WorkflowDashboard implements Component {
   constructor(
-    private readonly snap: WorkflowSnapshot,
+    private snap: WorkflowSnapshot,
     private readonly theme: DashboardTheme,
-    private readonly frame: number,
+    private frame: number,
   ) {}
 
+  update(snap: WorkflowSnapshot, frame: number): void {
+    this.snap = snap;
+    this.frame = frame;
+  }
+
   invalidate(): void {
-    // Stateless: a fresh instance is created per render, nothing to clear.
+    // Rendering is stateless; there is no cache to clear.
   }
 
   render(width: number): string[] {

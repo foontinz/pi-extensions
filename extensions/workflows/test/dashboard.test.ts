@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type Component, visibleWidth } from "@earendil-works/pi-tui";
 import type { UsageStats } from "../../subagents/core/types.js";
+import { createWorkflowView, type WorkflowSnapshot } from "../index.js";
 import { WorkflowDashboard } from "../ui/dashboard.js";
-import type { WorkflowSnapshot } from "../index.js";
 
 const plainTheme = { fg: (_role: string, text: string) => text, bold: (text: string) => text };
 const usage: UsageStats = { input: 12300, output: 4100, cacheRead: 0, cacheWrite: 0, cost: 0.083, contextTokens: 0, turns: 9 };
@@ -68,6 +69,34 @@ test("running dashboard shows phase, counts, tokens and agent glyphs", () => {
   assert.match(text, /↻ verify/);
   assert.match(text, /retry 1\/2/);
   assert.match(text, /timeout/);
+});
+
+test("live view updates one registered widget without changing its order", () => {
+  let setWidgetCalls = 0;
+  let renderRequests = 0;
+  let widget: Component | undefined;
+  const tui = { requestRender: () => { renderRequests += 1; } };
+  const ctx = {
+    hasUI: true,
+    ui: {
+      setWidget: (_key: string, content: unknown) => {
+        setWidgetCalls += 1;
+        if (typeof content === "function") {
+          widget = (content as (_tui: typeof tui, theme: typeof plainTheme) => Component)(tui, plainTheme);
+        }
+      },
+    },
+  } as unknown as ExtensionContext;
+
+  const view = createWorkflowView(ctx, "a1b2c3d4", "inline");
+  view.onState(snap({ phase: "research", phases: ["research"] }));
+  assert.equal(setWidgetCalls, 1);
+  assert.match(widget?.render(76).join("\n") ?? "", /research/);
+
+  view.onState(snap({ phase: "synthesize", phases: ["research", "synthesize"] }));
+  assert.equal(setWidgetCalls, 1, "state updates must not remove and re-add the widget");
+  assert.equal(renderRequests, 1);
+  assert.match(widget?.render(76).join("\n") ?? "", /synthesize/);
 });
 
 test("completed dashboard replaces the phase with a status label", () => {
