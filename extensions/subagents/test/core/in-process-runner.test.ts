@@ -286,6 +286,22 @@ test("wall-clock deadline catches synchronous session creation and prompt work",
   assert.equal(promptResult.output, "late output");
 });
 
+test("explicit thinking level is forwarded to createAgentSession", async () => {
+  let observedThinking: unknown;
+  const session = fakeSession({
+    messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+  });
+  const result = await runSubagentInProcess(
+    { task: "finish", cwd: process.cwd(), thinkingLevel: "off" },
+    async (options) => {
+      observedThinking = options?.thinkingLevel;
+      return { session } as CreateAgentSessionResult;
+    },
+  );
+  assert.equal(observedThinking, "off");
+  assert.equal(result.output, "done");
+});
+
 test("dispose exceptions do not replace a successful result", async () => {
   const session = fakeSession({
     messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],

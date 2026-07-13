@@ -4,7 +4,11 @@ import * as path from "node:path";
 import { Worker } from "node:worker_threads";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { type InProcessSubagentOptions, runSubagentInProcess } from "../subagents/core/in-process-runner.js";
+import {
+  type InProcessSubagentOptions,
+  runSubagentInProcess,
+  type SubagentThinkingLevel,
+} from "../subagents/core/in-process-runner.js";
 import { DEFAULT_RUN_RETENTION_MS, pruneOldRuns } from "../subagents/core/run-archive.js";
 import { addUsage, emptyUsageStats, type SubagentResult, type UsageStats } from "../subagents/core/types.js";
 import { createWorktree, WorktreeStartupCleanupError } from "../subagents/workspace/create-worktree.js";
@@ -23,6 +27,7 @@ interface AgentOptions {
   label?: string;
   tools?: string[];
   systemPrompt?: string;
+  thinking?: SubagentThinkingLevel;
   timeoutMs?: number;
   /** Run this agent in a different working directory (lightweight isolation). */
   cwd?: string;
@@ -96,6 +101,7 @@ export interface WorkflowSnapshot {
 }
 
 const DEFAULT_WORKFLOW_TOOLS = ["read", "bash"];
+const THINKING_LEVELS = new Set<SubagentThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
 const MAX_AGENTS = 100;
 const DEFAULT_CONCURRENCY = 8;
 const DEFAULT_WORKFLOW_TIMEOUT_MS = 30 * 60 * 1000;
@@ -196,6 +202,8 @@ export default function workflowsExtension(pi: ExtensionAPI) {
       "Good fits: parallel code review, repo-wide search+summarize, batch refactors/migrations, generating tests or docs across many files, comparing approaches, multi-step pipelines. A quick planning phase() then parallel() agents usually beats sequential hand work.",
       "It does spawn multiple agents and use tokens, so match the agent count to the work (a handful for small jobs, more for big fan-outs) rather than avoiding it — the parallelism and isolated context windows are the point.",
       "Workflow agents run in-process with minimal tools by default: read,bash. Pass opts.tools to widen.",
+      "Workflow agents inherit the root session's selected thinking level; pass opts.thinking ('off' through 'xhigh') to override it per agent.",
+      "Reviews and verification are often time-consuming; give them generous overall timeoutMs and per-agent opts.timeoutMs instead of short deadlines.",
       "Hooks (async): agent(task, opts) -> result; parallel(items, fn); pipeline(items, fns); workflow(script). Sync: phase(name); log(...); args(); failures().",
       "agent() returns null on failure (recorded in failures()). Pass opts.schema.required for JSON-shape validation + retry.",
       "Pass opts.worktree:true to run a write-heavy agent in its own git worktree (requires a git repo, auto torn down); opts.cwd sets a lightweight shared-tree subdir.",
@@ -253,7 +261,20 @@ export default function workflowsExtension(pi: ExtensionAPI) {
           runEntry.timedOut = true;
           controller.abort(new Error(`workflow timed out after ${timeoutMs}ms`));
         }, timeoutMs);
-        const runner = new WorkflowRunner(ctx.cwd, params.args, linked.signal, emit, runSubagentInProcess, view.onState, runId, resolved.origin, runDir, timeoutMs);
+        const runner = new WorkflowRunner(
+          ctx.cwd,
+          params.args,
+          linked.signal,
+          emit,
+          runSubagentInProcess,
+          view.onState,
+          runId,
+          resolved.origin,
+          runDir,
+          timeoutMs,
+          createWorktree,
+          pi.getThinkingLevel(),
+        );
         view.start();
         try {
           const output = await runner.run(resolved.script);
@@ -705,6 +726,8 @@ export class WorkflowRunner {
     scriptTimeoutMs: number = DEFAULT_WORKFLOW_TIMEOUT_MS,
     /** Test seam; production uses the shared worktree implementation. */
     private readonly worktreeFactory: WorkflowWorktreeFactory = createWorktree,
+    /** Inherited from the root session unless an agent sets opts.thinking. */
+    private readonly defaultThinkingLevel?: SubagentThinkingLevel,
   ) {
     this.externalSignal = signal;
     this.runSignal = this.runController.signal;
@@ -1000,6 +1023,9 @@ export class WorkflowRunner {
 
   private async agent(task: string, opts: AgentOptions = {}): Promise<unknown> {
     this.throwIfAborted();
+    if (opts.thinking !== undefined && !THINKING_LEVELS.has(opts.thinking)) {
+      throw new Error(`invalid workflow agent thinking level: ${String(opts.thinking)}`);
+    }
     if (++this.launchedCount > MAX_AGENTS) throw new Error(`workflow agent cap exceeded (${MAX_AGENTS})`);
     const index = this.launchedCount - 1;
     const label = opts.label ?? `#${index}`;
@@ -1136,6 +1162,7 @@ export class WorkflowRunner {
         cwd,
         tools: opts.tools ?? DEFAULT_WORKFLOW_TOOLS,
         systemPrompt: opts.systemPrompt,
+        thinkingLevel: opts.thinking ?? this.defaultThinkingLevel,
         timeoutMs: opts.timeoutMs,
         mcp: opts.mcp,
         signal: this.runSignal,

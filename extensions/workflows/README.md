@@ -71,6 +71,8 @@ With `background:false` it waits and returns the envelope:
   label?: string;
   tools?: string[];          // default: ["read","bash"]
   systemPrompt?: string;
+  thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+                              // default: inherit the root session's selected level
   timeoutMs?: number;        // per-agent
   cwd?: string;              // run the agent in this dir (resolved against workflow cwd)
   worktree?: boolean;        // run in a dedicated git worktree (default false; requires a git repo)
@@ -79,6 +81,9 @@ With `background:false` it waits and returns the envelope:
   retries?: number;          // schema-validation retries, default 2
 }
 ```
+
+Reviews and verification are often time-consuming. Give them generous per-agent
+`timeoutMs` and overall workflow `timeoutMs` values rather than short deadlines.
 
 ## Live view (TUI)
 

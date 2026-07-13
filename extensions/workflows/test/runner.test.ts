@@ -51,6 +51,39 @@ test("parallel fans out and aggregates usage", async () => {
   assert.equal(runner.usage.turns, 3);
 });
 
+test("agent thinking inherits the root level and supports per-agent overrides", async () => {
+  const controller = new AbortController();
+  const observed: Array<string | undefined> = [];
+  const runner = new WorkflowRunner(
+    "/tmp",
+    undefined,
+    controller.signal,
+    () => {},
+    async (options) => {
+      observed.push(options.thinkingLevel);
+      return ok(options.task);
+    },
+    undefined,
+    "",
+    "",
+    undefined,
+    1_000,
+    async () => { throw new Error("unused worktree factory"); },
+    "high",
+  );
+
+  await runner.run(`
+    await agent("inherit");
+    await agent("override", { thinking: "off" });
+  `);
+  assert.deepEqual(observed, ["high", "off"]);
+});
+
+test("agent rejects invalid thinking levels", async () => {
+  const runner = makeRunner(async (task) => ok(task));
+  await assert.rejects(runner.run(`return await agent("bad", { thinking: "turbo" });`), /invalid workflow agent thinking level/);
+});
+
 test("pipeline chains stage functions", async () => {
   const runner = makeRunner(async (task) => ok(`${task}!`));
   const result = await runner.run(`return await pipeline(["x"], [ (v) => agent("a:"+v), (v) => agent("b:"+v) ]);`);

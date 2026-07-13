@@ -91,12 +91,15 @@ export function resolveModelPattern(
   return chooseModelMatch(all, modelPatternQueries(raw), modelRegistry);
 }
 
+export type SubagentThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
 export interface InProcessSubagentOptions {
   task: string;
   cwd: string;
   tools?: readonly string[];
   systemPrompt?: string;
   appendSystemPrompt?: readonly string[];
+  thinkingLevel?: SubagentThinkingLevel;
   timeoutMs?: number;
   /**
    * Give the agent a shared `mcp` gateway tool that forwards to the process-wide
@@ -267,6 +270,7 @@ export async function runSubagentInProcess(
         authStorage,
         modelRegistry,
         resourceLoader: createBareResourceLoader(options.systemPrompt, options.appendSystemPrompt),
+        thinkingLevel: options.thinkingLevel,
         tools: toolAllowlist,
         noTools: toolAllowlist && toolAllowlist.length === 0 ? "all" : undefined,
         customTools: customTools.length > 0 ? customTools : undefined,
