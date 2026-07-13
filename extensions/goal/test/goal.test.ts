@@ -8,6 +8,7 @@ import {
   GOAL_CHECKPOINT_ENTRY,
   GOAL_CHECKPOINT_TOOL,
   GOAL_CONTROL_MESSAGE,
+  GOAL_RESUME_TOOL,
   createInitialCheckpoint,
   type GoalCheckpointV2,
 } from "../state.ts";
@@ -16,7 +17,7 @@ type Handler = (event: any, context: any) => unknown | Promise<unknown>;
 type CommandHandler = (args: string, context: any) => unknown | Promise<unknown>;
 type ToolExecutor = (
   toolCallId: string,
-  params: GoalCheckpointParams,
+  params: any,
   signal: AbortSignal | undefined,
   onUpdate: (update: unknown) => void,
   context: any,
@@ -44,6 +45,17 @@ type CompactRequest = {
 interface ToolResult {
   content: unknown;
   details: { checkpoint: GoalCheckpointV2 };
+}
+
+interface ResumeToolResult {
+  content: unknown;
+  details: {
+    goalId: string;
+    epoch: number;
+    revision: number;
+    userEntryId?: string;
+  };
+  terminate?: boolean;
 }
 
 /**
@@ -155,6 +167,7 @@ class ExtensionHarness {
     goalExtension(api as unknown as ExtensionAPI);
     assert.ok(this.commands.has("goal"), "goal command registered");
     assert.ok(this.tools.has(GOAL_CHECKPOINT_TOOL), "goal checkpoint tool registered");
+    assert.ok(this.tools.has(GOAL_RESUME_TOOL), "goal resume tool registered");
     // Pi flushes a session file only after its first assistant message. Seed a
     // completed exchange so durable-goal creation is realistic.
     this.append({
@@ -201,6 +214,24 @@ class ExtensionHarness {
     });
   }
 
+  appendUser(text: string): Entry {
+    return this.append({
+      type: "message",
+      message: { role: "user", content: [{ type: "text", text }] },
+    });
+  }
+
+  async beginUserPrompt(text: string): Promise<unknown[]> {
+    const results = await this.emit("before_agent_start", {
+      prompt: text,
+      images: [],
+      systemPrompt: "base system prompt",
+      systemPromptOptions: {},
+    });
+    this.appendUser(text);
+    return results;
+  }
+
   async callCheckpoint(params: GoalCheckpointParams): Promise<ToolResult> {
     const callId = `tool-call-${this.nextId}`;
     this.append({
@@ -232,6 +263,41 @@ class ExtensionHarness {
         isError: false,
       },
     });
+  }
+
+  async callResume(params: {
+    goalId: string;
+    expectedEpoch: number;
+    expectedRevision: number;
+  }): Promise<ResumeToolResult> {
+    const callId = `resume-call-${this.nextId}`;
+    this.append({
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: callId, name: GOAL_RESUME_TOOL, arguments: params }],
+        stopReason: "toolUse",
+      },
+    });
+    const result = await this.tools.get(GOAL_RESUME_TOOL)!(
+      callId,
+      params,
+      undefined,
+      () => {},
+      this.context,
+    ) as ResumeToolResult;
+    this.append({
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolCallId: callId,
+        toolName: GOAL_RESUME_TOOL,
+        content: structuredClone(result.content),
+        details: structuredClone(result.details),
+        isError: false,
+      },
+    });
+    return result;
   }
 
   controls(): Entry[] {
@@ -318,6 +384,29 @@ async function settleWithProgress(
   return result;
 }
 
+async function enterWaitingExternal(
+  harness: ExtensionHarness,
+  question = "Should the release target staging or production?",
+): Promise<GoalCheckpointV2> {
+  await createAndObserve(harness);
+  await settleWithProgress(harness);
+  const active = harness.latestPersisted();
+  const result = await harness.callCheckpoint({
+    action: "waiting_external",
+    expectedRevision: active.revision,
+    phaseId: active.activePhaseId,
+    summary: "Engineering is paused for the user's deployment decision.",
+    nextAction: `Await the user's answer: ${question}`,
+    openQuestions: [question],
+  });
+  harness.appendCheckpointResult(result);
+  harness.appendAssistant("Waiting for the user's answer.");
+  await harness.emit("agent_settled");
+  assert.equal(harness.latestPersisted().lifecycle, "waiting_external");
+  assert.equal(harness.latestPersisted().scheduler.state, "idle");
+  return harness.latestPersisted();
+}
+
 test("create persists its dispatch before sending correlated control", async () => {
   const harness = new ExtensionHarness();
   await harness.command("ship the feature");
@@ -386,6 +475,73 @@ test("a correlated goal control carries its bounded working packet", async () =>
   assert.match(String(control.content), /goal_checkpoint/);
   assert.match(String(control.content), /objective="correlate this run"/);
   assert.equal(harness.latestPersisted().scheduler.state, "run_in_flight");
+});
+
+test("an ordinary user answer can durably resume a waiting goal without a slash command", async () => {
+  const harness = new ExtensionHarness();
+  const waiting = await enterWaitingExternal(harness);
+  const controlsBefore = harness.controls().length;
+  const checkpointsBefore = harness.persistedCheckpoints().length;
+
+  const hookResults = await harness.beginUserPrompt("Use staging.");
+  const guidance = hookResults
+    .map((result) => (result as { systemPrompt?: string } | undefined)?.systemPrompt ?? "")
+    .join("\n");
+  assert.match(guidance, /goal_resume/);
+  assert.match(guidance, /Should the release target staging or production\?/);
+  assert.match(guidance, /Do not call goal_resume for clarification questions/);
+  assert.equal(harness.persistedCheckpoints().length, checkpointsBefore, "guidance is observational");
+  assert.equal(harness.latestPersisted().lifecycle, "waiting_external");
+
+  harness.idle = false;
+  const result = await harness.callResume({
+    goalId: waiting.goalId,
+    expectedEpoch: waiting.epoch,
+    expectedRevision: waiting.revision,
+  });
+  assert.equal(result.terminate, true);
+  assert.equal(harness.controls().length, controlsBefore, "tool execution never dispatches re-entrantly");
+  assert.equal(harness.latestPersisted().lifecycle, "recovering");
+  assert.equal(harness.latestPersisted().epoch, waiting.epoch + 1);
+  assert.match(harness.latestPersisted().ledger.nextAction ?? "", /Use staging\./);
+
+  harness.idle = true;
+  await harness.emit("agent_settled");
+  assert.equal(harness.controls().length, controlsBefore + 1);
+  assert.equal(harness.latestPersisted().scheduler.state, "run_in_flight");
+  assert.equal(harness.latestPersisted().epoch, waiting.epoch + 1);
+
+  const entries = harness.branch.length;
+  await harness.emit("agent_settled");
+  assert.equal(harness.branch.length, entries, "replayed settlement cannot dispatch twice");
+});
+
+test("a clarification question leaves a waiting goal untouched", async () => {
+  const harness = new ExtensionHarness();
+  const waiting = await enterWaitingExternal(harness);
+  const before = {
+    controls: harness.controls().length,
+    checkpoints: harness.persistedCheckpoints().length,
+    revision: waiting.revision,
+    epoch: waiting.epoch,
+  };
+
+  const hookResults = await harness.beginUserPrompt("What do you mean by production?");
+  assert.match(
+    hookResults.map((result) => (result as { systemPrompt?: string } | undefined)?.systemPrompt ?? "").join("\n"),
+    /Do not call goal_resume for clarification questions/,
+  );
+  harness.appendAssistant("Production means the live customer-facing environment.");
+  await harness.emit("agent_settled");
+
+  assert.equal(harness.latestPersisted().lifecycle, "waiting_external");
+  assert.equal(harness.latestPersisted().scheduler.state, "idle");
+  assert.deepEqual({
+    controls: harness.controls().length,
+    checkpoints: harness.persistedCheckpoints().length,
+    revision: harness.latestPersisted().revision,
+    epoch: harness.latestPersisted().epoch,
+  }, before);
 });
 
 test("goal_checkpoint result details are authoritative and settlement queues one continuation", async () => {

@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 /** Session/custom-message and tool identifiers owned by the goal extension. */
 export const GOAL_CHECKPOINT_ENTRY = "goal/checkpoint-v2";
 export const GOAL_CHECKPOINT_TOOL = "goal_checkpoint";
+export const GOAL_RESUME_TOOL = "goal_resume";
 export const GOAL_CONTROL_MESSAGE = "goal-control";
 export const LEGACY_GOAL_STATE_ENTRY = "goal-state";
 
