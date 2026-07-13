@@ -369,6 +369,15 @@ test("no-argument status is observational and never resumes a paused goal", asyn
   assert.match(harness.notifications.at(-1)?.message ?? "", /objective:/);
 });
 
+test("status is not a reserved subcommand", async () => {
+  const harness = new ExtensionHarness();
+
+  await harness.command("status");
+
+  assert.equal(harness.latestPersisted().objective, "status");
+  assert.equal(harness.controls().length, 1);
+});
+
 test("a correlated goal control carries its bounded working packet", async () => {
   const harness = new ExtensionHarness();
   await harness.command("correlate this run");
@@ -510,6 +519,8 @@ test("completion is only a verification claim and /goal done explicitly succeeds
   assert.equal(harness.latestPersisted().lifecycle, "succeeded");
   assert.equal(harness.latestPersisted().scheduler.state, "idle");
   assert.match(harness.notifications.at(-1)?.message ?? "", /explicitly accepted/i);
+  assert.equal(harness.widgets.at(-1)?.value, undefined, "succeeded goals disappear from the UI");
+  assert.equal(harness.statuses.at(-1)?.value, undefined);
 });
 
 test("pause and stop commit safely during an autonomous run", async () => {

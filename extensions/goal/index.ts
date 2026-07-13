@@ -153,7 +153,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
   };
 
   const render = (ctx: ExtensionContext): void => {
-    if (!state) {
+    if (!state || state.lifecycle === "succeeded") {
       ctx.ui.setWidget(WIDGET_KEY, undefined);
       ctx.ui.setStatus(WIDGET_KEY, undefined);
       return;
@@ -920,9 +920,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
   };
 
   pi.registerCommand("goal", {
-    description: "Durable goal: /goal <objective> | status | pause | resume [answer] | verify | stop | done",
+    description: "Durable goal: /goal <objective> | pause | resume [answer] | verify | stop | done",
     getArgumentCompletions: (prefix) => {
-      const values = ["status", "pause", "resume", "verify", "stop", "done"];
+      const values = ["pause", "resume", "verify", "stop", "done"];
       const matches = values.filter((value) => value.startsWith(prefix)).map((value) => ({ value, label: value }));
       return matches.length ? matches : null;
     },
@@ -931,9 +931,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
       const [verb = "", ...rest] = raw.split(/\s+/);
       const lower = verb.toLowerCase();
 
-      if (raw === "" || lower === "status") {
-        if (lower === "status" && rest.length) notify(ctx, "Usage: /goal status", "warning");
-        else showStatus(ctx);
+      if (raw === "") {
+        showStatus(ctx);
         return;
       }
 
@@ -1032,7 +1031,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
         return;
       }
 
-      if (["pause", "stop", "done", "verify", "status"].includes(lower)) {
+      if (["pause", "stop", "done", "verify"].includes(lower)) {
         notify(ctx, `Usage: /goal ${lower}`, "warning");
         return;
       }
