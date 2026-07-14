@@ -42,10 +42,10 @@ test("every rendered line fits within the requested width", () => {
 });
 
 test("renders a borderless header plus one row per agent", () => {
-  const lines = new WorkflowDashboard(snap(), plainTheme, 0).render(96);
+  const lines = new WorkflowDashboard(snap(), plainTheme, 0).render(110);
   assert.equal(lines.length, 1 + 4); // header + 4 agents, no box chrome
   assert.doesNotMatch(lines[0], /[╭╰│├]─/);
-  assert.match(lines[0], /◆ {2}⠋ RUNNING {2}│ {2}PHASE 2\/2 {2}synthesize/);
+  assert.match(lines[0], /◆ {2}⠋ RUNNING {2}│ {2}WORKFLOW {2}PHASE 2\/2 {2}synthesize/);
   assert.match(lines[1], /^ {3}├─ /);
   assert.match(lines[4], /^ {3}└─ /);
 });
@@ -61,7 +61,7 @@ test("a long runId never overflows when shown after finish", () => {
 
 test("running dashboard shows phase, counts, tokens and agent glyphs", () => {
   const text = new WorkflowDashboard(snap(), plainTheme, 0).render(120).join("\n");
-  assert.match(text, /PHASE 2\/2 {2}synthesize/);
+  assert.match(text, /WORKFLOW {2}PHASE 2\/2 {2}synthesize/);
   assert.match(text, /RUN 1\/4/);
   assert.match(text, /↑12k ↓4.1k/);
   assert.match(text, /1 FAILED/);

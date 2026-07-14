@@ -2193,7 +2193,14 @@ function refreshSubagentStatus(): void {
 
   const runningCount = visibleJobs.filter((job) => job.status === "running").length;
   ctx.ui.setStatus("subagents", runningCount > 0 ? `agents: ${runningCount} running` : `agents: ${visibleJobs.length} recent`);
-  ctx.ui.setWidget("subagents", formatStatusTable(visibleJobs, ctx), { placement: "belowEditor" });
+  if (ctx.mode === "tui") {
+    ctx.ui.setWidget("subagents", (_tui, theme) => ({
+      render: (width: number) => renderStatusTable(visibleJobs, theme, latestLogPreview, width),
+      invalidate() {},
+    }), { placement: "belowEditor" });
+  } else {
+    ctx.ui.setWidget("subagents", formatStatusTable(visibleJobs, ctx), { placement: "belowEditor" });
+  }
   scheduleFinishedStatusExpiry(visibleJobs, now);
 }
 

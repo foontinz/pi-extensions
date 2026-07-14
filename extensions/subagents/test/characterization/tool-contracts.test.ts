@@ -110,7 +110,7 @@ function makeStatusCtx() {
     cwd,
     hasUI: true,
     ui: {
-      theme: { fg: (_color: string, value: string) => value },
+      theme: { fg: (_color: string, value: string) => value, bold: (value: string) => value },
       setStatus(key: string, value: string | undefined) { calls.push({ kind: "status", key, value }); },
       setWidget(key: string, value: string[] | undefined, options?: unknown) { calls.push({ kind: "widget", key, value, options }); },
     },
@@ -347,12 +347,13 @@ test("status widget formatting characterizes running and terminal rows", () => {
     makeJob({ id: "agent_epsilon_55555555", label: "cleanup pending", status: "failed", phase: "failed", cleanupPhase: "pending", cleanupPending: true, finishedAt: 1_700_000_010_000 }),
   ], statusCtx);
   const table = rows.join("\n");
-  assert.match(table, /^subagents\nid\s+agent/);
-  assert.match(table, /11111111\s+running-job\s+\d\d:\d\d\s+\d+(?::\d\d){1,2}\s+running\s+running checking repository files/);
-  assert.match(table, /22222222\s+completed-job\s+\d\d:\d\d\s+\d+(?::\d\d){1,2}\s+completed\s+done ship final patch/);
-  assert.match(table, /33333333\s+failed-job\s+\d\d:\d\d\s+\d+(?::\d\d){1,2}\s+failed\s+failed boom stack trace/);
-  assert.match(table, /44444444\s+cancelled-job\s+\d\d:\d\d\s+\d+(?::\d\d){1,2}\s+cancelled\s+stopped user requested stop/);
-  assert.match(table, /55555555\s+cleanup-pending\s+\d\d:\d\d\s+\d+(?::\d\d){1,2}\s+failed\s+cleanup-pending/);
+  assert.match(table, /^◆ {2}RUNNING {2}│ {2}AGENTS {2}1 active/);
+  assert.match(table, /2 FAILED · RUN 1\/5/);
+  assert.match(table, /├─ ● running-job\s+checking repository files\s+11111111 · \d+(?::\d\d){1,2}/);
+  assert.match(table, /├─ ✓ completed-job\s+ship final patch\s+22222222 · \d+(?::\d\d){1,2}/);
+  assert.match(table, /├─ ✗ failed-job\s+boom stack trace\s+33333333 · \d+(?::\d\d){1,2}/);
+  assert.match(table, /├─ · cancelled-job\s+user requested stop\s+44444444 · \d+(?::\d\d){1,2}/);
+  assert.match(table, /└─ ✗ cleanup-pending\s+cleanup-pending\s+55555555 · \d+(?::\d\d){1,2}/);
 });
 
 test("status widget terminal visibility window hides expired terminal jobs", () => {

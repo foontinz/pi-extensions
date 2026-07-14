@@ -90,16 +90,19 @@ export class WorkflowDashboard implements Component {
     return truncateToWidth(leftFit + gap + right, width);
   }
 
-  /** `PHASE 2/2  synthesize` while running, else the workflow origin/run id. */
+  /** `WORKFLOW  PHASE 2/2  synthesize` while running, else the origin/run id. */
   private phaseLabel(): string {
     const t = this.theme;
     const s = this.snap;
+    // The muted WORKFLOW tag keeps this header distinguishable from the goal
+    // widget, which shares the `◆  STATE  │  PHASE x/y` shape.
+    const tag = t.fg("muted", "WORKFLOW") + "  ";
     if (s.phase && s.phases.length > 0) {
       const ordinal = Math.max(1, s.phases.indexOf(s.phase) + 1);
-      return t.fg("muted", `PHASE ${ordinal}/${s.phases.length}`) + "  " + t.fg("text", s.phase);
+      return tag + t.fg("muted", `PHASE ${ordinal}/${s.phases.length}`) + "  " + t.fg("text", s.phase);
     }
-    if (s.status === "running") return t.fg("muted", "STARTING");
-    return t.fg("muted", s.runId || s.origin);
+    if (s.status === "running") return tag + t.fg("muted", "STARTING");
+    return tag + t.fg("muted", s.runId || s.origin);
   }
 
   private agentRow(

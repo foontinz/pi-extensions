@@ -89,11 +89,12 @@ test("status widget includes short job ids and cleanup-failed indicators", () =>
     cleanupPhase: "failed",
     cleanupError: "rm failed",
   });
-  const ctx = { ui: { theme: { fg: (_color: string, text: string) => text } } } as any;
+  const ctx = { ui: { theme: { fg: (_color: string, text: string) => text, bold: (text: string) => text } } } as any;
 
   const lines = __subagentsTest.formatStatusTable([job], ctx);
-  assert.match(lines.join("\n"), /id\s+agent/);
+  assert.match(lines[0], /◆ {2}\w+ {2}│ {2}AGENTS/);
   assert.match(lines.join("\n"), /deadbeef/);
+  assert.match(lines.join("\n"), /cleanup-failed rm failed/);
   assert.equal(__subagentsTest.shortJobId(job.id), "deadbeef");
   assert.match(__subagentsTest.compactJobState(job), /cleanup-failed rm failed/);
 });

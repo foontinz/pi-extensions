@@ -9,7 +9,7 @@ import { compactJobState, formatStatusTable, type StatusTheme } from "../../ui/s
 import { normalizeUsage } from "../../core/in-process-runner.js";
 import { normalizeWorktreeEnvConfig } from "../../workspace/worktree-config.js";
 
-const plainTheme: StatusTheme = { fg: (_role, text) => text };
+const plainTheme: StatusTheme = { fg: (_role, text) => text, bold: (text) => text };
 
 test("normalizeUsage reads cost from pi's nested {total} usage object", () => {
   // Pi assistant messages store cost as an object, not a number. Regression
@@ -123,7 +123,8 @@ test("extracted status widget uses a narrow theme interface", () => {
     },
   ], plainTheme, () => undefined);
 
-  assert.equal(rows[0], "subagents");
-  assert.match(rows.join("\n"), /review-agent/);
+  assert.match(rows[0], /◆ {2}DONE {2}│ {2}AGENTS {2}1 recent/);
+  assert.match(rows[0], /RUN 1\/1/);
+  assert.match(rows.join("\n"), /└─ ✓ review-agent/);
   assert.equal(compactJobState({ id: "a", label: "b", status: "failed", startedAt: 1, updatedAt: 1, cleanupError: "bad cleanup" }, () => undefined), "cleanup-failed bad cleanup");
 });
