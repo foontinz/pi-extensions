@@ -287,7 +287,7 @@ export function parsePrState(value: unknown, expectedKey?: string): PrState {
     repoRoot: nullableString(state.repoRoot, "state.repoRoot"),
     worktreePath: nullableString(state.worktreePath, "state.worktreePath"),
     headRefName: nullableString(state.headRefName, "state.headRefName"),
-    baseRefName: nullableString(state.baseRefName, "state.baseRefName"),
+    baseRefName: state.baseRefName === undefined ? null : nullableString(state.baseRefName, "state.baseRefName"),
     status,
     createdAt: timestamp(state.createdAt, "state.createdAt"),
     updatedAt: timestamp(state.updatedAt, "state.updatedAt"),

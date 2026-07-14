@@ -422,6 +422,35 @@ export async function isPaneLive(
   return (await verifyPane(socketContext(env), ref, parsePrKey(key).key)) === "live";
 }
 
+// Resolve the pane the current process is running inside (tmux exports TMUX_PANE),
+// verifying it is an owned pane for this PR. The poller uses this to authoritatively
+// record its own pane, avoiding a startup race with the `watch` caller that spawned
+// it (whose post-spawn save could otherwise be overwritten by the first poll).
+export async function resolveOwnPaneRef(
+  key: string,
+  app: AppPaths = appPaths(),
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<TmuxPaneRef | null> {
+  const paneId = env.TMUX_PANE;
+  if (!paneId || !/^%\d+$/.test(paneId)) return null;
+  const context = socketContext(env);
+  const token = await ownerToken(app);
+  const result = await execute(
+    context,
+    [
+      "display-message",
+      "-p",
+      "-t",
+      paneId,
+      `#{session_id}\t#{window_id}\t#{pane_id}\t#{${OWNER_OPTION}}\t#{${KEY_OPTION}}\t#{${TOKEN_OPTION}}`,
+    ],
+    true,
+  );
+  const record = parsePaneRecord(result.stdout.trimEnd());
+  if (!record || record.ownerToken !== token || record.key !== parsePrKey(key).key) return null;
+  return toRef(record, context.socketName);
+}
+
 export async function killPrPane(
   ref: TmuxPaneRef | null,
   key: string,

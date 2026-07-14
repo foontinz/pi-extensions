@@ -20,7 +20,13 @@ test("config validates model pairing, ranges, and unknown fields", () => {
     pollIntervalSec: 5,
     runTimeoutMin: 15,
     maxConcurrentRuns: 2,
+    baseMergeMessage: null,
   });
+  assert.equal(
+    parseConfig({ provider: "openai", model: "gpt-5", baseMergeMessage: "chore: merge base GENAI=NO" }).baseMergeMessage,
+    "chore: merge base GENAI=NO",
+  );
+  assert.throws(() => parseConfig({ baseMergeMessage: "line1\nline2" }), /single-line/);
   assert.throws(() => parseConfig({ provider: "openai" }), /both be set/);
   assert.throws(() => parseConfig({ pollIntervalSec: 4 }), /5 to 3600/);
   assert.throws(() => parseConfig({ maxConcurrentRuns: 1.5 }), /integer/);

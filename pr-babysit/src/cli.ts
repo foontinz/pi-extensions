@@ -18,7 +18,7 @@ import {
   savePrState,
   type PrState,
 } from "./state.ts";
-import { ensurePrPane, ensureTmuxAvailable, isPaneLive, killPrPane, setPaneLabel } from "./tmux.ts";
+import { ensurePrPane, ensureTmuxAvailable, isPaneLive, killPrPane, resolveOwnPaneRef, setPaneLabel } from "./tmux.ts";
 import { provisionWorktree, removeManagedWorktree, worktreeDirty } from "./worktree.ts";
 
 const VERSION = "0.1.0";
@@ -349,6 +349,16 @@ async function runPoller(key: string, once: boolean, io: CliIo): Promise<void> {
 
     while (!controller.signal.aborted) {
       state = (await loadPrState(key, app)) ?? state;
+      // Authoritatively (re)record the pane this poller runs inside. `watch` persists a
+      // ref after spawning us and the pane's owner options are set slightly after the
+      // pane is created, so both a startup save and this reload can otherwise race to a
+      // stale ref. Resolving our own live pane each cycle self-heals state.tmux; the
+      // value is preserved through pollOnce's structuredClone.
+      const ownPane = await resolveOwnPaneRef(key, app).catch(() => null);
+      if (ownPane && JSON.stringify(ownPane) !== JSON.stringify(state.tmux)) {
+        state.tmux = ownPane;
+        await savePrState(state, app);
+      }
       try {
         ownLogin ??= await client.currentLogin({ signal: controller.signal, host });
         const result = await pollOnce(client, state, ownLogin, app, { signal: controller.signal });

@@ -285,6 +285,11 @@ export interface BaseMergeResult {
   branch: string;
   action: "up_to_date" | "fast_forward" | "merged" | "conflict" | "no_remote" | "push_failed";
   pushed: boolean;
+  pushError?: string;
+}
+
+export interface SyncOptions {
+  mergeMessage?: string | null;
 }
 
 export interface SyncResult {
@@ -303,6 +308,17 @@ async function ok(runner: CommandRunner, args: readonly string[]): Promise<boole
   }
 }
 
+// Push the checked-out branch to its upstream, returning the git error on failure
+// instead of throwing so a run is never blocked by an unpushable base merge.
+async function tryPush(worktreePath: string, runner: CommandRunner): Promise<{ pushed: boolean; error?: string }> {
+  try {
+    await runner("git", ["-C", worktreePath, "push"]);
+    return { pushed: true };
+  } catch (error) {
+    return { pushed: false, error: (error as Error).message };
+  }
+}
+
 // Real merge commits require a committer identity. Prefer whatever the repo/global
 // config already provides; fall back to a pr-babysit identity so the automatic base
 // merge never fails purely for lack of configured name/email.
@@ -316,10 +332,16 @@ async function mergeIdentityArgs(worktreePath: string, runner: CommandRunner): P
 // push the result so the pull request stays continuously up to date. Conflicts are
 // left for the dispatched agent to resolve; we abort the merge and report instead of
 // blocking the run.
+async function aheadOfUpstream(worktreePath: string, runner: CommandRunner): Promise<boolean> {
+  const counts = await runner("git", ["-C", worktreePath, "rev-list", "--count", "@{upstream}..HEAD"]).catch(() => null);
+  return counts !== null && Number(counts.stdout.trim()) > 0;
+}
+
 async function mergeBaseBranch(
   state: Pick<PrState, "baseRefName">,
   worktreePath: string,
   runner: CommandRunner,
+  options: SyncOptions,
 ): Promise<BaseMergeResult | null> {
   const branch = state.baseRefName?.trim();
   if (!branch || /[\r\n\0]/.test(branch)) return null;
@@ -327,21 +349,31 @@ async function mergeBaseBranch(
   if (!(await ok(runner, ["-C", worktreePath, "rev-parse", "--verify", "--quiet", `refs/remotes/${remoteRef}`]))) {
     return { branch, action: "no_remote", pushed: false };
   }
-  // Base already contained in HEAD: nothing to merge.
+
+  // Base already contained in HEAD: nothing to merge, but a prior merge may still be
+  // waiting to be pushed (e.g. a transient/rule-blocked push). Retry the push so a
+  // recovered configuration self-heals.
   if (await ok(runner, ["-C", worktreePath, "merge-base", "--is-ancestor", remoteRef, "HEAD"])) {
+    if (await aheadOfUpstream(worktreePath, runner)) {
+      const { pushed, error } = await tryPush(worktreePath, runner);
+      return { branch, action: pushed ? "merged" : "push_failed", pushed, ...(error ? { pushError: error } : {}) };
+    }
     return { branch, action: "up_to_date", pushed: false };
   }
+
   const fastForward = await ok(runner, ["-C", worktreePath, "merge-base", "--is-ancestor", "HEAD", remoteRef]);
   const identity = await mergeIdentityArgs(worktreePath, runner);
+  const message = options.mergeMessage?.trim();
+  const messageArgs = message && !fastForward ? ["-m", message] : [];
   try {
-    await runner("git", ["-C", worktreePath, ...identity, "merge", "--no-edit", remoteRef]);
+    await runner("git", ["-C", worktreePath, ...identity, "merge", "--no-edit", ...messageArgs, remoteRef]);
   } catch {
     await ok(runner, ["-C", worktreePath, "merge", "--abort"]);
     return { branch, action: "conflict", pushed: false };
   }
-  const pushed = await ok(runner, ["-C", worktreePath, "push"]);
+  const { pushed, error } = await tryPush(worktreePath, runner);
   const action = fastForward ? "fast_forward" : "merged";
-  return { branch, action: pushed ? action : "push_failed", pushed };
+  return { branch, action: pushed ? action : "push_failed", pushed, ...(error ? { pushError: error } : {}) };
 }
 
 function describeBase(base: BaseMergeResult | null): string {
@@ -356,7 +388,7 @@ function describeBase(base: BaseMergeResult | null): string {
     case "conflict":
       return `; base ${base.branch} merge conflicts (left for the agent)`;
     case "push_failed":
-      return `; merged base ${base.branch} locally but push failed`;
+      return `; merged base ${base.branch} locally but push failed${base.pushError ? ` (${base.pushError.split("\n")[0]})` : ""}`;
     case "no_remote":
       return `; base ${base.branch} has no origin ref`;
   }
@@ -366,6 +398,7 @@ export async function syncWorktreeBeforeRun(
   state: Pick<PrState, "key" | "repoRoot" | "worktreePath" | "baseRefName">,
   app: AppPaths = appPaths(),
   runner: CommandRunner = runCommand,
+  options: SyncOptions = {},
 ): Promise<SyncResult> {
   const { worktreePath } = validateManagedPaths(state, app);
   if (await worktreeDirty(state, app, runner)) {
@@ -390,6 +423,6 @@ export async function syncWorktreeBeforeRun(
   } else {
     headDetail = `clean worktree (${ahead || 0} ahead, ${behind || 0} behind)`;
   }
-  const base = await mergeBaseBranch(state, worktreePath, runner);
+  const base = await mergeBaseBranch(state, worktreePath, runner, options);
   return { dirty: false, reset, base, detail: `${headDetail}${describeBase(base)}` };
 }

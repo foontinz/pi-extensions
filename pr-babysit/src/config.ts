@@ -8,6 +8,7 @@ export interface Config {
   pollIntervalSec: number;
   runTimeoutMin: number;
   maxConcurrentRuns: number;
+  baseMergeMessage: string | null;
 }
 
 export const DEFAULT_CONFIG: Readonly<Config> = Object.freeze({
@@ -16,6 +17,7 @@ export const DEFAULT_CONFIG: Readonly<Config> = Object.freeze({
   pollIntervalSec: 60,
   runTimeoutMin: 15,
   maxConcurrentRuns: 2,
+  baseMergeMessage: null,
 });
 
 const ALLOWED_KEYS = new Set([
@@ -24,6 +26,7 @@ const ALLOWED_KEYS = new Set([
   "pollIntervalSec",
   "runTimeoutMin",
   "maxConcurrentRuns",
+  "baseMergeMessage",
 ]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -58,6 +61,15 @@ export function parseConfig(value: unknown): Config {
 
   const provider = optionalName(value.provider, "provider");
   const model = optionalName(value.model, "model");
+  const baseMergeMessage =
+    value.baseMergeMessage === undefined || value.baseMergeMessage === null
+      ? null
+      : (() => {
+          if (typeof value.baseMergeMessage !== "string" || value.baseMergeMessage.trim() === "" || /[\r\n\0]/.test(value.baseMergeMessage)) {
+            throw new Error("config.baseMergeMessage must be a non-empty single-line string");
+          }
+          return value.baseMergeMessage;
+        })();
   if ((provider === null) !== (model === null)) {
     throw new Error("config.provider and config.model must either both be set or both be omitted");
   }
@@ -74,6 +86,7 @@ export function parseConfig(value: unknown): Config {
       1,
       32,
     ),
+    baseMergeMessage,
   };
 }
 

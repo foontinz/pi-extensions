@@ -18,6 +18,7 @@ const config: Config = {
   pollIntervalSec: 60,
   runTimeoutMin: 1,
   maxConcurrentRuns: 1,
+  baseMergeMessage: null,
 };
 
 async function verifiedReplies(

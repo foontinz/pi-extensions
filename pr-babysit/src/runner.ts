@@ -210,7 +210,7 @@ export async function executeAgentRun(
   const now = options.now ?? (() => new Date());
   const runId = options.runId ?? randomUUID();
   if (!/^[a-f\d-]{36}$/i.test(runId)) throw new Error("runId must be a UUID");
-  const sync = await syncWorktreeBeforeRun(state, app);
+  const sync = await syncWorktreeBeforeRun(state, app, undefined, { mergeMessage: config.baseMergeMessage });
   const artifactDir = join(paths.runsDir, runId);
   await mkdir(artifactDir, { mode: 0o700 });
   const promptPath = join(artifactDir, "prompt.md");

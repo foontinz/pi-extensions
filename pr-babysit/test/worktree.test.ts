@@ -151,12 +151,14 @@ test("sync automatically merges the base branch into the head branch and pushes 
   await git(repoRoot, "worktree", "add", "--track", "-b", "feature", worktreePath, "origin/feature");
 
   const state = createPrState({ key: "owner/repo#7", repoRoot, worktreePath, baseRefName: "main" });
-  const sync = await syncWorktreeBeforeRun(state, app);
+  const sync = await syncWorktreeBeforeRun(state, app, undefined, { mergeMessage: "chore: merge base GENAI=NO" });
 
   assert.equal(sync.dirty, false);
   assert.equal(sync.base?.branch, "main");
   assert.equal(sync.base?.action, "merged");
   assert.equal(sync.base?.pushed, true);
+  // The custom merge message is honored (repo commit-message rules).
+  assert.equal(await git(worktreePath, "log", "-1", "--format=%s"), "chore: merge base GENAI=NO");
   // The advance from main is now present locally and pushed to origin/feature.
   assert.ok((await readFile(join(worktreePath, "main-only.txt"), "utf8")).includes("main advance"));
   await git(worktreePath, "fetch", "origin");
@@ -165,6 +167,21 @@ test("sync automatically merges the base branch into the head branch and pushes 
   // A second sync is a no-op: base is already contained in the head branch.
   const again = await syncWorktreeBeforeRun(state, app);
   assert.equal(again.base?.action, "up_to_date");
+
+  // Self-heal: a base merge that stayed local (previous push failed) is re-pushed
+  // on the next sync rather than being reported as a permanent no-op.
+  await git(worktreePath, "reset", "--hard", "@{upstream}");
+  await git(seed, "checkout", "main");
+  await writeFile(join(seed, "main-only-2.txt"), "second advance\n");
+  await git(seed, "add", "main-only-2.txt");
+  await git(seed, "commit", "-m", "advance main again");
+  await git(seed, "push", "origin", "main");
+  await git(worktreePath, "fetch", "origin");
+  await git(worktreePath, "-c", "user.email=x@y.z", "-c", "user.name=x", "merge", "--no-edit", "-m", "chore: local merge GENAI=NO", "origin/main");
+  // HEAD is ahead of upstream with base already contained but unpushed.
+  const healed = await syncWorktreeBeforeRun(state, app);
+  assert.equal(healed.base?.action, "merged");
+  assert.equal(healed.base?.pushed, true);
 });
 
 test("managed removal refuses dirty worktrees unless explicitly forced", async () => {

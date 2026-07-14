@@ -34,6 +34,8 @@ Create `~/.pr-babysitter/config.json` before an event can invoke pi:
 
 The provider and model are always passed explicitly. Runs disable extension, skill, context-file, and project-local approval discovery.
 
+Optional `baseMergeMessage` (a single-line string) sets the commit message used when the base branch is auto-merged into the head branch (see *Branch synchronization*). Set it when the repository enforces a commit-message ruleset that git's default merge message would violate, e.g. `"chore: merge base branch GENAI=NO"`. When omitted, git's default merge message is used.
+
 ## Usage
 
 ```sh
@@ -49,7 +51,7 @@ A bare PR number resolves against the current Git repository. `run --pr [host/]o
 
 ## Branch synchronization
 
-Before every run, a clean managed worktree is fast-forwarded to the latest pushed head commit and the PR base branch (`origin/<baseRefName>`, e.g. `main`) is automatically merged into the head branch. When the merge introduces new commits they are pushed straight to the PR head ref, so the pull request stays continuously up to date with its base. Fast-forwards, real merges, and "already merged" states are all handled; a merge that conflicts is aborted and left for the dispatched agent to resolve rather than blocking the run. If the worktree has uncommitted local changes, synchronization (and the base merge) is skipped for that run. The chosen action is recorded in the run prompt and `runs/<run-id>/meta.json`.
+Before every run, a clean managed worktree is fast-forwarded to the latest pushed head commit and the PR base branch (`origin/<baseRefName>`, e.g. `main`) is automatically merged into the head branch. When the merge introduces new commits they are pushed straight to the PR head ref, so the pull request stays continuously up to date with its base. The merge commit message is git's default unless `baseMergeMessage` is configured (needed when a repository enforces commit-message rules). A merge that stays local because a push failed is retried on the next sync. Fast-forwards, real merges, and "already merged" states are all handled; a merge that conflicts is aborted and left for the dispatched agent to resolve rather than blocking the run. If the worktree has uncommitted local changes, synchronization (and the base merge) is skipped for that run. The chosen action is recorded in the run prompt and `runs/<run-id>/meta.json`.
 
 ## GitHub Enterprise Server
 
