@@ -1,0 +1,99 @@
+{
+  "pr": {
+    "owner": "owner",
+    "repo": "repo",
+    "number": 1,
+    "key": "owner/repo#1",
+    "url": "https://github.com/owner/repo/pull/1",
+    "title": "Improve polling",
+    "state": "OPEN",
+    "isDraft": false,
+    "mergeable": "MERGEABLE",
+    "mergeStateStatus": "UNSTABLE",
+    "headRefName": "feature/polling",
+    "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "headRepository": { "nameWithOwner": "foontinz/claude-code-plugins" },
+    "reviewDecision": "CHANGES_REQUESTED",
+    "statusCheckRollup": [
+      { "__typename": "CheckRun", "name": "test", "status": "IN_PROGRESS", "conclusion": "" }
+    ]
+  },
+  "issueComments": [
+    {
+      "id": 1,
+      "body": "Existing comment",
+      "createdAt": "2026-01-01T00:00:00.000Z",
+      "updatedAt": "2026-01-01T00:00:00.000Z",
+      "actor": "alice",
+      "raw": { "id": 1 }
+    },
+    {
+      "id": 2,
+      "body": "Please update the docs",
+      "createdAt": "2026-01-01T00:11:00.000Z",
+      "updatedAt": "2026-01-01T00:11:00.000Z",
+      "actor": "bob",
+      "raw": { "id": 2 }
+    },
+    {
+      "id": 3,
+      "body": "My own note",
+      "createdAt": "2026-01-01T00:11:00.000Z",
+      "updatedAt": "2026-01-01T00:11:00.000Z",
+      "actor": "foontinz",
+      "raw": { "id": 3 }
+    },
+    {
+      "id": 4,
+      "body": "Automated reply <!-- pr-babysitter:run=abc -->",
+      "createdAt": "2026-01-01T00:11:00.000Z",
+      "updatedAt": "2026-01-01T00:11:00.000Z",
+      "actor": "charlie",
+      "raw": { "id": 4 }
+    },
+    {
+      "id": 5,
+      "body": "Please add a test",
+      "createdAt": "2026-01-01T00:11:00.000Z",
+      "updatedAt": "2026-01-01T00:11:00.000Z",
+      "actor": "dave",
+      "raw": { "id": 5 }
+    }
+  ],
+  "reviewComments": [
+    {
+      "id": 20,
+      "body": "Handle the null case",
+      "createdAt": "2026-01-01T00:12:00.000Z",
+      "updatedAt": "2026-01-01T00:12:00.000Z",
+      "actor": "erin",
+      "raw": { "id": 20, "path": "src/poller.ts", "line": 12 }
+    }
+  ],
+  "reviews": [
+    {
+      "id": 10,
+      "body": "Existing review",
+      "state": "COMMENTED",
+      "submittedAt": "2026-01-01T00:01:00.000Z",
+      "actor": "alice",
+      "raw": { "id": 10 }
+    },
+    {
+      "id": 11,
+      "body": "Own review",
+      "state": "COMMENTED",
+      "submittedAt": "2026-01-01T00:13:00.000Z",
+      "actor": "foontinz",
+      "raw": { "id": 11 }
+    },
+    {
+      "id": 12,
+      "body": "Changes requested",
+      "state": "CHANGES_REQUESTED",
+      "submittedAt": "2026-01-01T00:14:00.000Z",
+      "actor": "frank",
+      "raw": { "id": 12, "state": "CHANGES_REQUESTED" }
+    }
+  ]
+}

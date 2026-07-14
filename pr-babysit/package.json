@@ -1,0 +1,23 @@
+{
+  "name": "pr-babysit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Autonomous GitHub PR babysitter supervised by tmux",
+  "bin": {
+    "pr-babysit": "./src/cli.ts"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --test test/*.test.ts",
+    "test:live": "PR_BABYSIT_LIVE_TMUX=1 node --test test/tmux-live.test.ts",
+    "test:e2e": "PR_BABYSIT_E2E=1 node test/scratch-e2e.ts"
+  },
+  "engines": {
+    "node": ">=25.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.0",
+    "typescript": "^6.0.0"
+  }
+}

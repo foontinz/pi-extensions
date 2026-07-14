@@ -1,0 +1,31 @@
+{
+  "pr": {
+    "owner": "owner",
+    "repo": "repo",
+    "number": 1,
+    "key": "owner/repo#1",
+    "url": "https://github.com/owner/repo/pull/1",
+    "title": "Improve polling",
+    "state": "MERGED",
+    "isDraft": false,
+    "mergeable": "UNKNOWN",
+    "mergeStateStatus": "UNKNOWN",
+    "headRefName": "feature/polling",
+    "headRefOid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "headRepository": { "nameWithOwner": "foontinz/claude-code-plugins" },
+    "reviewDecision": "APPROVED",
+    "statusCheckRollup": []
+  },
+  "issueComments": [
+    {
+      "id": 99,
+      "body": "Comment after merge",
+      "createdAt": "2026-01-01T00:30:00.000Z",
+      "updatedAt": "2026-01-01T00:30:00.000Z",
+      "actor": "zoe",
+      "raw": { "id": 99 }
+    }
+  ],
+  "reviewComments": [],
+  "reviews": []
+}
