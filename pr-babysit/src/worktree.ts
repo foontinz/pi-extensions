@@ -281,32 +281,115 @@ export async function removeManagedWorktree(
   await runner("git", ["-C", repoRoot, "worktree", "prune"]);
 }
 
+export interface BaseMergeResult {
+  branch: string;
+  action: "up_to_date" | "fast_forward" | "merged" | "conflict" | "no_remote" | "push_failed";
+  pushed: boolean;
+}
+
 export interface SyncResult {
   dirty: boolean;
   reset: boolean;
   detail: string;
+  base: BaseMergeResult | null;
+}
+
+async function ok(runner: CommandRunner, args: readonly string[]): Promise<boolean> {
+  try {
+    await runner("git", args);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Real merge commits require a committer identity. Prefer whatever the repo/global
+// config already provides; fall back to a pr-babysit identity so the automatic base
+// merge never fails purely for lack of configured name/email.
+async function mergeIdentityArgs(worktreePath: string, runner: CommandRunner): Promise<string[]> {
+  const email = await runner("git", ["-C", worktreePath, "config", "user.email"]).then((r) => r.stdout.trim()).catch(() => "");
+  if (email !== "") return [];
+  return ["-c", "user.name=pr-babysit", "-c", "user.email=pr-babysit@localhost"];
+}
+
+// Merge the PR base branch (e.g. origin/main) into the checked-out head branch and
+// push the result so the pull request stays continuously up to date. Conflicts are
+// left for the dispatched agent to resolve; we abort the merge and report instead of
+// blocking the run.
+async function mergeBaseBranch(
+  state: Pick<PrState, "baseRefName">,
+  worktreePath: string,
+  runner: CommandRunner,
+): Promise<BaseMergeResult | null> {
+  const branch = state.baseRefName?.trim();
+  if (!branch || /[\r\n\0]/.test(branch)) return null;
+  const remoteRef = `origin/${branch}`;
+  if (!(await ok(runner, ["-C", worktreePath, "rev-parse", "--verify", "--quiet", `refs/remotes/${remoteRef}`]))) {
+    return { branch, action: "no_remote", pushed: false };
+  }
+  // Base already contained in HEAD: nothing to merge.
+  if (await ok(runner, ["-C", worktreePath, "merge-base", "--is-ancestor", remoteRef, "HEAD"])) {
+    return { branch, action: "up_to_date", pushed: false };
+  }
+  const fastForward = await ok(runner, ["-C", worktreePath, "merge-base", "--is-ancestor", "HEAD", remoteRef]);
+  const identity = await mergeIdentityArgs(worktreePath, runner);
+  try {
+    await runner("git", ["-C", worktreePath, ...identity, "merge", "--no-edit", remoteRef]);
+  } catch {
+    await ok(runner, ["-C", worktreePath, "merge", "--abort"]);
+    return { branch, action: "conflict", pushed: false };
+  }
+  const pushed = await ok(runner, ["-C", worktreePath, "push"]);
+  const action = fastForward ? "fast_forward" : "merged";
+  return { branch, action: pushed ? action : "push_failed", pushed };
+}
+
+function describeBase(base: BaseMergeResult | null): string {
+  if (base === null) return "";
+  switch (base.action) {
+    case "up_to_date":
+      return `; base ${base.branch} already merged`;
+    case "fast_forward":
+      return `; fast-forwarded to base ${base.branch}${base.pushed ? " and pushed" : ""}`;
+    case "merged":
+      return `; merged base ${base.branch}${base.pushed ? " and pushed" : ""}`;
+    case "conflict":
+      return `; base ${base.branch} merge conflicts (left for the agent)`;
+    case "push_failed":
+      return `; merged base ${base.branch} locally but push failed`;
+    case "no_remote":
+      return `; base ${base.branch} has no origin ref`;
+  }
 }
 
 export async function syncWorktreeBeforeRun(
-  state: Pick<PrState, "key" | "repoRoot" | "worktreePath">,
+  state: Pick<PrState, "key" | "repoRoot" | "worktreePath" | "baseRefName">,
   app: AppPaths = appPaths(),
   runner: CommandRunner = runCommand,
 ): Promise<SyncResult> {
   const { worktreePath } = validateManagedPaths(state, app);
-  if (await worktreeDirty(state, app, runner)) return { dirty: true, reset: false, detail: "worktree has local changes" };
+  if (await worktreeDirty(state, app, runner)) {
+    return { dirty: true, reset: false, base: null, detail: "worktree has local changes" };
+  }
   await runner("git", ["-C", worktreePath, "fetch", "--all", "--prune"]);
   let counts: CommandResult;
   try {
     counts = await runner("git", ["-C", worktreePath, "rev-list", "--left-right", "--count", "HEAD...@{upstream}"]);
   } catch {
-    return { dirty: false, reset: false, detail: "clean worktree has no upstream" };
+    return { dirty: false, reset: false, base: null, detail: "clean worktree has no upstream" };
   }
   const [aheadText, behindText] = counts.stdout.trim().split(/\s+/);
   const ahead = Number(aheadText);
   const behind = Number(behindText);
+  let reset = false;
+  let headDetail: string;
   if (ahead === 0 && behind > 0) {
     await runner("git", ["-C", worktreePath, "reset", "--hard", "@{upstream}"]);
-    return { dirty: false, reset: true, detail: `reset to upstream (${behind} commit${behind === 1 ? "" : "s"} behind)` };
+    reset = true;
+    headDetail = `reset to upstream (${behind} commit${behind === 1 ? "" : "s"} behind)`;
+  } else {
+    headDetail = `clean worktree (${ahead || 0} ahead, ${behind || 0} behind)`;
   }
-  return { dirty: false, reset: false, detail: `clean worktree (${ahead || 0} ahead, ${behind || 0} behind)` };
+  const base = await mergeBaseBranch(state, worktreePath, runner);
+  return { dirty: false, reset, base, detail: `${headDetail}${describeBase(base)}` };
 }

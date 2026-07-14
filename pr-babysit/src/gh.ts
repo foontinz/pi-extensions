@@ -82,6 +82,7 @@ export interface PrView extends PrRef {
   isDraft: boolean;
   mergeable: MergeableState;
   mergeStateStatus: string;
+  baseRefName: string;
   headRefName: string;
   headRefOid: string;
   headRepository: string;
@@ -215,6 +216,7 @@ export function parsePrView(value: unknown, expected?: Partial<PrRef>): PrView {
     isDraft: boolean(item.isDraft, "gh pr view.isDraft"),
     mergeable,
     mergeStateStatus: nullableString(item.mergeStateStatus, "gh pr view.mergeStateStatus") ?? "UNKNOWN",
+    baseRefName: string(item.baseRefName, "gh pr view.baseRefName"),
     headRefName: string(item.headRefName, "gh pr view.headRefName"),
     headRefOid: string(item.headRefOid, "gh pr view.headRefOid"),
     headRepository: `${headRepositoryRef.owner}/${headRepositoryRef.repo}`,
@@ -282,6 +284,7 @@ const PR_VIEW_FIELDS = [
   "isDraft",
   "mergeable",
   "mergeStateStatus",
+  "baseRefName",
   "headRefName",
   "headRefOid",
   "headRepository",

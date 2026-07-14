@@ -196,7 +196,7 @@ async function spawnPi(
 }
 
 export async function executeAgentRun(
-  state: Pick<PrState, "key" | "url" | "headRefName" | "worktreePath" | "repoRoot">,
+  state: Pick<PrState, "key" | "url" | "headRefName" | "baseRefName" | "worktreePath" | "repoRoot">,
   events: readonly EventRecord[],
   config: Config,
   options: RunnerOptions = {},

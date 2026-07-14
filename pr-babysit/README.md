@@ -47,6 +47,10 @@ node src/cli.ts unwatch owner/repo#123
 
 A bare PR number resolves against the current Git repository. `run --pr [host/]owner/repo#N` is an internal pane command; `--once` is useful for controlled diagnostics.
 
+## Branch synchronization
+
+Before every run, a clean managed worktree is fast-forwarded to the latest pushed head commit and the PR base branch (`origin/<baseRefName>`, e.g. `main`) is automatically merged into the head branch. When the merge introduces new commits they are pushed straight to the PR head ref, so the pull request stays continuously up to date with its base. Fast-forwards, real merges, and "already merged" states are all handled; a merge that conflicts is aborted and left for the dispatched agent to resolve rather than blocking the run. If the worktree has uncommitted local changes, synchronization (and the base merge) is skipped for that run. The chosen action is recorded in the run prompt and `runs/<run-id>/meta.json`.
+
 ## GitHub Enterprise Server
 
 Authenticate the host with `gh`, then pass its PR URL:

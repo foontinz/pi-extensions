@@ -172,10 +172,11 @@ async function watch(input: string, io: CliIo): Promise<void> {
 
   let state = await loadPrState(key, app);
   if (!state) {
-    state = createPrState({ key, url: resolved.url, headRefName: resolved.headRefName });
+    state = createPrState({ key, url: resolved.url, headRefName: resolved.headRefName, baseRefName: resolved.baseRefName });
   } else {
     state.url = resolved.url;
     state.headRefName = resolved.headRefName;
+    state.baseRefName = resolved.baseRefName;
   }
   await savePrState(state, app);
 

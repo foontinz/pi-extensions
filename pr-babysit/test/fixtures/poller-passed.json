@@ -10,6 +10,7 @@
     "isDraft": false,
     "mergeable": "MERGEABLE",
     "mergeStateStatus": "CLEAN",
+    "baseRefName": "main",
     "headRefName": "feature/polling",
     "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "headRepository": { "nameWithOwner": "foontinz/claude-code-plugins" },

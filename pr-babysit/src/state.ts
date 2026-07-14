@@ -60,6 +60,7 @@ export interface PrState {
   repoRoot: string | null;
   worktreePath: string | null;
   headRefName: string | null;
+  baseRefName: string | null;
   status: PrStatus;
   createdAt: string;
   updatedAt: string;
@@ -89,6 +90,7 @@ export interface InitialPrState {
   repoRoot?: string | null;
   worktreePath?: string | null;
   headRefName?: string | null;
+  baseRefName?: string | null;
 }
 
 const STATUSES = new Set<PrStatus>(["initializing", "watching", "running", "error"]);
@@ -230,6 +232,7 @@ export function createPrState(input: InitialPrState, now = new Date()): PrState 
     repoRoot: input.repoRoot ?? null,
     worktreePath: input.worktreePath ?? null,
     headRefName: input.headRefName ?? null,
+    baseRefName: input.baseRefName ?? null,
     status: "initializing",
     createdAt: at,
     updatedAt: at,
@@ -284,6 +287,7 @@ export function parsePrState(value: unknown, expectedKey?: string): PrState {
     repoRoot: nullableString(state.repoRoot, "state.repoRoot"),
     worktreePath: nullableString(state.worktreePath, "state.worktreePath"),
     headRefName: nullableString(state.headRefName, "state.headRefName"),
+    baseRefName: nullableString(state.baseRefName, "state.baseRefName"),
     status,
     createdAt: timestamp(state.createdAt, "state.createdAt"),
     updatedAt: timestamp(state.updatedAt, "state.updatedAt"),

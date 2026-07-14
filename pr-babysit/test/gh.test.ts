@@ -16,6 +16,7 @@ const rawPr = {
   isDraft: false,
   mergeable: "MERGEABLE",
   mergeStateStatus: "CLEAN",
+  baseRefName: "main",
   headRefName: "feature",
   headRefOid: "abc123",
   headRepository: { nameWithOwner: "Owner/Repo" },

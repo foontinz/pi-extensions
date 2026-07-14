@@ -317,6 +317,7 @@ export async function pollOnce(
   nextState.cursors = diff.cursors;
   nextState.url = snapshot.pr.url;
   nextState.headRefName = snapshot.pr.headRefName;
+  nextState.baseRefName = snapshot.pr.baseRefName;
   nextState.pendingEvents.push(...diff.events);
   nextState.consecutiveErrors = 0;
   nextState.lastError = null;

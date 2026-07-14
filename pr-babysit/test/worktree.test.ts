@@ -14,6 +14,7 @@ import {
   provisionWorktree,
   removeManagedWorktree,
   runCommand,
+  syncWorktreeBeforeRun,
   type CommandRunner,
 } from "../src/worktree.ts";
 
@@ -109,12 +110,62 @@ const pr: PrView = {
   isDraft: false,
   mergeable: "MERGEABLE",
   mergeStateStatus: "CLEAN",
+  baseRefName: "main",
   headRefName: "feature/fix",
   headRefOid: "abc",
   headRepository: "owner/repo",
   reviewDecision: "",
   statusCheckRollup: [],
 };
+
+test("sync automatically merges the base branch into the head branch and pushes it", async () => {
+  const home = await mkdtemp(join(tmpdir(), "pr-babysit-base-merge-"));
+  const app = appPaths(home);
+  await ensureAppDirs(app);
+
+  // Bare origin plus a seed clone so we can populate main and a diverged feature.
+  const origin = await mkdtemp(join(tmpdir(), "pr-babysit-origin-"));
+  await runCommand("git", ["init", "--bare", "-b", "main", origin]);
+  const seed = await mkdtemp(join(tmpdir(), "pr-babysit-seed-"));
+  await runCommand("git", ["clone", origin, seed]);
+  await git(seed, "config", "user.email", "seed@example.com");
+  await git(seed, "config", "user.name", "Seed");
+  await writeFile(join(seed, "base.txt"), "base\n");
+  await git(seed, "add", "base.txt");
+  await git(seed, "commit", "-m", "base");
+  await git(seed, "push", "origin", "main");
+  await git(seed, "checkout", "-b", "feature");
+  await writeFile(join(seed, "feature.txt"), "feature\n");
+  await git(seed, "add", "feature.txt");
+  await git(seed, "commit", "-m", "feature work");
+  await git(seed, "push", "origin", "feature");
+  await git(seed, "checkout", "main");
+  await writeFile(join(seed, "main-only.txt"), "main advance\n");
+  await git(seed, "add", "main-only.txt");
+  await git(seed, "commit", "-m", "advance main");
+  await git(seed, "push", "origin", "main");
+
+  const repoRoot = repoRootPath("owner", "repo", app);
+  await runCommand("git", ["clone", origin, repoRoot]);
+  const worktreePath = prPaths("owner/repo#7", app).worktreePath;
+  await git(repoRoot, "worktree", "add", "--track", "-b", "feature", worktreePath, "origin/feature");
+
+  const state = createPrState({ key: "owner/repo#7", repoRoot, worktreePath, baseRefName: "main" });
+  const sync = await syncWorktreeBeforeRun(state, app);
+
+  assert.equal(sync.dirty, false);
+  assert.equal(sync.base?.branch, "main");
+  assert.equal(sync.base?.action, "merged");
+  assert.equal(sync.base?.pushed, true);
+  // The advance from main is now present locally and pushed to origin/feature.
+  assert.ok((await readFile(join(worktreePath, "main-only.txt"), "utf8")).includes("main advance"));
+  await git(worktreePath, "fetch", "origin");
+  await git(worktreePath, "merge-base", "--is-ancestor", "origin/main", "origin/feature");
+
+  // A second sync is a no-op: base is already contained in the head branch.
+  const again = await syncWorktreeBeforeRun(state, app);
+  assert.equal(again.base?.action, "up_to_date");
+});
 
 test("managed removal refuses dirty worktrees unless explicitly forced", async () => {
   const home = await mkdtemp(join(tmpdir(), "pr-babysit-dirty-remove-"));
