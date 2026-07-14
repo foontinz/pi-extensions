@@ -5,7 +5,7 @@ Standalone TypeScript CLI that watches GitHub pull requests in tmux and dispatch
 ## Installation
 
 ```sh
-cd /Users/barbos/.pi/agent/pr-babysit
+cd path/to/pr-babysit
 npm install
 npm run check
 npm link

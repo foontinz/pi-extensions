@@ -416,8 +416,14 @@ export function recoveryHint(message: string): string {
   if (/config\.json|provider|model/i.test(message)) {
     return "Set valid provider/model fields in ~/.pr-babysitter/config.json, then rerun watch.";
   }
-  if (/\bgh\b|GitHub|rate.?limit|403|authentication/i.test(message)) {
+  if (/must be|must return|Unknown .*state|returned (a|an) (mismatched|unexpected)/i.test(message)) {
+    return "gh returned unexpected data (often an older GitHub Enterprise schema); update `gh`, confirm the PR URL/host, and file an issue with the failing field.";
+  }
+  if (/rate.?limit|403|401|authentication|not logged in|auth/i.test(message)) {
     return "Run `gh auth status`, repair authentication or wait for rate-limit reset, then rerun watch.";
+  }
+  if (/\bgh\b|GitHub/i.test(message)) {
+    return "Verify `gh` is installed and the PR URL/host is reachable, then rerun watch.";
   }
   if (/tmux/i.test(message)) {
     return "Install/start tmux, verify the configured socket, then rerun watch; durable state is retained.";

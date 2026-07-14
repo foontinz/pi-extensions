@@ -55,6 +55,14 @@ test("help documents prerequisites, retained state, and concrete recovery action
   }
   assert.match(recoveryHint("config.json must set provider and model"), /provider\/model/);
   assert.match(recoveryHint("gh pr view failed: HTTP 403"), /gh auth status/);
+  assert.match(
+    recoveryHint("gh pr view.headRepository.nameWithOwner must be a string"),
+    /unexpected data|GitHub Enterprise schema/,
+  );
+  assert.doesNotMatch(
+    recoveryHint("gh pr view.headRepository.nameWithOwner must be a string"),
+    /gh auth status/,
+  );
   assert.match(recoveryHint("worktree has uncommitted changes"), /--force/);
 });
 

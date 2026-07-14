@@ -56,6 +56,22 @@ test("PR URLs and gh metadata resolve to canonical keys", async () => {
   assert.deepEqual(calls[0]?.slice(0, 6), ["pr", "view", "7", "--repo", "github.com/owner/repo", "--json"]);
 });
 
+test("GitHub Enterprise PRs without nameWithOwner fall back to owner/name", async () => {
+  const ghesPr = {
+    ...rawPr,
+    headRepository: { name: "Repo" },
+    headRepositoryOwner: { login: "Owner" },
+  };
+  const runner: GhRunner = async () => jsonResult(ghesPr);
+  const resolved = await new GhClient(runner).resolvePr("OWNER/REPO#7");
+  assert.equal(resolved.headRepository, "owner/repo");
+
+  // When even the owner is missing, fall back to the base repository.
+  const nameOnly = { ...rawPr, headRepository: { name: "OtherRepo" }, headRepositoryOwner: null };
+  const nameOnlyResolved = await new GhClient(async () => jsonResult(nameOnly)).resolvePr("OWNER/REPO#7");
+  assert.equal(nameOnlyResolved.headRepository, "owner/otherrepo");
+});
+
 test("bare PR numbers resolve against the current repository", async () => {
   const calls: string[][] = [];
   const runner: GhRunner = async (args) => {

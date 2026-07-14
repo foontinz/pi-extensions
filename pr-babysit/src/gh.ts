@@ -204,7 +204,7 @@ export function parsePrView(value: unknown, expected?: Partial<PrRef>): PrView {
   const checks = item.statusCheckRollup ?? [];
   if (!Array.isArray(checks) || !checks.every(isRecord)) throw new Error("gh pr view.statusCheckRollup must be an array");
   const headRepository = record(item.headRepository, "gh pr view.headRepository");
-  const headNameWithOwner = string(headRepository.nameWithOwner, "gh pr view.headRepository.nameWithOwner");
+  const headNameWithOwner = resolveHeadNameWithOwner(headRepository, item.headRepositoryOwner, urlRef);
   const headRepositoryRef = parsePrKey(`${urlRef.host}/${headNameWithOwner}#1`);
 
   return {
@@ -221,6 +221,25 @@ export function parsePrView(value: unknown, expected?: Partial<PrRef>): PrView {
     reviewDecision: nullableString(item.reviewDecision, "gh pr view.reviewDecision") ?? "",
     statusCheckRollup: checks,
   };
+}
+
+function resolveHeadNameWithOwner(
+  headRepository: Record<string, unknown>,
+  headRepositoryOwner: unknown,
+  urlRef: PrRef,
+): string {
+  // Newer GitHub returns nameWithOwner directly.
+  const direct = nullableString(headRepository.nameWithOwner, "gh pr view.headRepository.nameWithOwner");
+  if (direct !== null) return direct;
+  // Older GitHub Enterprise Server omits nameWithOwner. Reconstruct it from the
+  // owner + name pair when available, otherwise fall back to the base repo.
+  const name = nullableString(headRepository.name, "gh pr view.headRepository.name");
+  const owner = isRecord(headRepositoryOwner)
+    ? nullableString(headRepositoryOwner.login, "gh pr view.headRepositoryOwner.login")
+    : null;
+  if (name !== null && owner !== null) return `${owner}/${name}`;
+  if (name !== null) return `${urlRef.owner}/${name}`;
+  return `${urlRef.owner}/${urlRef.repo}`;
 }
 
 function parseComment(value: unknown, field: string): ApiComment {
@@ -266,6 +285,7 @@ const PR_VIEW_FIELDS = [
   "headRefName",
   "headRefOid",
   "headRepository",
+  "headRepositoryOwner",
   "reviewDecision",
   "statusCheckRollup",
 ].join(",");
