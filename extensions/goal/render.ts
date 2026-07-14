@@ -1,4 +1,4 @@
-import type { GoalCheckpointV2, GoalLifecycle, GoalPhase } from "./state.ts";
+import type { GoalCheckpointV2, GoalPhase } from "./state.ts";
 
 export interface GoalContextUsage {
   tokens: number | null;
@@ -15,7 +15,19 @@ export interface GoalRenderOptions {
   now?: number;
   /** Maximum code-point width for each returned line. */
   maxWidth?: number;
+  /** Maximum code-point width for model-authored attention detail. */
   nextActionWidth?: number;
+  /** A caller displaying the last valid checkpoint may flag a corrupt newer authority. */
+  corruptState?: boolean;
+}
+
+export type GoalAttentionOwner = "user" | "task" | "machine" | "terminal";
+
+export interface GoalAttention {
+  owner: GoalAttentionOwner;
+  badge: string;
+  detail: string;
+  tone: "accent" | "warning" | "error" | "success" | "muted";
 }
 
 export interface GoalPhaseDisplay {
@@ -72,14 +84,6 @@ export function isInterruptedGoal(checkpoint: GoalCheckpointV2): boolean {
 }
 
 
-function lifecycleLabel(lifecycle: GoalLifecycle): string {
-  return lifecycle.replaceAll("_", " ");
-}
-
-export function formatGoalLifecycle(checkpoint: GoalCheckpointV2): string {
-  return isInterruptedGoal(checkpoint) ? "interrupted" : lifecycleLabel(checkpoint.lifecycle);
-}
-
 function validPercent(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
@@ -111,6 +115,107 @@ export function getGoalNextAction(checkpoint: GoalCheckpointV2): string {
       : "Record the next concrete action.");
 }
 
+function attentionDetail(value: string, options: GoalRenderOptions): string {
+  return truncateOneLine(value, options.nextActionWidth ?? 72);
+}
+
+/** Derive who owns the next action without adding any persisted state. */
+export function getGoalAttention(
+  checkpoint: GoalCheckpointV2,
+  options: GoalRenderOptions = {},
+): GoalAttention {
+  const nextAction = (): string => attentionDetail(getGoalNextAction(checkpoint), options);
+
+  if (options.corruptState || checkpoint.pauseReason === "corrupt_state") {
+    return {
+      owner: "user",
+      badge: "PAUSED — CORRUPT STATE",
+      detail: "run /goal resume to recover or /goal stop to discard",
+      tone: "error",
+    };
+  }
+  if (checkpoint.lifecycle === "failed") {
+    return { owner: "terminal", badge: "FAILED", detail: nextAction(), tone: "error" };
+  }
+  if (checkpoint.lifecycle === "cancelled") {
+    return { owner: "terminal", badge: "CANCELLED", detail: nextAction(), tone: "error" };
+  }
+  if (checkpoint.lifecycle === "succeeded") {
+    return { owner: "terminal", badge: "SUCCEEDED", detail: "", tone: "success" };
+  }
+  if (checkpoint.scheduler.state === "dispatch_pending" || checkpoint.scheduler.state === "run_in_flight") {
+    return { owner: "machine", badge: "WORKING", detail: nextAction(), tone: "accent" };
+  }
+  if (checkpoint.scheduler.state === "compaction_pending" || checkpoint.compaction.state === "pending") {
+    return {
+      owner: "machine",
+      badge: "RECOVERING — COMPACTING",
+      detail: "nothing needed from you",
+      tone: "muted",
+    };
+  }
+  if (checkpoint.lifecycle === "blocked") {
+    const question = [...checkpoint.ledger.openQuestions]
+      .reverse()
+      .find((value) => value.trim().length > 0);
+    return {
+      owner: "user",
+      badge: "WAITING FOR YOU",
+      detail: attentionDetail(question ?? getGoalNextAction(checkpoint), options),
+      tone: "warning",
+    };
+  }
+  if (checkpoint.lifecycle === "waiting_external" && checkpoint.waitFor) {
+    const kind = checkpoint.waitFor.kind;
+    const id = truncateOneLine(checkpoint.waitFor.id, 48);
+    return {
+      owner: "task",
+      badge: `WAITING FOR TASK ${kind} ${id}`,
+      detail: "auto-resumes on completion or failure",
+      tone: "accent",
+    };
+  }
+  if (checkpoint.lifecycle === "waiting_external") {
+    return {
+      owner: "user",
+      badge: "WAITING FOR YOU",
+      detail: attentionDetail(`tell me when done: ${getGoalNextAction(checkpoint)}`, options),
+      tone: "warning",
+    };
+  }
+  if (checkpoint.lifecycle === "verifying_goal" && checkpoint.scheduler.state === "idle") {
+    return {
+      owner: "user",
+      badge: "NEEDS YOUR REVIEW",
+      detail: "accept with /goal done or re-check with /goal verify",
+      tone: "warning",
+    };
+  }
+  if (checkpoint.lifecycle === "paused" || checkpoint.scheduler.state === "recovery_required") {
+    const reason = checkpoint.pauseReason?.replaceAll("_", " ") ?? "recovery required";
+    return {
+      owner: "user",
+      badge: `PAUSED (${reason})`,
+      detail: "run /goal resume",
+      tone: "warning",
+    };
+  }
+  if (checkpoint.lifecycle === "recovering" && checkpoint.scheduler.state === "idle") {
+    return {
+      owner: "machine",
+      badge: "RECOVERING",
+      detail: "auto-continues; nothing needed from you",
+      tone: "muted",
+    };
+  }
+  return { owner: "machine", badge: "WORKING", detail: nextAction(), tone: "accent" };
+}
+
+/** Retained for callers that previously consumed the compact lifecycle label. */
+export function formatGoalLifecycle(checkpoint: GoalCheckpointV2): string {
+  return getGoalAttention(checkpoint).badge.toLowerCase();
+}
+
 function phaseLabel(checkpoint: GoalCheckpointV2, titleLimit: number): string | undefined {
   const phase = getGoalPhaseDisplay(checkpoint);
   if (phase.total === 0) return checkpoint.lifecycle === "planning" ? undefined : "plan pending";
@@ -136,8 +241,9 @@ export function formatGoalStatusLine(
 ): string {
   const width = checkedWidth(options.maxWidth);
   const context = formatContextPercent(goalContextPercent(options));
+  const attention = getGoalAttention(checkpoint, options);
   const line = [
-    `🎯 ${formatGoalLifecycle(checkpoint)}`,
+    `🎯 ${attention.badge}`,
     phaseLabel(checkpoint, 48),
     `run ${checkpoint.budgets.epochRuns}/${checkpoint.budgets.maxEpochRuns}`,
     `ctx ${context}`,
@@ -151,8 +257,8 @@ export function formatGoalWidgetLines(
   options: GoalRenderOptions = {},
 ): string[] {
   const width = checkedWidth(options.maxWidth, 140)!;
-  const header = formatGoalStatusLine(checkpoint, options);
-  const actionLabel = isInterruptedGoal(checkpoint) ? "reconcile" : "next";
-  const action = truncateOneLine(getGoalNextAction(checkpoint), options.nextActionWidth ?? 72);
-  return [bounded(`${header}  ›  ${actionLabel}: ${action}`, width)];
+  const attention = getGoalAttention(checkpoint, options);
+  const header = formatGoalStatusLine(checkpoint, { ...options, maxWidth: undefined });
+  const detail = attention.detail ? `  ›  ${attention.detail}` : "";
+  return [bounded(`${header}${detail}`, width)];
 }

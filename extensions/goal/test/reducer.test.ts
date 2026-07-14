@@ -8,7 +8,9 @@ import {
   type GoalReducerResult,
 } from "../reducer.ts";
 import {
+  GOAL_SNAPSHOT_SOFT_LIMIT,
   createInitialCheckpoint,
+  snapshotByteLength,
   type GoalCheckpointV2,
 } from "../state.ts";
 
@@ -422,6 +424,117 @@ test("human resume, pause, and cancel clear typed wait correlation", () => {
     assert.equal(result.state.waitFor, undefined, action.type);
     assert.notEqual(result.state.lifecycle, "waiting_external", action.type);
   }
+});
+
+test("answer_received continues in the same epoch without laundering budget", () => {
+  for (const lifecycle of ["blocked", "waiting_external"] as const) {
+    const state = waitingExternal();
+    state.lifecycle = lifecycle;
+    if (lifecycle === "blocked") {
+      delete state.waitFor;
+      state.pauseReason = "user";
+      state.ledger.openQuestions = ["Choose staging or production?"];
+    }
+    state.epoch = 4;
+    state.budgets.epochRuns = 3;
+    state.budgets.totalRuns = 9;
+    state.budgets.totalTurns = 21;
+    const before = structuredClone(state);
+    const result = reduceGoal(state, {
+      type: "answer_received",
+      nextAction: "Reconcile using staging.",
+      now: 130,
+      eventId: `event_answer_${lifecycle}`,
+    });
+    expectPersistFirst(result);
+    assert.equal(result.state.lifecycle, "recovering");
+    assert.equal(result.state.epoch, 4);
+    assert.equal(result.state.budgets.epochRuns, 3);
+    assert.equal(result.state.budgets.totalRuns, 9);
+    assert.equal(result.state.budgets.totalTurns, 21);
+    assert.equal(result.state.waitFor, undefined);
+    assert.equal(result.state.pauseReason, undefined);
+    assert.equal(result.state.ledger.nextAction, "Reconcile using staging.");
+    assert.deepEqual(state, before, "answer receipt is immutable");
+  }
+
+  for (const lifecycle of ["planning", "running", "recovering", "paused", "succeeded"] as const) {
+    const state = initial();
+    state.lifecycle = lifecycle;
+    const result = reduceGoal(state, {
+      type: "answer_received",
+      nextAction: "Not valid here.",
+      now: 130,
+      eventId: `event_invalid_answer_${lifecycle}`,
+    });
+    expectFailure(result, "invalid_transition");
+  }
+  for (const nextAction of ["", "   ", "x".repeat(4_001)]) {
+    const state = waitingExternal();
+    expectFailure(reduceGoal(state, {
+      type: "answer_received",
+      nextAction,
+      now: 130,
+      eventId: "event_invalid_answer_text",
+    }), "invalid_transition");
+  }
+  const leased = waitingExternal();
+  leased.scheduler = {
+    state: "dispatch_pending",
+    dispatch: {
+      dispatchId: "dispatch_answer_lease",
+      goalId: leased.goalId,
+      epoch: leased.epoch,
+      revision: leased.revision,
+      runId: "run_answer_lease",
+      createdAt: 120,
+    },
+  };
+  leased.budgets.epochRuns = 1;
+  leased.budgets.totalRuns = 1;
+  expectFailure(reduceGoal(leased, {
+    type: "answer_received", nextAction: "answer", now: 130, eventId: "event_answer_lease",
+  }), "invalid_transition");
+  const compacting = waitingExternal();
+  compacting.scheduler = { state: "compaction_pending" };
+  compacting.compaction = { generation: 1, state: "pending", requestedAtRevision: compacting.revision };
+  expectFailure(reduceGoal(compacting, {
+    type: "answer_received", nextAction: "answer", now: 130, eventId: "event_answer_compaction",
+  }), "invalid_transition");
+
+  const large = waitingExternal();
+  for (let index = 0; index < 128 && (snapshotByteLength(large) ?? 0) < 60 * 1024; index++) {
+    large.ledger.recentProgress.push(`history-${index}-` + "界".repeat(190));
+  }
+  assert.ok((snapshotByteLength(large) ?? 0) > GOAL_SNAPSHOT_SOFT_LIMIT);
+  const compactedAnswer = reduceGoal(large, {
+    type: "answer_received",
+    nextAction: "Apply the answer after compacting historical progress.",
+    now: 135,
+    eventId: "event_answer_compacted",
+  });
+  expectPersistFirst(compactedAnswer);
+  assert.ok((snapshotByteLength(compactedAnswer.state) ?? Infinity) <= GOAL_SNAPSHOT_SOFT_LIMIT);
+  assert.equal(compactedAnswer.state.ledger.recentProgress.filter((item) => item.startsWith("Snapshot compacted:")).length, 1);
+
+  const exhausted = waitingExternal("background_task", "bg_answer_budget", { maxEpochRuns: 1 });
+  exhausted.budgets.epochRuns = 1;
+  exhausted.budgets.totalRuns = 1;
+  const paused = reduceGoal(exhausted, {
+    type: "answer_received",
+    nextAction: "Use the supplied credential after the budget resets.",
+    now: 140,
+    eventId: "event_answer_budget",
+  });
+  expectPersistFirst(paused);
+  assert.equal(paused.state.lifecycle, "paused");
+  assert.equal(paused.state.pauseReason, "budget");
+  assert.equal(paused.state.epoch, exhausted.epoch);
+  assert.equal(paused.state.budgets.epochRuns, 1);
+  assert.match(paused.state.ledger.nextAction ?? "", /supplied credential/);
+  expectFailure(reduceGoal(paused.state, {
+    type: "answer_received", nextAction: "Try laundering again", now: 141, eventId: "event_answer_again",
+  }), "invalid_transition");
 });
 
 test("a failed external dependency diagnoses without changing criteria, while exhausted budget pauses", () => {

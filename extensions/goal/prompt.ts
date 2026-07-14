@@ -176,9 +176,10 @@ function renderPacket(
     "- Supply a concise summary and an exact nextAction unless completion is being claimed. Record only durable summaries, decisions, and evidence references—never raw history, logs, or artifact contents.",
     "- If the tool rejects a stale revision, stop changing goal state and reconcile from the newest checkpoint; never retry using guessed state.",
     "- phase_candidate_complete and goal_candidate_complete are claims only. They enter verification; they do not mark success. Never claim verification without observed evidence or explicit user acceptance.",
-    "- Use blocked only for a concrete user decision or unavailable prerequisite, and state the precise question. Use waiting_external only for an already started dependency.",
-    "- When waiting on one owned enhanced-bash task, pass waitFor={kind:\"background_task\",id:\"<exact bg_/mon_ id>\"}; for one owned Workflow, pass waitFor={kind:\"workflow\",id:\"<exact runId>\"}. Wait on one owned task at a time. Use mon_ only for a finite watcher that exits; monitor output lines are not completion. Subagent waits are unavailable until typed completion metadata exists.",
-    "- Omit waitFor for human or unidentified external dependencies. Matching typed terminal metadata after the checkpoint wakes the goal automatically: do not poll, sleep, launch a duplicate continuation, call goal_resume from task output, or claim resumption in prose.",
+    "- Use blocked only for a concrete user decision or user-performed prerequisite. Include the exact question in openQuestions or the exact requested action in nextAction.",
+    "- Use typed waiting_external only for one already-started owned enhanced-bash task or Workflow: pass waitFor={kind:\"background_task\",id:\"<exact bg_/mon_ id>\"} or waitFor={kind:\"workflow\",id:\"<exact runId>\"}. Use mon_ only for a finite watcher that exits; monitor output lines are not completion. Subagent waits are unavailable until typed completion metadata exists.",
+    "- Use untyped waiting_external only when no typed callback exists, such as a person or third-party system. Omit waitFor and provide nextAction naming the dependency and exactly how completion will be recognized or reported.",
+    "- Never use waiting_external for scheduler acceptance, phase acceptance, verification acceptance, or internal bookkeeping. Matching typed terminal metadata after the checkpoint wakes the goal automatically: do not poll, sleep, launch a duplicate continuation, call goal_resume from task output, or claim that a typed wait resumed from prose alone.",
     "- Do not use legacy text sentinels as a substitute for goal_checkpoint. Do not dispatch another continuation yourself.",
     "</goal_working_packet>",
   ].join("\n");

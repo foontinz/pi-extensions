@@ -4,6 +4,7 @@ import { Type, type Static } from "typebox";
 import { Check } from "typebox/value";
 import {
   GOAL_BOUNDS,
+  GOAL_SNAPSHOT_SOFT_LIMIT,
   advanceCheckpoint,
   isTerminalLifecycle,
   type GoalCheckpointV2,
@@ -140,6 +141,44 @@ function keepNewestById<T extends { id: string }>(values: readonly T[], limit: n
   return [...byId.values()].slice(-limit);
 }
 
+function keepEvidenceWithActiveProof(
+  checkpoint: GoalCheckpointV2,
+  values: readonly GoalEvidence[],
+): GoalEvidence[] {
+  const byId = new Map<string, GoalEvidence>();
+  for (const value of values) {
+    byId.delete(value.id);
+    byId.set(value.id, value);
+  }
+  const deduplicated = [...byId.values()];
+  const protectedCriteria = [
+    ...checkpoint.acceptanceCriteria,
+    ...checkpoint.phases
+      .filter((phase) => phase.id === checkpoint.activePhaseId
+        || (phase.status !== "completed" && phase.status !== "skipped"))
+      .flatMap((phase) => phase.criteria),
+  ];
+  const protectedCriterionIds = new Set(protectedCriteria.map((criterion) => criterion.id));
+  const protectedEvidenceIds = new Set(protectedCriteria.flatMap((criterion) => criterion.evidenceIds ?? []));
+  for (const evidence of deduplicated) {
+    if (evidence.criterionId && protectedCriterionIds.has(evidence.criterionId)) {
+      protectedEvidenceIds.add(evidence.id);
+    }
+  }
+  const protectedCount = deduplicated.filter((item) => protectedEvidenceIds.has(item.id)).length;
+  if (protectedCount > GOAL_BOUNDS.evidence) {
+    fail("active acceptance evidence exceeds the bounded evidence ledger");
+  }
+  const historicalSlots = GOAL_BOUNDS.evidence - protectedCount;
+  const retainedHistorical = new Set(
+    historicalSlots === 0 ? []
+      : deduplicated.filter((item) => !protectedEvidenceIds.has(item.id))
+        .slice(-historicalSlots)
+        .map((item) => item.id),
+  );
+  return deduplicated.filter((item) => protectedEvidenceIds.has(item.id) || retainedHistorical.has(item.id));
+}
+
 function criteriaFromInput(
   values: readonly Static<typeof CriterionInput>[],
   limit: number,
@@ -237,6 +276,17 @@ function validateAction(checkpoint: GoalCheckpointV2, params: GoalCheckpointPara
   if (params.action === "phase_candidate_complete" && params.phaseId === undefined) {
     fail("phase_candidate_complete requires phaseId");
   }
+  if (params.action === "blocked") {
+    const hasQuestion = params.openQuestions?.some((question) => cleanText(question).length > 0) ?? false;
+    const hasNextAction = params.nextAction !== undefined && cleanText(params.nextAction).length > 0;
+    if (!hasQuestion && !hasNextAction) {
+      fail("blocked requires a concrete user question in openQuestions or nextAction");
+    }
+  }
+  if (params.action === "waiting_external" && params.waitFor === undefined
+    && (params.nextAction === undefined || !cleanText(params.nextAction))) {
+    fail("untyped waiting_external requires nextAction naming the dependency and completion condition");
+  }
   if (params.waitFor !== undefined && params.action !== "waiting_external") {
     fail("waitFor may only be used with waiting_external");
   }
@@ -313,7 +363,8 @@ export function applyGoalCheckpoint(
   const eventId = currentRun.eventId ?? deterministicEventId(checkpoint, params, currentRun);
   if (eventId === checkpoint.eventId) fail("eventId must identify a new checkpoint");
 
-  return advanceCheckpoint(checkpoint, (draft) => {
+  try {
+    return advanceCheckpoint(checkpoint, (draft) => {
     const summary = cleanText(params.summary);
     const phaseId = params.phaseId === undefined ? undefined : cleanText(params.phaseId);
 
@@ -380,8 +431,8 @@ export function applyGoalCheckpoint(
       runId: currentRun.runId,
       ...(evidence.digest !== undefined ? { digest: cleanText(evidence.digest) } : {}),
     }));
-    draft.evidence = keepNewestById([...draft.evidence, ...newEvidence], GOAL_BOUNDS.evidence);
-    attachEvidenceIds(draft, newEvidence);
+    draft.evidence = keepEvidenceWithActiveProof(draft, [...draft.evidence, ...newEvidence]);
+    attachEvidenceIds(draft, newEvidence.filter((item) => draft.evidence.some((kept) => kept.id === item.id)));
 
     if (params.openQuestions !== undefined) {
       draft.ledger.openQuestions = uniqueStrings(params.openQuestions, GOAL_BOUNDS.openQuestions);
@@ -412,6 +463,12 @@ export function applyGoalCheckpoint(
         draft.lifecycle = "waiting_external";
         break;
     }
-    draft.pauseReason = undefined;
-  }, { now, eventId });
+      draft.pauseReason = undefined;
+    }, { now, eventId, compactSnapshotToBytes: GOAL_SNAPSHOT_SOFT_LIMIT });
+  } catch (cause) {
+    if (cause instanceof Error && cause.message.includes(`checkpoint exceeds ${GOAL_BOUNDS.snapshotBytes} bytes`)) {
+      fail(`checkpoint exceeds ${GOAL_BOUNDS.snapshotBytes} bytes after deterministic compaction; essential active state cannot be removed safely`);
+    }
+    throw cause;
+  }
 }

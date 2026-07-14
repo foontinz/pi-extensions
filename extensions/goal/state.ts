@@ -8,6 +8,7 @@ export const GOAL_CONTROL_MESSAGE = "goal-control";
 export const LEGACY_GOAL_STATE_ENTRY = "goal-state";
 
 export const GOAL_SCHEMA_VERSION = 2 as const;
+export const GOAL_SNAPSHOT_SOFT_LIMIT = 56 * 1024;
 export const MAX_GOAL_SNAPSHOT_BYTES = 64 * 1024;
 
 /** Public limits are shared by command, tool, and persistence validation. */
@@ -429,6 +430,349 @@ function jsonByteLength(value: unknown): number | undefined {
 
 export function snapshotByteLength(value: unknown): number | undefined {
   return jsonByteLength(value);
+}
+
+export interface GoalSnapshotCompactionReport {
+  changed: boolean;
+  bytesBefore: number;
+  bytesAfter: number;
+  droppedEvidence: number;
+  droppedArtifacts: number;
+  droppedDecisions: number;
+  droppedProgress: number;
+  prunedEvidenceLinks: number;
+}
+
+const SNAPSHOT_COMPACTION_MARKER = /^Snapshot compacted: dropped \d+ evidence, \d+ decisions, \d+ artifacts\.$/;
+const TERMINAL_PHASE_STATUSES = new Set<GoalPhaseStatus>(["completed", "skipped"]);
+
+/** Return the longest code-point boundary prefix whose UTF-8 encoding fits. */
+function truncateUtf8(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  let result = "";
+  let bytes = 0;
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + characterBytes > maxBytes) break;
+    result += character;
+    bytes += characterBytes;
+  }
+  return result;
+}
+
+/**
+ * Deterministically slim removable snapshot history. Safety state, active plan
+ * structure, current actions, and acceptance/nonterminal evidence identities
+ * are never removed. The supplied draft is the only value mutated.
+ */
+export function compactGoalSnapshotDraft(
+  draft: GoalCheckpointV2,
+  targetBytes: number = GOAL_SNAPSHOT_SOFT_LIMIT,
+): GoalSnapshotCompactionReport {
+  if (!Number.isSafeInteger(targetBytes) || targetBytes < 1 || targetBytes > MAX_GOAL_SNAPSHOT_BYTES) {
+    throw new RangeError(`snapshot compaction target must be between 1 and ${MAX_GOAL_SNAPSHOT_BYTES} bytes`);
+  }
+  const bytesBefore = jsonByteLength(draft);
+  if (bytesBefore === undefined) throw new TypeError("snapshot is not JSON serializable");
+  const report: GoalSnapshotCompactionReport = {
+    changed: false,
+    bytesBefore,
+    bytesAfter: bytesBefore,
+    droppedEvidence: 0,
+    droppedArtifacts: 0,
+    droppedDecisions: 0,
+    droppedProgress: 0,
+    prunedEvidenceLinks: 0,
+  };
+  const collectionsWithinBounds = (): boolean =>
+    draft.ledger.completedPhaseSummaries.length <= GOAL_BOUNDS.completedPhaseSummaries
+    && draft.ledger.decisions.length <= GOAL_BOUNDS.decisions
+    && draft.ledger.openQuestions.length <= GOAL_BOUNDS.openQuestions
+    && draft.ledger.recentProgress.length <= GOAL_BOUNDS.recentProgress
+    && draft.evidence.length <= GOAL_BOUNDS.evidence
+    && draft.artifacts.length <= GOAL_BOUNDS.artifacts;
+  if (bytesBefore <= targetBytes && collectionsWithinBounds()) return report;
+
+  let changed = false;
+  const markChanged = (): void => {
+    changed = true;
+  };
+  const markerText = (): string =>
+    `Snapshot compacted: dropped ${report.droppedEvidence} evidence, ${report.droppedDecisions} decisions, ${report.droppedArtifacts} artifacts.`;
+  const syncMarker = (): void => {
+    if (!changed) return;
+    const progress = draft.ledger.recentProgress;
+    const ordinary = progress.filter((item) => !SNAPSHOT_COMPACTION_MARKER.test(item));
+    const markerCount = progress.length - ordinary.length;
+    const retained = ordinary.slice(-15);
+    report.droppedProgress += ordinary.length - retained.length + Math.max(0, markerCount - 1);
+    draft.ledger.recentProgress = [...retained, markerText()];
+  };
+  const currentBytes = (): number => {
+    const bytes = jsonByteLength(draft);
+    if (bytes === undefined) throw new TypeError("compacted snapshot is not JSON serializable");
+    return bytes;
+  };
+  const reachedTarget = (): boolean => {
+    syncMarker();
+    return currentBytes() <= targetBytes && collectionsWithinBounds();
+  };
+  const finish = (): GoalSnapshotCompactionReport => {
+    syncMarker();
+    report.changed = changed;
+    report.bytesAfter = currentBytes();
+    return report;
+  };
+  const allCriteria = (): GoalCriterion[] => [
+    ...draft.acceptanceCriteria,
+    ...draft.phases.flatMap((phase) => phase.criteria),
+  ];
+  const pruneMissingEvidenceLinks = (): boolean => {
+    const retainedIds = new Set(draft.evidence.map((item) => item.id));
+    let pruned = 0;
+    for (const criterion of allCriteria()) {
+      if (criterion.evidenceIds === undefined) continue;
+      const retained = criterion.evidenceIds.filter((id) => retainedIds.has(id));
+      pruned += criterion.evidenceIds.length - retained.length;
+      if (retained.length === 0) delete criterion.evidenceIds;
+      else criterion.evidenceIds = retained;
+    }
+    if (pruned === 0) return false;
+    report.prunedEvidenceLinks += pruned;
+    markChanged();
+    return true;
+  };
+  const removeEvidence = (id: string): void => {
+    const index = draft.evidence.findIndex((item) => item.id === id);
+    if (index < 0) return;
+    draft.evidence.splice(index, 1);
+    report.droppedEvidence += 1;
+    markChanged();
+    pruneMissingEvidenceLinks();
+  };
+  const truncateRequired = (
+    value: string,
+    maxBytes: number,
+    apply: (next: string) => void,
+  ): boolean => {
+    const next = truncateUtf8(value, maxBytes);
+    if (next === value || next.trim().length === 0) return false;
+    apply(next);
+    markChanged();
+    return true;
+  };
+
+  // Stage 1: retain only the newest bounded narrative entries. The marker is
+  // installed lazily after the first real mutation and occupies the 16th slot.
+  if (draft.ledger.recentProgress.length > 16) {
+    report.droppedProgress += draft.ledger.recentProgress.length - 16;
+    draft.ledger.recentProgress = draft.ledger.recentProgress.slice(-16);
+    markChanged();
+  }
+  if (draft.ledger.openQuestions.length > 8) {
+    draft.ledger.openQuestions = draft.ledger.openQuestions.slice(-8);
+    markChanged();
+  }
+  if (changed && reachedTarget()) return finish();
+
+  // Stage 2: retain recent decision detail, then recent decision identities.
+  const rationaleBoundary = Math.max(0, draft.ledger.decisions.length - 8);
+  let slimmedRationale = false;
+  for (let index = 0; index < rationaleBoundary; index++) {
+    if (draft.ledger.decisions[index]!.rationale === undefined) continue;
+    delete draft.ledger.decisions[index]!.rationale;
+    slimmedRationale = true;
+    markChanged();
+  }
+  if (slimmedRationale && reachedTarget()) return finish();
+  if (draft.ledger.decisions.length > 32) {
+    report.droppedDecisions += draft.ledger.decisions.length - 32;
+    draft.ledger.decisions = draft.ledger.decisions.slice(-32);
+    markChanged();
+    if (reachedTarget()) return finish();
+  }
+
+  const acceptanceCriteria = draft.acceptanceCriteria;
+  const nonterminalCriteria = draft.phases
+    .filter((phase) => phase.id === draft.activePhaseId || !TERMINAL_PHASE_STATUSES.has(phase.status))
+    .flatMap((phase) => phase.criteria);
+  const criteriaBeforeEvidenceRemoval = allCriteria();
+  const referencedBy = (evidence: GoalEvidence, criteria: readonly GoalCriterion[]): boolean =>
+    criteria.some((criterion) => criterion.id === evidence.criterionId
+      || criterion.evidenceIds?.includes(evidence.id) === true);
+  const evidencePriority = draft.evidence.map((evidence, index) => ({
+    id: evidence.id,
+    index,
+    observedAt: evidence.observedAt,
+    referenced: referencedBy(evidence, criteriaBeforeEvidenceRemoval),
+    protected: referencedBy(evidence, acceptanceCriteria) || referencedBy(evidence, nonterminalCriteria),
+  }));
+  const protectedEvidenceIds = new Set(
+    evidencePriority.filter((item) => item.protected).map((item) => item.id),
+  );
+  const oldestFirst = <T extends { index: number; observedAt: number }>(items: T[]): T[] =>
+    items.sort((left, right) => left.observedAt - right.observedAt || left.index - right.index);
+
+  // Stage 3: discard evidence with no criterion relationship.
+  for (const candidate of oldestFirst(evidencePriority.filter((item) => !item.referenced))) {
+    removeEvidence(candidate.id);
+    if (reachedTarget()) return finish();
+  }
+
+  // Stage 4: completed/skipped-only evidence is historical, never active or
+  // acceptance evidence. Stage 5 cleanup is performed atomically on each drop.
+  for (const candidate of oldestFirst(evidencePriority.filter((item) => item.referenced && !item.protected))) {
+    removeEvidence(candidate.id);
+    if (reachedTarget()) return finish();
+  }
+
+  // Stage 5: also clean pre-existing ghost links deterministically.
+  if (pruneMissingEvidenceLinks() && reachedTarget()) return finish();
+
+  // Stage 6: retain artifacts with an exact ID/path locator in retained evidence.
+  const locatorTokens = (locator: string): string[] => {
+    const values = new Set([locator]);
+    const match = /^(?:entry|session|tool|tool-result|tool_call|artifact|file|command|test|git):(?:\/\/)?(.+)$/i.exec(locator);
+    if (match?.[1]) values.add(match[1]);
+    return [...values];
+  };
+  const referencedArtifacts = new Set<string>();
+  const protectedArtifactLocators = new Set<string>();
+  for (const artifact of draft.artifacts) {
+    for (const evidence of draft.evidence) {
+      const tokens = locatorTokens(evidence.locator);
+      if (!tokens.includes(artifact.id) && !tokens.includes(artifact.path)) continue;
+      referencedArtifacts.add(artifact.id);
+      protectedArtifactLocators.add(evidence.locator);
+    }
+  }
+  const artifactPriority = draft.artifacts
+    .map((artifact, index) => ({ id: artifact.id, index, observedAt: artifact.createdAt }))
+    .filter((item) => !referencedArtifacts.has(item.id));
+  for (const candidate of oldestFirst(artifactPriority)) {
+    const index = draft.artifacts.findIndex((item) => item.id === candidate.id);
+    if (index < 0) continue;
+    draft.artifacts.splice(index, 1);
+    report.droppedArtifacts += 1;
+    markChanged();
+    if (reachedTarget()) return finish();
+  }
+
+  // Stage 7: completed phase narration can be slimmed without changing plan
+  // identity, statuses, dependencies, or criterion identity/status.
+  const completedPhases = draft.phases.filter((phase) =>
+    phase.id !== draft.activePhaseId && TERMINAL_PHASE_STATUSES.has(phase.status));
+  let removedCompletedActions = false;
+  for (const phase of completedPhases) {
+    if (phase.nextAction === undefined) continue;
+    delete phase.nextAction;
+    removedCompletedActions = true;
+    markChanged();
+  }
+  if (removedCompletedActions && reachedTarget()) return finish();
+  let slimmedCompletedSummaries = false;
+  for (const phase of completedPhases) {
+    if (phase.summary !== undefined
+      && truncateRequired(phase.summary, 512, (next) => { phase.summary = next; })) {
+      slimmedCompletedSummaries = true;
+    }
+  }
+  for (const summary of draft.ledger.completedPhaseSummaries) {
+    if (truncateRequired(summary.summary, 512, (next) => { summary.summary = next; })) {
+      slimmedCompletedSummaries = true;
+    }
+  }
+  if (slimmedCompletedSummaries && reachedTarget()) return finish();
+
+  // Stage 8: exhaust lower-value narrative in a stable oldest-first order.
+  while (draft.ledger.recentProgress.some((item) => !SNAPSHOT_COMPACTION_MARKER.test(item))) {
+    const index = draft.ledger.recentProgress.findIndex((item) => !SNAPSHOT_COMPACTION_MARKER.test(item));
+    draft.ledger.recentProgress.splice(index, 1);
+    report.droppedProgress += 1;
+    markChanged();
+    if (reachedTarget()) return finish();
+  }
+  while (draft.ledger.openQuestions.length > 1) {
+    draft.ledger.openQuestions.shift();
+    markChanged();
+    if (reachedTarget()) return finish();
+  }
+  while (draft.ledger.completedPhaseSummaries.length > 0) {
+    draft.ledger.completedPhaseSummaries.shift();
+    markChanged();
+    if (reachedTarget()) return finish();
+  }
+  for (const artifact of draft.artifacts) {
+    if (referencedArtifacts.has(artifact.id)) continue;
+    if (artifact.description !== undefined) {
+      delete artifact.description;
+      markChanged();
+      if (reachedTarget()) return finish();
+    }
+    if (artifact.mediaType !== undefined) {
+      delete artifact.mediaType;
+      markChanged();
+      if (reachedTarget()) return finish();
+    }
+  }
+  for (const phase of completedPhases) {
+    if (phase.summary === undefined) continue;
+    delete phase.summary;
+    markChanged();
+    if (reachedTarget()) return finish();
+  }
+  for (const decision of draft.ledger.decisions) {
+    if (decision.rationale === undefined) continue;
+    delete decision.rationale;
+    markChanged();
+    if (reachedTarget()) return finish();
+  }
+
+  const narrativeLimits = [1_024, 512, 256, 128, 64] as const;
+  const oldDecisions = draft.ledger.decisions.slice(0, Math.max(0, draft.ledger.decisions.length - 8));
+  for (const decision of oldDecisions) {
+    for (const limit of narrativeLimits) {
+      if (truncateRequired(decision.summary, limit, (next) => { decision.summary = next; })
+        && reachedTarget()) return finish();
+    }
+  }
+  for (const phase of completedPhases) {
+    for (const limit of narrativeLimits) {
+      if (truncateRequired(phase.intent, limit, (next) => { phase.intent = next; })
+        && reachedTarget()) return finish();
+      if (truncateRequired(phase.title, limit, (next) => { phase.title = next; })
+        && reachedTarget()) return finish();
+    }
+  }
+  // Criterion descriptions are plan structure, so compact them only after all
+  // lower-risk completed history has been exhausted.
+  for (const phase of completedPhases) {
+    for (const criterion of phase.criteria) {
+      for (const limit of narrativeLimits) {
+        if (truncateRequired(criterion.description, limit, (next) => { criterion.description = next; })
+          && reachedTarget()) return finish();
+      }
+    }
+  }
+  const evidenceOldestFirst = oldestFirst(draft.evidence.map((evidence, index) => ({
+    evidence,
+    index,
+    observedAt: evidence.observedAt,
+  })));
+  for (const item of evidenceOldestFirst) {
+    if (protectedEvidenceIds.has(item.evidence.id)) continue;
+    for (const limit of narrativeLimits) {
+      if (truncateRequired(item.evidence.description, limit, (next) => { item.evidence.description = next; })
+        && reachedTarget()) return finish();
+      if (!protectedArtifactLocators.has(item.evidence.locator)
+        && truncateRequired(item.evidence.locator, limit, (next) => { item.evidence.locator = next; })
+        && reachedTarget()) return finish();
+    }
+  }
+
+  // Stage 9: all remaining fields are essential/protected. Leave an oversized
+  // result for the existing hard validation to reject rather than weakening it.
+  return finish();
 }
 
 export function isSnapshotWithinBounds(value: unknown): boolean {
@@ -974,6 +1318,8 @@ export function cloneCheckpoint(checkpoint: GoalCheckpointV2): GoalCheckpointV2 
 export interface AdvanceCheckpointOptions {
   now?: number;
   eventId?: string;
+  /** Deterministically compact the fully-derived draft before hard validation. */
+  compactSnapshotToBytes?: number;
 }
 
 export type GoalCheckpointMutation =
@@ -1014,6 +1360,9 @@ export function advanceCheckpoint(
   draft.updatedAt = options.now ?? Date.now();
   if (draft.updatedAt < previous.updatedAt) throw new RangeError("updatedAt cannot move backwards");
 
+  if (options.compactSnapshotToBytes !== undefined) {
+    compactGoalSnapshotDraft(draft, options.compactSnapshotToBytes);
+  }
   const valid = validateGoalCheckpointV2(draft);
   if (!valid.ok) throw new RangeError(`Invalid next goal checkpoint: ${valid.error}`);
   return draft;

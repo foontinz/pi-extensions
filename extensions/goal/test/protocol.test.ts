@@ -26,13 +26,16 @@ import {
 import {
   formatGoalStatusLine,
   formatGoalWidgetLines,
+  getGoalAttention,
   getGoalNextAction,
   isInterruptedGoal,
 } from "../render.ts";
 import {
   GOAL_CHECKPOINT_TOOL,
   GOAL_CONTROL_MESSAGE,
+  GOAL_SNAPSHOT_SOFT_LIMIT,
   createInitialCheckpoint,
+  snapshotByteLength,
   type GoalCheckpointV2,
   type GoalCriterion,
   type GoalEvidence,
@@ -297,6 +300,133 @@ test("goal_checkpoint records one typed external wait and clears it on every oth
     () => applyGoalCheckpoint(plan, multipleWaits as unknown as GoalCheckpointParams, run(121)),
     /wait on one task at a time or consolidate/,
   );
+});
+
+test("blocked and untyped waits require a concrete user-owned action", () => {
+  const initial = checkpointInFlight();
+  const plan = applyGoalCheckpoint(initial, {
+    action: "set_plan",
+    expectedRevision: initial.revision,
+    summary: "Established actionable-wait coverage",
+    acceptanceCriteria: [{ id: "accept-wait", description: "The dependency resolves" }],
+    phases: [{
+      id: "phase-wait",
+      title: "Wait actionably",
+      intent: "Record only concrete waits",
+      criteria: [{ id: "criterion-wait", description: "The wait is actionable" }],
+    }],
+  }, run(110, "event-actionable-plan"));
+  const before = structuredClone(plan);
+
+  assert.throws(() => applyGoalCheckpoint(plan, params(plan, {
+    action: "blocked",
+    summary: "Need user input",
+  }), run(120, "event-vague-block")), /blocked requires a concrete user question/);
+  assert.throws(() => applyGoalCheckpoint(plan, params(plan, {
+    action: "blocked",
+    summary: "Need user input",
+    openQuestions: ["   "],
+  }), run(120, "event-empty-block")), /blocked requires a concrete user question/);
+  assert.throws(() => applyGoalCheckpoint(plan, params(plan, {
+    action: "waiting_external",
+    summary: "Waiting vaguely",
+  }), run(120, "event-vague-wait")), /untyped waiting_external requires nextAction/);
+  assert.throws(() => applyGoalCheckpoint(plan, params(plan, {
+    action: "waiting_external",
+    summary: "Waiting vaguely",
+    nextAction: "   ",
+  }), run(120, "event-empty-wait")), /untyped waiting_external requires nextAction/);
+  assert.deepEqual(plan, before, "rejected wait reports are immutable");
+
+  const question = applyGoalCheckpoint(plan, params(plan, {
+    action: "blocked",
+    summary: "Need an environment choice",
+    openQuestions: ["Deploy to staging or production?"],
+  }), run(120, "event-question-block"));
+  assert.equal(question.lifecycle, "blocked");
+  const action = applyGoalCheckpoint(plan, params(plan, {
+    action: "blocked",
+    summary: "Need credential setup",
+    nextAction: "Create the deploy credential and report when login succeeds.",
+  }), run(120, "event-action-block"));
+  assert.equal(action.lifecycle, "blocked");
+  const untyped = applyGoalCheckpoint(plan, params(plan, {
+    action: "waiting_external",
+    summary: "Awaiting third-party review",
+    nextAction: "Wait for the vendor review and tell me when its status becomes approved.",
+  }), run(120, "event-action-wait"));
+  assert.equal(untyped.lifecycle, "waiting_external");
+  assert.equal(untyped.waitFor, undefined);
+  const typedWithoutNext = applyGoalCheckpoint(plan, params(plan, {
+    action: "waiting_external",
+    summary: "Started the workflow",
+    waitFor: { kind: "workflow", id: "workflow-123" },
+  }), run(120, "event-typed-wait"));
+  assert.deepEqual(typedWithoutNext.waitFor, { kind: "workflow", id: "workflow-123" });
+});
+
+test("goal_checkpoint compacts historical snapshot growth before hard validation", () => {
+  const initial = checkpointInFlight();
+  const plan = applyGoalCheckpoint(initial, {
+    action: "set_plan",
+    expectedRevision: initial.revision,
+    summary: "Established compaction coverage",
+    acceptanceCriteria: [{ id: "accept-compact", description: "Active proof survives" }],
+    phases: [{
+      id: "phase-compact",
+      title: "Compact checkpoint",
+      intent: "Record progress without exceeding the snapshot bound",
+      criteria: [{ id: "criterion-compact", description: "Checkpoint succeeds" }],
+    }],
+  }, run(110, "event-compaction-plan"));
+  for (let index = 0; index < 128 && (snapshotByteLength(plan) ?? 0) < 60 * 1024; index++) {
+    plan.ledger.recentProgress.push(`historical-${index}-` + "界".repeat(190));
+  }
+  assert.ok((snapshotByteLength(plan) ?? 0) > GOAL_SNAPSHOT_SOFT_LIMIT);
+  const before = structuredClone(plan);
+  const compacted = applyGoalCheckpoint(plan, params(plan, {
+    phaseId: "phase-compact",
+    summary: "Recorded one more bounded result",
+    nextAction: "Verify the compacted checkpoint.",
+  }), run(120, "event-compacted-progress"));
+  assert.ok((snapshotByteLength(compacted) ?? Infinity) <= GOAL_SNAPSHOT_SOFT_LIMIT);
+  assert.equal(compacted.goalId, plan.goalId);
+  assert.equal(compacted.scheduler.activeRun?.runId, plan.scheduler.activeRun?.runId);
+  assert.equal(compacted.ledger.recentProgress.filter((item) => item.startsWith("Snapshot compacted:")).length, 1);
+  assert.deepEqual(plan, before, "checkpoint application remains immutable while compacting");
+});
+
+test("a full evidence ledger never evicts active acceptance proof", () => {
+  const initial = checkpointInFlight();
+  const plan = applyGoalCheckpoint(initial, {
+    action: "set_plan",
+    expectedRevision: initial.revision,
+    summary: "Established evidence retention coverage",
+    acceptanceCriteria: [{ id: "accept-proof", description: "Proof remains", evidenceIds: ["e0"] }],
+    phases: [{
+      id: "phase-proof",
+      title: "Retain proof",
+      intent: "Add history without dropping active evidence",
+      criteria: [{ id: "phase-proof-criterion", description: "History is bounded" }],
+    }],
+  }, run(110, "event-evidence-plan"));
+  plan.evidence = Array.from({ length: 512 }, (_, index) => ({
+    id: `e${index}`,
+    ...(index === 0 ? { criterionId: "accept-proof" } : {}),
+    kind: "command" as const,
+    description: "x",
+    locator: `c${index}`,
+    observedAt: 100 + index,
+    runId: "run-1",
+  }));
+  assert.ok((snapshotByteLength(plan) ?? Infinity) < 64 * 1024);
+  const next = applyGoalCheckpoint(plan, params(plan, {
+    phaseId: "phase-proof",
+    summary: "Added one newest historical observation",
+    evidence: [{ id: "new-history", kind: "command", description: "new", locator: "new" }],
+  }), run(120, "event-evidence-retained"));
+  assert.ok(next.evidence.some((item) => item.id === "e0"));
+  assert.ok(next.acceptanceCriteria[0]!.evidenceIds?.includes("e0"));
 });
 
 test("working packets are deterministic, bounded, complete, and exclude artifact contents", () => {
@@ -615,6 +745,84 @@ test("evidence kind semantics and artifact verification are fail-closed", () => 
   }).verified.length, 1, "an adapter-observed digest may support evidence");
 });
 
+test("attention ownership is explicit and shared by compact renderers", () => {
+  const base = createInitialCheckpoint("Render ownership safely", {
+    now: 10,
+    goalId: "INTERNAL_GOAL_SENTINEL",
+    eventId: "event-attention",
+  });
+  base.ledger.nextAction = "Continue the current action\nwithout leaking control state.";
+  const cases: Array<{
+    name: string;
+    mutate: (value: GoalCheckpointV2) => void;
+    owner: "user" | "task" | "machine" | "terminal";
+    badge: RegExp;
+    detail: RegExp;
+  }> = [
+    { name: "planning", mutate: () => {}, owner: "machine", badge: /WORKING/, detail: /Continue/ },
+    {
+      name: "blocked",
+      mutate: (value) => { value.lifecycle = "blocked"; value.ledger.openQuestions = ["Choose staging\nor production?"]; },
+      owner: "user", badge: /WAITING FOR YOU/, detail: /Choose staging or production/,
+    },
+    {
+      name: "typed wait",
+      mutate: (value) => { value.lifecycle = "waiting_external"; value.waitFor = { kind: "workflow", id: "wf\n123" }; },
+      owner: "task", badge: /WAITING FOR TASK workflow wf 123/, detail: /auto-resumes/,
+    },
+    {
+      name: "untyped wait",
+      mutate: (value) => { value.lifecycle = "waiting_external"; value.ledger.nextAction = "Report when review is approved."; },
+      owner: "user", badge: /WAITING FOR YOU/, detail: /tell me when done/,
+    },
+    {
+      name: "recovering",
+      mutate: (value) => { value.lifecycle = "recovering"; },
+      owner: "machine", badge: /^RECOVERING$/, detail: /nothing needed/,
+    },
+    {
+      name: "compacting",
+      mutate: (value) => {
+        value.lifecycle = "recovering";
+        value.scheduler = { state: "compaction_pending" };
+        value.compaction = { generation: 1, state: "pending", requestedAtRevision: value.revision };
+      },
+      owner: "machine", badge: /RECOVERING — COMPACTING/, detail: /nothing needed/,
+    },
+    {
+      name: "review",
+      mutate: (value) => { value.lifecycle = "verifying_goal"; },
+      owner: "user", badge: /NEEDS YOUR REVIEW/, detail: /\/goal done.*\/goal verify/,
+    },
+    {
+      name: "paused",
+      mutate: (value) => { value.lifecycle = "paused"; value.pauseReason = "interrupted"; },
+      owner: "user", badge: /PAUSED \(interrupted\)/, detail: /\/goal resume/,
+    },
+    { name: "failed", mutate: (value) => { value.lifecycle = "failed"; }, owner: "terminal", badge: /FAILED/, detail: /Continue/ },
+    { name: "cancelled", mutate: (value) => { value.lifecycle = "cancelled"; }, owner: "terminal", badge: /CANCELLED/, detail: /Continue/ },
+    { name: "succeeded", mutate: (value) => { value.lifecycle = "succeeded"; }, owner: "terminal", badge: /SUCCEEDED/, detail: /^$/ },
+  ];
+
+  for (const item of cases) {
+    const checkpoint = structuredClone(base);
+    item.mutate(checkpoint);
+    const attention = getGoalAttention(checkpoint, { nextActionWidth: 100 });
+    assert.equal(attention.owner, item.owner, item.name);
+    assert.match(attention.badge, item.badge, item.name);
+    assert.match(attention.detail, item.detail, item.name);
+    assert.doesNotMatch(attention.badge + attention.detail, /[\n\r\u0000]/, item.name);
+    const rendered = `${formatGoalStatusLine(checkpoint)} ${formatGoalWidgetLines(checkpoint)[0]}`;
+    assert.match(rendered, new RegExp(attention.badge.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), item.name);
+    assert.doesNotMatch(rendered, /INTERNAL_GOAL_SENTINEL|run-internal|dispatch-internal|revision/i, item.name);
+  }
+
+  const corrupt = getGoalAttention(base, { corruptState: true });
+  assert.equal(corrupt.owner, "user");
+  assert.equal(corrupt.tone, "error");
+  assert.match(corrupt.badge, /CORRUPT STATE/);
+});
+
 test("interrupted rendering stays compact and makes reconciliation explicit with unknown context", () => {
   const checkpoint = createInitialCheckpoint("Recover interrupted work", {
     now: 100,
@@ -634,7 +842,7 @@ test("interrupted rendering stays compact and makes reconciliation explicit with
   const status = formatGoalStatusLine(checkpoint, {
     contextUsage: { tokens: null, contextWindow: 128_000, percent: 95 },
   });
-  assert.match(status, /🎯 interrupted/);
+  assert.match(status, /🎯 PAUSED \(interrupted\)/);
   assert.match(status, /ctx \?/);
 
   const lines = formatGoalWidgetLines(checkpoint, {
@@ -642,7 +850,7 @@ test("interrupted rendering stays compact and makes reconciliation explicit with
     contextUsage: { tokens: null, contextWindow: 128_000 },
   });
   assert.equal(lines.length, 1);
-  assert.match(lines[0]!, /🎯 interrupted/);
-  assert.match(lines[0]!, /reconcile: Reconcile current files/);
+  assert.match(lines[0]!, /🎯 PAUSED \(interrupted\)/);
+  assert.match(lines[0]!, /run \/goal resume/);
   assert.ok(lines.every((line) => Array.from(line).length <= 100));
 });

@@ -5,9 +5,11 @@ import {
   GOAL_CHECKPOINT_ENTRY,
   GOAL_CHECKPOINT_TOOL,
   GOAL_SCHEMA_VERSION,
+  GOAL_SNAPSHOT_SOFT_LIMIT,
   LEGACY_GOAL_STATE_ENTRY,
   MAX_GOAL_SNAPSHOT_BYTES,
   advanceCheckpoint,
+  compactGoalSnapshotDraft,
   cloneCheckpoint,
   createInitialCheckpoint,
   goalProgressHash,
@@ -237,6 +239,23 @@ test("waitFor round-trips strictly, remains optional, and is confined to waiting
     waitFor: { kind: "workflow", id: "workflow_1" },
   }), /requires waiting_external/);
 
+  const legacyVagueBlocked = checkpoint({ lifecycle: "blocked" });
+  legacyVagueBlocked.ledger.openQuestions = [];
+  delete legacyVagueBlocked.ledger.nextAction;
+  const legacyVagueWait = checkpoint({ lifecycle: "waiting_external" });
+  legacyVagueWait.ledger.openQuestions = [];
+  delete legacyVagueWait.ledger.nextAction;
+  for (const legacy of [legacyVagueBlocked, legacyVagueWait]) {
+    assert.equal(validateGoalCheckpointV2(legacy).ok, true, "new actionable-wait validation does not invalidate history");
+    const hydrated = hydrateGoalState([{
+      type: "custom",
+      id: `entry-${legacy.lifecycle}`,
+      customType: GOAL_CHECKPOINT_ENTRY,
+      data: legacy,
+    }]);
+    assert.equal(hydrated.status, "ok");
+  }
+
   const paused = advanceCheckpoint(
     checkpoint({ lifecycle: "waiting_external", waitFor: { kind: "background_task", id: "bg_003" } }),
     { lifecycle: "paused", pauseReason: "user" },
@@ -319,6 +338,159 @@ test("measures UTF-8 JSON bytes and enforces the inclusive 64 KiB snapshot ceili
   assert.equal(snapshotByteLength(cyclic), undefined);
   assert.equal(isSnapshotWithinBounds(cyclic), false);
   assertInvalid(cyclic, /not JSON serializable/);
+});
+
+test("snapshot compaction is deterministic, idempotent, and preserves active proof", () => {
+  const underTarget = checkpoint();
+  const underJson = JSON.stringify(underTarget);
+  const noOp = compactGoalSnapshotDraft(underTarget);
+  assert.equal(noOp.changed, false);
+  assert.equal(JSON.stringify(underTarget), underJson);
+
+  const conciseOverflow = checkpoint();
+  conciseOverflow.ledger.recentProgress = Array.from({ length: GOAL_BOUNDS.recentProgress + 1 }, (_, index) => `p${index}`);
+  assert.ok((snapshotByteLength(conciseOverflow) ?? Infinity) < GOAL_SNAPSHOT_SOFT_LIMIT);
+  const overflowReport = compactGoalSnapshotDraft(conciseOverflow);
+  assert.equal(overflowReport.changed, true);
+  assert.ok(conciseOverflow.ledger.recentProgress.length <= 16);
+  assert.equal(validateGoalCheckpointV2(conciseOverflow).ok, true);
+
+  const makeLarge = (): GoalCheckpointV2 => {
+    const value = checkpoint();
+    value.ledger.recentProgress = Array.from({ length: 30 }, (_, index) => `progress-${index}-` + "🙂".repeat(180));
+    value.ledger.openQuestions = Array.from({ length: 12 }, (_, index) => `question-${index}-` + "界".repeat(120));
+    value.ledger.decisions = Array.from({ length: 40 }, (_, index) => ({
+      id: `decision_${index}`,
+      summary: `summary-${index}-` + "s".repeat(280),
+      rationale: `rationale-${index}-` + "r".repeat(280),
+      madeAt: 1_000 + index,
+      runId: "run_1",
+    }));
+    value.acceptanceCriteria[0]!.evidenceIds = ["evidence_accept", "ghost_evidence"];
+    value.phases[0]!.criteria[0]!.evidenceIds = ["evidence_active"];
+    value.evidence = [
+      {
+        id: "evidence_accept", criterionId: "criterion_1", kind: "test",
+        description: "accept-" + "A".repeat(2_000), locator: "test:acceptance",
+        observedAt: 1_900, runId: "run_1",
+      },
+      {
+        id: "evidence_active", criterionId: "phase_criterion_1", kind: "file",
+        description: "active-" + "界".repeat(700), locator: "file:/tmp/active.json",
+        observedAt: 1_901, runId: "run_1",
+      },
+      ...Array.from({ length: 16 }, (_, index) => ({
+        id: `evidence_unreferenced_${index}`,
+        kind: "command" as const,
+        description: `old-${index}-` + "x".repeat(900),
+        locator: `command:old-${index}`,
+        observedAt: 1_000 + index,
+        runId: "run_1",
+      })),
+    ];
+    value.artifacts = [
+      {
+        id: "artifact_active", path: "/tmp/active.json", digest: "sha256:active",
+        description: "must survive byte-for-byte", createdAt: 1_900, runId: "run_1",
+      },
+      ...Array.from({ length: 12 }, (_, index) => ({
+        id: `artifact_old_${index}`, path: `/tmp/old-${index}`, digest: `sha256:${index}`,
+        description: "artifact-history-" + "z".repeat(700), createdAt: 1_000 + index, runId: "run_1",
+      })),
+    ];
+    return value;
+  };
+
+  const first = makeLarge();
+  const second = makeLarge();
+  const protectedAcceptance = structuredClone(first.evidence[0]);
+  const protectedActive = structuredClone(first.evidence[1]);
+  const protectedArtifact = structuredClone(first.artifacts[0]);
+  const identity = {
+    schemaVersion: first.schemaVersion,
+    eventId: first.eventId,
+    parentEventId: first.parentEventId,
+    revision: first.revision,
+    goalId: first.goalId,
+    epoch: first.epoch,
+    objective: first.objective,
+    lifecycle: first.lifecycle,
+    activePhaseId: first.activePhaseId,
+    scheduler: structuredClone(first.scheduler),
+    budgets: structuredClone(first.budgets),
+    compaction: structuredClone(first.compaction),
+    nextAction: first.ledger.nextAction,
+    latestQuestion: first.ledger.openQuestions.at(-1),
+  };
+  const target = 24 * 1024;
+  const report = compactGoalSnapshotDraft(first, target);
+  const secondReport = compactGoalSnapshotDraft(second, target);
+  assert.deepEqual(secondReport, report);
+  assert.equal(JSON.stringify(second), JSON.stringify(first));
+  assert.equal(report.changed, true);
+  assert.ok((snapshotByteLength(first) ?? Infinity) <= target);
+  assert.ok(report.droppedEvidence > 0);
+  assert.ok(report.droppedArtifacts > 0);
+  assert.ok(report.droppedDecisions > 0);
+  assert.ok(report.prunedEvidenceLinks > 0);
+  assert.deepEqual(first.evidence.find((item) => item.id === "evidence_accept"), protectedAcceptance);
+  assert.deepEqual(first.evidence.find((item) => item.id === "evidence_active"), protectedActive);
+  assert.deepEqual(first.artifacts.find((item) => item.id === "artifact_active"), protectedArtifact);
+  assert.equal(first.acceptanceCriteria[0]!.evidenceIds?.includes("ghost_evidence"), false);
+  assert.equal(first.ledger.openQuestions.at(-1), identity.latestQuestion);
+  assert.deepEqual({
+    schemaVersion: first.schemaVersion,
+    eventId: first.eventId,
+    parentEventId: first.parentEventId,
+    revision: first.revision,
+    goalId: first.goalId,
+    epoch: first.epoch,
+    objective: first.objective,
+    lifecycle: first.lifecycle,
+    activePhaseId: first.activePhaseId,
+    scheduler: first.scheduler,
+    budgets: first.budgets,
+    compaction: first.compaction,
+    nextAction: first.ledger.nextAction,
+    latestQuestion: first.ledger.openQuestions.at(-1),
+  }, identity);
+  assert.equal(first.ledger.recentProgress.filter((item) => item.startsWith("Snapshot compacted:")).length, 1);
+  assert.ok(first.ledger.recentProgress.length <= 16);
+  assert.ok(first.ledger.openQuestions.length <= 8);
+  assert.doesNotMatch(JSON.stringify(first), /�/);
+
+  const once = JSON.stringify(first);
+  const idempotent = compactGoalSnapshotDraft(first, target);
+  assert.equal(idempotent.changed, false);
+  assert.equal(JSON.stringify(first), once);
+
+  const soft = makeLarge();
+  compactGoalSnapshotDraft(soft, GOAL_SNAPSHOT_SOFT_LIMIT);
+  assert.ok((snapshotByteLength(soft) ?? Infinity) <= GOAL_SNAPSHOT_SOFT_LIMIT);
+});
+
+test("snapshot compaction fails closed when acceptance evidence alone exceeds the hard limit", () => {
+  const value = checkpoint();
+  value.acceptanceCriteria = Array.from({ length: 24 }, (_, index) => ({
+    id: `accept_${index}`,
+    description: `Acceptance criterion ${index}`,
+    status: "pending" as const,
+    evidenceIds: [`protected_${index}`],
+  }));
+  value.evidence = Array.from({ length: 24 }, (_, index) => ({
+    id: `protected_${index}`,
+    criterionId: `accept_${index}`,
+    kind: "test" as const,
+    description: "界".repeat(1_300),
+    locator: `test:protected-${index}`,
+    observedAt: 1_000 + index,
+    runId: "run_1",
+  }));
+  const protectedJson = JSON.stringify(value.evidence);
+  const report = compactGoalSnapshotDraft(value);
+  assert.ok(report.bytesAfter > MAX_GOAL_SNAPSHOT_BYTES);
+  assert.equal(JSON.stringify(value.evidence), protectedJson);
+  assert.equal(validateGoalCheckpointV2(value).ok, false);
 });
 
 test("advanceCheckpoint derives immutable revision metadata without mutating or aliasing inputs", () => {

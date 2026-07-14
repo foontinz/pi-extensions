@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Check } from "typebox/value";
 
 import type { GoalCheckpointParams } from "../checkpoint-tool.ts";
 import goalExtension from "../index.ts";
@@ -66,6 +67,7 @@ class ExtensionHarness {
   readonly handlers = new Map<string, Handler[]>();
   readonly commands = new Map<string, CommandHandler>();
   readonly tools = new Map<string, ToolExecutor>();
+  readonly toolParameters = new Map<string, unknown>();
   readonly notifications: Array<{ message: string; level: string }> = [];
   readonly widgets: Array<{ key: string; value: unknown }> = [];
   readonly statuses: Array<{ key: string; value: unknown }> = [];
@@ -83,6 +85,7 @@ class ExtensionHarness {
   failAppendAt: number | undefined;
 
   private nextId = 1;
+  private lastCheckpointToolCallId: string | undefined;
 
   readonly context: any = {
     hasUI: true,
@@ -139,8 +142,9 @@ class ExtensionHarness {
       registerCommand: (name: string, definition: { handler: CommandHandler }) => {
         this.commands.set(name, definition.handler);
       },
-      registerTool: (definition: { name: string; execute: ToolExecutor }) => {
+      registerTool: (definition: { name: string; execute: ToolExecutor; parameters?: unknown }) => {
         this.tools.set(definition.name, definition.execute);
+        this.toolParameters.set(definition.name, definition.parameters);
       },
       appendEntry: (customType: string, data: unknown) => {
         this.appendAttempts += 1;
@@ -253,6 +257,7 @@ class ExtensionHarness {
 
   async callCheckpoint(params: GoalCheckpointParams): Promise<ToolResult> {
     const callId = `tool-call-${this.nextId}`;
+    this.lastCheckpointToolCallId = callId;
     this.append({
       type: "message",
       message: {
@@ -275,7 +280,7 @@ class ExtensionHarness {
       type: "message",
       message: {
         role: "toolResult",
-        toolCallId: `tool-result-${this.nextId}`,
+        toolCallId: this.lastCheckpointToolCallId ?? `tool-result-${this.nextId}`,
         toolName: GOAL_CHECKPOINT_TOOL,
         content: structuredClone(result.content),
         details: structuredClone(result.details),
@@ -284,11 +289,8 @@ class ExtensionHarness {
     });
   }
 
-  async callResume(params: {
-    goalId: string;
-    expectedEpoch: number;
-    expectedRevision: number;
-  }): Promise<ResumeToolResult> {
+  async callResume(): Promise<ResumeToolResult> {
+    const params = {};
     const callId = `resume-call-${this.nextId}`;
     this.append({
       type: "message",
@@ -498,6 +500,13 @@ test("a correlated goal control carries its bounded working packet", async () =>
   assert.equal(harness.latestPersisted().scheduler.state, "run_in_flight");
 });
 
+test("goal_resume exposes an empty strict parameter object", () => {
+  const harness = new ExtensionHarness();
+  const schema = harness.toolParameters.get(GOAL_RESUME_TOOL) as Parameters<typeof Check>[0];
+  assert.equal(Check(schema, {}), true);
+  assert.equal(Check(schema, { goalId: "copied", expectedEpoch: 1, expectedRevision: 1 }), false);
+});
+
 test("an ordinary user answer can durably resume a waiting goal without a slash command", async () => {
   const harness = new ExtensionHarness();
   const waiting = await enterWaitingExternal(harness);
@@ -515,16 +524,16 @@ test("an ordinary user answer can durably resume a waiting goal without a slash 
   assert.equal(harness.latestPersisted().lifecycle, "waiting_external");
 
   harness.idle = false;
-  const result = await harness.callResume({
-    goalId: waiting.goalId,
-    expectedEpoch: waiting.epoch,
-    expectedRevision: waiting.revision,
-  });
+  const result = await harness.callResume();
   assert.equal(result.terminate, true);
   assert.equal(harness.controls().length, controlsBefore, "tool execution never dispatches re-entrantly");
   assert.equal(harness.latestPersisted().lifecycle, "recovering");
-  assert.equal(harness.latestPersisted().epoch, waiting.epoch + 1);
+  assert.equal(harness.latestPersisted().epoch, waiting.epoch);
+  assert.equal(harness.latestPersisted().budgets.epochRuns, waiting.budgets.epochRuns);
+  assert.equal(harness.latestPersisted().budgets.totalRuns, waiting.budgets.totalRuns);
   assert.match(harness.latestPersisted().ledger.nextAction ?? "", /Use staging\./);
+  assert.doesNotMatch(JSON.stringify(result.content), new RegExp(waiting.goalId));
+  assert.doesNotMatch(JSON.stringify(result.content), /epoch|revision/i);
   const afterResumeMutation = await harness.preflightTool("edit");
   assert.equal(afterResumeMutation?.block, true);
   assert.match(afterResumeMutation?.reason ?? "", /goal_resume must be the final tool call/);
@@ -533,7 +542,8 @@ test("an ordinary user answer can durably resume a waiting goal without a slash 
   await harness.emit("agent_settled");
   assert.equal(harness.controls().length, controlsBefore + 1);
   assert.equal(harness.latestPersisted().scheduler.state, "run_in_flight");
-  assert.equal(harness.latestPersisted().epoch, waiting.epoch + 1);
+  assert.equal(harness.latestPersisted().epoch, waiting.epoch);
+  assert.equal(harness.latestPersisted().budgets.epochRuns, waiting.budgets.epochRuns + 1);
 
   const entries = harness.branch.length;
   await harness.emit("agent_settled");
@@ -566,6 +576,16 @@ test("a clarification question leaves a waiting goal untouched", async () => {
     revision: harness.latestPersisted().revision,
     epoch: harness.latestPersisted().epoch,
   }, before);
+});
+
+test("goal_resume rejects an acknowledgement turn that already used another tool", async () => {
+  const harness = new ExtensionHarness();
+  const waiting = await enterWaitingExternal(harness);
+  await harness.beginUserPrompt("Use staging.");
+  assert.equal(await harness.preflightTool("read"), undefined, "clarification tools remain available");
+  await assert.rejects(() => harness.callResume(), /must be the only tool call/);
+  assert.equal(harness.latestPersisted().eventId, waiting.eventId);
+  assert.equal(harness.latestPersisted().lifecycle, "waiting_external");
 });
 
 test("background completion between the wait checkpoint and run settlement wakes exactly once", async () => {
@@ -747,7 +767,7 @@ test("workflow completion wakes from restore and maps terminal failure statuses"
     failures: 0,
   });
 
-  await restored.emit("session_start");
+  await restored.emit("session_start", { reason: "reload" });
   assert.equal(restored.controls().length, controlsBefore + 1);
   assert.equal(restored.latestPersisted().lifecycle, "recovering");
   assert.equal(restored.latestPersisted().epoch, waiting.epoch);
@@ -819,7 +839,7 @@ test("a persisted typed machine wake survives reload before its dispatch", async
   assert.equal(harness.controls().length, controlsBefore);
 
   harness.pending = false;
-  await harness.emit("session_start");
+  await harness.emit("session_start", { reason: "reload" });
   assert.equal(harness.controls().length, controlsBefore + 1);
   assert.equal(harness.latestPersisted().lifecycle, "recovering");
   assert.equal(harness.latestPersisted().scheduler.state, "run_in_flight");
@@ -897,7 +917,7 @@ test("session reload and tree navigation pause runnable state and never auto-dis
   const reloadState = createInitialCheckpoint("restore after reload", { now: 10 });
   harness.replaceBranch([{ type: "custom", customType: GOAL_CHECKPOINT_ENTRY, data: reloadState }]);
 
-  await harness.emit("session_start");
+  await harness.emit("session_start", { reason: "reload" });
   assert.equal(harness.latestPersisted().lifecycle, "paused");
   assert.equal(harness.latestPersisted().pauseReason, "interrupted");
   assert.equal(harness.controls().length, 0);
@@ -908,6 +928,144 @@ test("session reload and tree navigation pause runnable state and never auto-dis
   assert.equal(harness.latestPersisted().lifecycle, "paused");
   assert.equal(harness.latestPersisted().pauseReason, "interrupted");
   assert.equal(harness.controls().length, 0, "tree restoration never starts work automatically");
+});
+
+test("reload retries only restorations proven safe by branch evidence", async (t) => {
+  await t.test("undelivered dispatch retries once without refunding budget", async () => {
+    const harness = new ExtensionHarness();
+    const pending = createInitialCheckpoint("retry an undelivered dispatch", {
+      now: 10,
+      goalId: "goal-undelivered",
+      eventId: "event-undelivered",
+      maxEpochRuns: 5,
+    });
+    pending.scheduler = {
+      state: "dispatch_pending",
+      dispatch: {
+        dispatchId: "dispatch-undelivered",
+        goalId: pending.goalId,
+        epoch: pending.epoch,
+        revision: pending.revision,
+        runId: "run-undelivered",
+        createdAt: 10,
+      },
+    };
+    pending.budgets.epochRuns = 1;
+    pending.budgets.totalRuns = 1;
+    harness.replaceBranch([{ type: "custom", customType: GOAL_CHECKPOINT_ENTRY, data: pending }]);
+
+    await harness.emit("session_start", { reason: "reload" });
+    assert.equal(harness.controls().length, 1);
+    assert.equal(harness.latestPersisted().scheduler.state, "run_in_flight");
+    assert.equal(harness.latestPersisted().epoch, pending.epoch);
+    assert.equal(harness.latestPersisted().budgets.epochRuns, 2, "the first spent run is not refunded");
+
+    const entries = harness.branch.length;
+    await harness.emit("agent_settled");
+    assert.equal(harness.branch.length, entries, "no duplicate retry is emitted");
+  });
+
+  await t.test("completed but unsettled checkpoint settles and continues once", async () => {
+    const harness = new ExtensionHarness();
+    const active = await createAndObserve(harness, "settle after reload");
+    const result = await harness.callCheckpoint(initialPlan(active.revision));
+    harness.appendCheckpointResult(result);
+    harness.appendAssistant("The checkpointed run ended normally.");
+    const controlsBefore = harness.controls().length;
+
+    await harness.emit("session_start", { reason: "reload" });
+    assert.equal(harness.controls().length, controlsBefore + 1);
+    assert.equal(harness.latestPersisted().scheduler.state, "run_in_flight");
+    assert.equal(harness.latestPersisted().scheduler.lastSettledRunId, active.scheduler.activeRun?.runId);
+  });
+
+  await t.test("orphan checkpoint results after the terminating assistant fail closed", async () => {
+    const harness = new ExtensionHarness();
+    const active = await createAndObserve(harness, "reject orphan restore evidence");
+    const result = await harness.callCheckpoint(initialPlan(active.revision));
+    harness.appendAssistant("The run already ended before this orphan result.");
+    harness.appendCheckpointResult(result);
+
+    await harness.emit("session_start", { reason: "reload" });
+    assert.equal(harness.controls().length, 1);
+    assert.equal(harness.latestPersisted().lifecycle, "paused");
+    assert.equal(harness.latestPersisted().pauseReason, "interrupted");
+  });
+
+  await t.test("typed completion wakes after an unsettled waiting run is restored", async () => {
+    const harness = new ExtensionHarness();
+    await createAndObserve(harness, "restore a completed typed wait");
+    await settleWithProgress(harness);
+    const active = harness.latestPersisted();
+    const result = await harness.callCheckpoint({
+      action: "waiting_external",
+      expectedRevision: active.revision,
+      phaseId: active.activePhaseId,
+      summary: "Started a typed background task.",
+      waitFor: { kind: "background_task", id: "bg-restore-settle" },
+    });
+    harness.appendCheckpointResult(result);
+    harness.appendCustomMessage("enhanced-bash-background", {
+      jobs: [{ id: "bg-restore-settle", kind: "bash", status: "exited", exitCode: 0 }],
+    });
+    harness.appendAssistant("The waiting run ended normally.");
+    const controlsBefore = harness.controls().length;
+
+    await harness.emit("session_start", { reason: "reload" });
+    assert.equal(harness.controls().length, controlsBefore + 1);
+    assert.equal(harness.latestPersisted().lifecycle, "recovering");
+    assert.equal(harness.latestPersisted().waitFor, undefined);
+    assert.equal(harness.latestPersisted().scheduler.state, "run_in_flight");
+  });
+
+  await t.test("a durably applied ordinary answer continues in the same epoch", async () => {
+    const harness = new ExtensionHarness();
+    const waiting = await enterWaitingExternal(harness);
+    const controlsBefore = harness.controls().length;
+    await harness.beginUserPrompt("Use production.");
+    await harness.callResume();
+    assert.equal(harness.latestPersisted().lifecycle, "recovering");
+    assert.equal(harness.latestPersisted().epoch, waiting.epoch);
+
+    await harness.emit("session_start", { reason: "reload" });
+    assert.equal(harness.controls().length, controlsBefore + 1);
+    assert.equal(harness.latestPersisted().epoch, waiting.epoch);
+    assert.equal(harness.latestPersisted().scheduler.state, "run_in_flight");
+  });
+});
+
+test("fork, tree, and unknown restore reasons never consume typed completion", async () => {
+  for (const mode of ["tree", "fork", "unknown"] as const) {
+    const harness = new ExtensionHarness();
+    const waiting = await enterWaitingExternal(harness, `task-${mode}`, {
+      kind: "background_task",
+      id: `bg-${mode}`,
+    });
+    const controlsBefore = harness.controls().length;
+    harness.appendCustomMessage("enhanced-bash-background", {
+      jobs: [{ id: `bg-${mode}`, kind: "bash", status: "exited", exitCode: 0 }],
+    });
+    if (mode === "tree") await harness.emit("session_tree");
+    else await harness.emit("session_start", mode === "fork" ? { reason: "fork" } : { reason: "future-mode" });
+    assert.equal(harness.controls().length, controlsBefore, mode);
+    assert.equal(harness.latestPersisted().eventId, waiting.eventId, mode);
+    assert.equal(harness.latestPersisted().lifecycle, "waiting_external", mode);
+    assert.deepEqual(harness.latestPersisted().waitFor, waiting.waitFor, mode);
+  }
+});
+
+test("corrupt state without a valid predecessor still renders explicit ownership", async () => {
+  const harness = new ExtensionHarness();
+  harness.replaceBranch([{
+    type: "custom",
+    customType: GOAL_CHECKPOINT_ENTRY,
+    data: { schemaVersion: 2, eventId: "malformed" },
+  }]);
+  await harness.emit("session_start", { reason: "reload" });
+  assert.match(JSON.stringify(harness.widgets.at(-1)?.value), /PAUSED — CORRUPT STATE/);
+  assert.match(JSON.stringify(harness.widgets.at(-1)?.value), /\/goal stop/);
+  await harness.command("");
+  assert.match(harness.notifications.at(-1)?.message ?? "", /PAUSED — CORRUPT STATE/);
 });
 
 test("persistence failures and ephemeral sessions fail closed while unflushed sessions bootstrap volatile", async () => {

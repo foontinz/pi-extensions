@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import {
   GOAL_BOUNDS,
+  GOAL_SNAPSHOT_SOFT_LIMIT,
   advanceCheckpoint,
   isTerminalLifecycle,
   validateGoalCheckpointV2,
@@ -101,6 +102,11 @@ export interface GoalExternalCompletedAction extends RevisionAction {
   detail?: string;
 }
 
+export interface GoalAnswerReceivedAction extends RevisionAction {
+  type: "answer_received";
+  nextAction: string;
+}
+
 export interface GoalResumeAction extends RevisionAction {
   type: "resume";
   nextAction?: string;
@@ -139,6 +145,10 @@ export interface GoalInterruptRestoredAction extends RevisionAction {
   type: "interrupt_restored";
 }
 
+export interface GoalRetryUndeliveredDispatchAction extends RevisionAction {
+  type: "retry_undelivered_dispatch";
+}
+
 export interface GoalEnforceLimitsAction extends RevisionAction {
   type: "enforce_limits";
   stagnationLimit?: number;
@@ -153,6 +163,7 @@ export type GoalAction =
   | GoalControlObservationAction
   | GoalSettleRunAction
   | GoalExternalCompletedAction
+  | GoalAnswerReceivedAction
   | GoalResumeAction
   | GoalPauseAction
   | GoalCancelAction
@@ -160,6 +171,7 @@ export type GoalAction =
   | GoalCompactionSucceededAction
   | GoalCompactionFailedAction
   | GoalInterruptRestoredAction
+  | GoalRetryUndeliveredDispatchAction
   | GoalEnforceLimitsAction
   | GoalMarkSucceededAction;
 
@@ -200,7 +212,11 @@ function next(
 ): GoalCheckpointV2 | GoalReducerError {
   if (!validMeta(action)) return { code: "invalid_action", message: "action requires a valid now and eventId" };
   try {
-    return advanceCheckpoint(state, mutate, { now: action.now, eventId: action.eventId });
+    return advanceCheckpoint(state, mutate, {
+      now: action.now,
+      eventId: action.eventId,
+      compactSnapshotToBytes: GOAL_SNAPSHOT_SOFT_LIMIT,
+    });
   } catch (cause) {
     return {
       code: "invalid_transition",
@@ -442,6 +458,39 @@ function externalCompleted(state: GoalCheckpointV2, action: GoalExternalComplete
   }] : []);
 }
 
+function answerReceived(state: GoalCheckpointV2, action: GoalAnswerReceivedAction): GoalReducerResult {
+  if (state.lifecycle !== "blocked" && state.lifecycle !== "waiting_external") {
+    return error(state, "invalid_transition", `lifecycle ${state.lifecycle} cannot receive an answer`);
+  }
+  if (state.scheduler.state !== "idle") {
+    return error(state, "invalid_transition", "answer receipt requires an idle scheduler");
+  }
+  if (state.compaction.state !== "idle") {
+    return error(state, "invalid_transition", "answer receipt requires idle compaction");
+  }
+  if (typeof action.nextAction !== "string"
+    || !action.nextAction.trim()
+    || action.nextAction.length > GOAL_BOUNDS.text) {
+    return error(state, "invalid_transition", "answer receipt requires a non-empty bounded next action");
+  }
+
+  const exhausted = budgetExceeded(state, action.now);
+  return apply(state, action, (draft) => {
+    delete draft.waitFor;
+    delete draft.pauseReason;
+    draft.ledger.nextAction = action.nextAction;
+    if (exhausted) {
+      pauseForLimit(draft, "budget");
+      return;
+    }
+    draft.lifecycle = "recovering";
+  }, () => exhausted ? [{
+    type: "notify",
+    level: "warning",
+    message: "User answer recorded, but execution cannot continue because the goal budget is exhausted; explicit recovery is required.",
+  }] : []);
+}
+
 function resume(state: GoalCheckpointV2, action: GoalResumeAction): GoalReducerResult {
   if (!["paused", "blocked", "waiting_external", "recovering"].includes(state.lifecycle)
     && state.scheduler.state !== "recovery_required") {
@@ -562,6 +611,17 @@ function interruptRestored(state: GoalCheckpointV2, action: GoalInterruptRestore
   }]);
 }
 
+function retryUndeliveredDispatch(
+  state: GoalCheckpointV2,
+  action: GoalRetryUndeliveredDispatchAction,
+): GoalReducerResult {
+  if (state.scheduler.state !== "dispatch_pending" || !state.scheduler.dispatch
+    || state.scheduler.activeRun !== undefined || state.compaction.state !== "idle") {
+    return error(state, "invalid_transition", "retry requires one pending undelivered dispatch");
+  }
+  return apply(state, action, (draft) => clearLease(draft));
+}
+
 function enforceLimits(state: GoalCheckpointV2, action: GoalEnforceLimitsAction): GoalReducerResult {
   const reason = budgetExceeded(state, action.now)
     ? "budget"
@@ -578,6 +638,9 @@ function enforceLimits(state: GoalCheckpointV2, action: GoalEnforceLimitsAction)
 
 function terminalGuard(state: GoalCheckpointV2, action: GoalAction): GoalReducerResult | undefined {
   if (!isTerminalLifecycle(state)) return undefined;
+  if (action.type === "answer_received") {
+    return error(state, "invalid_transition", `terminal lifecycle ${state.lifecycle} cannot receive an answer`);
+  }
   // Replayed settlement and callbacks remain harmless after a terminal commit.
   if (action.type === "settle_run"
     || action.type === "external_completed"
@@ -603,6 +666,7 @@ export function reduceGoal(state: GoalCheckpointV2, action: GoalAction): GoalRed
     case "observe_goal_control": return observeControl(state, action);
     case "settle_run": return settle(state, action);
     case "external_completed": return externalCompleted(state, action);
+    case "answer_received": return answerReceived(state, action);
     case "resume": return resume(state, action);
     case "pause": return pause(state, action);
     case "cancel": return cancel(state, action);
@@ -610,6 +674,7 @@ export function reduceGoal(state: GoalCheckpointV2, action: GoalAction): GoalRed
     case "compaction_succeeded": return compactionSucceeded(state, action);
     case "compaction_failed": return compactionFailed(state, action);
     case "interrupt_restored": return interruptRestored(state, action);
+    case "retry_undelivered_dispatch": return retryUndeliveredDispatch(state, action);
     case "enforce_limits": return enforceLimits(state, action);
     case "mark_succeeded":
       if (state.lifecycle !== "verifying_goal") {
