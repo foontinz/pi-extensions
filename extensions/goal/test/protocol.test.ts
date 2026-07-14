@@ -234,6 +234,71 @@ test("goal_checkpoint applies plan, progress, and completion-claim transitions w
   assert.equal(goalClaim.phases[0]?.status, "candidate_complete");
 });
 
+test("goal_checkpoint records one typed external wait and clears it on every other action", () => {
+  const initial = checkpointInFlight();
+  const plan = applyGoalCheckpoint(initial, {
+    action: "set_plan",
+    expectedRevision: initial.revision,
+    phaseId: "phase-1",
+    summary: "Established the wait test plan",
+    acceptanceCriteria: [{ id: "accept-1", description: "The dependency is reconciled" }],
+    phases: [{
+      id: "phase-1",
+      title: "Wait safely",
+      intent: "Wait for one typed dependency",
+      criteria: [{ id: "phase-criterion-1", description: "Typed completion is observed" }],
+    }],
+  }, run(110, "event-wait-plan"));
+
+  const waitingParams: GoalCheckpointParams = {
+    action: "waiting_external",
+    expectedRevision: plan.revision,
+    phaseId: "phase-1",
+    summary: "Started the owned background task",
+    nextAction: "Wait for its typed completion",
+    waitFor: { kind: "background_task", id: "  bg_003  " },
+  };
+  assert.equal(Check(GoalCheckpointParams, waitingParams), true);
+  const waiting = applyGoalCheckpoint(plan, waitingParams, run(120, "event-waiting"));
+  assert.equal(waiting.lifecycle, "waiting_external");
+  assert.deepEqual(waiting.waitFor, { kind: "background_task", id: "bg_003" });
+  const packet = buildGoalWorkingPacket(waiting);
+  assert.match(packet, /waitFor\.kind=background_task waitFor\.id="bg_003"/);
+  assert.match(packet, /Matching typed terminal metadata after the checkpoint wakes the goal automatically/);
+  assert.match(packet, /do not poll, sleep/);
+
+  const resumedProgress = applyGoalCheckpoint(waiting, {
+    action: "progress",
+    expectedRevision: waiting.revision,
+    phaseId: "phase-1",
+    summary: "Reconciled the dependency",
+  }, run(130, "event-after-wait"));
+  assert.equal(resumedProgress.lifecycle, "running");
+  assert.equal(resumedProgress.waitFor, undefined);
+
+  assert.throws(() => applyGoalCheckpoint(plan, {
+    ...params(plan),
+    waitFor: { kind: "workflow", id: "workflow-1" },
+  }, run(121)), /only be used with waiting_external/);
+  assert.throws(() => applyGoalCheckpoint(plan, {
+    ...waitingParams,
+    waitFor: { kind: "background_task", id: "   " },
+  }, run(121)), /non-empty after trimming/);
+  assert.throws(() => applyGoalCheckpoint(plan, {
+    ...waitingParams,
+    waitFor: { kind: "subagent", id: "agent-1" },
+  }, run(121)), /subagent is unavailable/);
+  const multipleWaits = {
+    ...waitingParams,
+    waitFor: [{ kind: "background_task", id: "bg_1" }, { kind: "workflow", id: "wf_1" }],
+  };
+  assert.equal(Check(GoalCheckpointParams, multipleWaits), false, "the strict schema permits only one wait correlation");
+  assert.throws(
+    () => applyGoalCheckpoint(plan, multipleWaits as unknown as GoalCheckpointParams, run(121)),
+    /wait on one task at a time or consolidate/,
+  );
+});
+
 test("working packets are deterministic, bounded, complete, and exclude artifact contents", () => {
   const checkpoint = createInitialCheckpoint("Validate a deterministic packet " + "α".repeat(1_500), {
     now: 10,

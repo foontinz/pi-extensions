@@ -7,6 +7,7 @@ import {
   validateGoalCheckpointV2,
   type GoalCheckpointV2,
   type GoalDispatchIntent,
+  type GoalExternalWaitKind,
   type GoalLifecycle,
   type GoalPauseReason,
   type GoalRunRef,
@@ -50,7 +51,7 @@ export type GoalReducerResult =
       error: GoalReducerError;
     };
 
-interface RevisionAction {
+export interface RevisionAction {
   now: number;
   eventId: string;
 }
@@ -90,6 +91,14 @@ export interface GoalSettleRunAction extends RevisionAction {
   checkpointRecorded?: boolean;
   /** Required to schedule the one allowed checkpoint-repair run. */
   repair?: GoalRepairDispatch;
+}
+
+export interface GoalExternalCompletedAction extends RevisionAction {
+  type: "external_completed";
+  kind: GoalExternalWaitKind;
+  id: string;
+  outcome: "succeeded" | "failed";
+  detail?: string;
 }
 
 export interface GoalResumeAction extends RevisionAction {
@@ -143,6 +152,7 @@ export type GoalAction =
   | GoalDispatchAction
   | GoalControlObservationAction
   | GoalSettleRunAction
+  | GoalExternalCompletedAction
   | GoalResumeAction
   | GoalPauseAction
   | GoalCancelAction
@@ -240,6 +250,7 @@ function clearLease(draft: GoalCheckpointV2, schedulerState: "idle" | "recovery_
 function pauseForLimit(draft: GoalCheckpointV2, reason: "budget" | "stalled"): void {
   draft.lifecycle = "paused";
   draft.pauseReason = reason;
+  delete draft.waitFor;
 }
 
 function makeIntent(
@@ -391,6 +402,46 @@ function settle(state: GoalCheckpointV2, action: GoalSettleRunAction): GoalReduc
   });
 }
 
+function externalFailureNextAction(action: GoalExternalCompletedAction): string {
+  const prefix = `External dependency ${action.kind} ${action.id} failed (`;
+  const suffix = "); diagnose the failure before continuing. Do not mark criteria satisfied from this event.";
+  const rawDetail = action.detail?.trim() || "no additional detail";
+  const detailBudget = Math.max(0, GOAL_BOUNDS.text - prefix.length - suffix.length);
+  return `${prefix}${rawDetail.slice(0, detailBudget)}${suffix}`;
+}
+
+function externalCompleted(state: GoalCheckpointV2, action: GoalExternalCompletedAction): GoalReducerResult {
+  if (state.lifecycle !== "waiting_external"
+    || state.scheduler.state !== "idle"
+    || state.compaction.state !== "idle"
+    || state.waitFor?.kind !== action.kind
+    || state.waitFor.id !== action.id) return unchanged(state);
+  if (!(["background_task", "workflow", "subagent"] as const).includes(action.kind)
+    || typeof action.id !== "string" || !action.id.trim() || action.id.length > GOAL_BOUNDS.id
+    || (action.outcome !== "succeeded" && action.outcome !== "failed")
+    || (action.detail !== undefined
+      && (typeof action.detail !== "string" || action.detail.length > GOAL_BOUNDS.text))) {
+    return error(state, "invalid_action", "external completion metadata is invalid");
+  }
+  const exhausted = budgetExceeded(state, action.now);
+  return apply(state, action, (draft) => {
+    delete draft.waitFor;
+    delete draft.pauseReason;
+    draft.ledger.nextAction = action.outcome === "succeeded"
+      ? `External dependency ${action.kind} ${action.id} completed; reconcile its results against the active phase before continuing.`
+      : externalFailureNextAction(action);
+    if (exhausted) {
+      pauseForLimit(draft, "budget");
+      return;
+    }
+    draft.lifecycle = "recovering";
+  }, () => exhausted ? [{
+    type: "notify",
+    level: "warning",
+    message: "Goal paused because its run or elapsed-time budget was exhausted while an external dependency completed.",
+  }] : []);
+}
+
 function resume(state: GoalCheckpointV2, action: GoalResumeAction): GoalReducerResult {
   if (!["paused", "blocked", "waiting_external", "recovering"].includes(state.lifecycle)
     && state.scheduler.state !== "recovery_required") {
@@ -401,6 +452,7 @@ function resume(state: GoalCheckpointV2, action: GoalResumeAction): GoalReducerR
     draft.epoch += 1;
     draft.lifecycle = "recovering";
     delete draft.pauseReason;
+    delete draft.waitFor;
     clearLease(draft);
     draft.budgets.epochRuns = 0;
     if (draft.compaction.state !== "idle") {
@@ -419,6 +471,7 @@ function pause(state: GoalCheckpointV2, action: GoalPauseAction): GoalReducerRes
     const ambiguous = draft.scheduler.state !== "idle" || draft.compaction.state === "pending";
     draft.lifecycle = "paused";
     draft.pauseReason = action.reason ?? "user";
+    delete draft.waitFor;
     clearLease(draft, ambiguous ? "recovery_required" : "idle");
     if (draft.compaction.state === "pending") draft.compaction.state = "failed";
   }, () => action.message ? [{ type: "notify", level: "warning", message: action.message }] : []);
@@ -428,6 +481,7 @@ function cancel(state: GoalCheckpointV2, action: GoalCancelAction): GoalReducerR
   return apply(state, action, (draft) => {
     draft.lifecycle = "cancelled";
     delete draft.pauseReason;
+    delete draft.waitFor;
     clearLease(draft);
     if (draft.compaction.state === "pending") draft.compaction.state = "failed";
   });
@@ -526,6 +580,7 @@ function terminalGuard(state: GoalCheckpointV2, action: GoalAction): GoalReducer
   if (!isTerminalLifecycle(state)) return undefined;
   // Replayed settlement and callbacks remain harmless after a terminal commit.
   if (action.type === "settle_run"
+    || action.type === "external_completed"
     || action.type === "compaction_succeeded"
     || action.type === "compaction_failed"
     || action.type === "interrupt_restored") return unchanged(state);
@@ -547,6 +602,7 @@ export function reduceGoal(state: GoalCheckpointV2, action: GoalAction): GoalRed
     case "dispatch": return dispatch(state, action);
     case "observe_goal_control": return observeControl(state, action);
     case "settle_run": return settle(state, action);
+    case "external_completed": return externalCompleted(state, action);
     case "resume": return resume(state, action);
     case "pause": return pause(state, action);
     case "cancel": return cancel(state, action);

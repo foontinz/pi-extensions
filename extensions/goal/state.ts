@@ -148,6 +148,13 @@ export type GoalSchedulerState =
   | "compaction_pending"
   | "recovery_required";
 
+export type GoalExternalWaitKind = "background_task" | "workflow" | "subagent";
+
+export interface GoalExternalWait {
+  kind: GoalExternalWaitKind;
+  id: string;
+}
+
 export interface GoalCheckpointV2 {
   schemaVersion: 2;
 
@@ -163,6 +170,14 @@ export interface GoalCheckpointV2 {
 
   lifecycle: GoalLifecycle;
   pauseReason?: GoalPauseReason;
+  /**
+   * One typed external dependency awaited by this checkpoint. The checkpoint's
+   * own branch position is the ordering anchor; timestamps are never used.
+   *
+   * This optional strict-schema field is intentionally not rollback-compatible:
+   * an older extension build will treat checkpoints containing it as corrupt.
+   */
+  waitFor?: GoalExternalWait;
 
   constraints: string[];
   acceptanceCriteria: GoalCriterion[];
@@ -270,6 +285,7 @@ const EVIDENCE_KINDS: readonly GoalEvidenceKind[] = ["file", "command", "test", 
 const SCHEDULER_STATES: readonly GoalSchedulerState[] = [
   "idle", "dispatch_pending", "run_in_flight", "compaction_pending", "recovery_required",
 ];
+const EXTERNAL_WAIT_KINDS: readonly GoalExternalWaitKind[] = ["background_task", "workflow", "subagent"];
 
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -354,6 +370,13 @@ function validateEvidence(value: unknown): value is GoalEvidence {
     && optionalString(value.digest, GOAL_BOUNDS.digest);
 }
 
+function validateExternalWait(value: unknown): value is GoalExternalWait {
+  return record(value)
+    && ownKeys(value, ["kind", "id"])
+    && oneOf(value.kind, EXTERNAL_WAIT_KINDS)
+    && boundedString(value.id, GOAL_BOUNDS.id);
+}
+
 function validateArtifact(value: unknown): value is GoalArtifactRef {
   if (!record(value) || !ownKeys(value, [
     "id", "path", "digest", "description", "mediaType", "sizeBytes", "createdAt", "runId",
@@ -422,7 +445,7 @@ export function validateGoalCheckpointV2(value: unknown): GoalValidationResult<G
   if (!record(value)) return { ok: false, error: "checkpoint must be an object" };
   if (!ownKeys(value, [
     "schemaVersion", "eventId", "parentEventId", "revision", "goalId", "epoch", "objective", "createdAt",
-    "updatedAt", "lifecycle", "pauseReason", "constraints", "acceptanceCriteria", "planVersion", "phases",
+    "updatedAt", "lifecycle", "pauseReason", "waitFor", "constraints", "acceptanceCriteria", "planVersion", "phases",
     "activePhaseId", "ledger", "evidence", "artifacts", "scheduler", "budgets", "compaction",
   ])) return { ok: false, error: "checkpoint contains unknown fields" };
 
@@ -439,6 +462,12 @@ export function validateGoalCheckpointV2(value: unknown): GoalValidationResult<G
   if (!oneOf(value.lifecycle, LIFECYCLES)) return { ok: false, error: "invalid lifecycle" };
   if (value.pauseReason !== undefined && !oneOf(value.pauseReason, PAUSE_REASONS)) {
     return { ok: false, error: "invalid pauseReason" };
+  }
+  if (value.waitFor !== undefined && !validateExternalWait(value.waitFor)) {
+    return { ok: false, error: "invalid waitFor" };
+  }
+  if (value.waitFor !== undefined && value.lifecycle !== "waiting_external") {
+    return { ok: false, error: "waitFor requires waiting_external lifecycle" };
   }
   if (!stringArray(value.constraints, GOAL_BOUNDS.constraints, GOAL_BOUNDS.text)) {
     return { ok: false, error: "invalid constraints" };
@@ -978,6 +1007,7 @@ export function advanceCheckpoint(
   if (isTerminalLifecycle(previous.lifecycle) && draft.lifecycle !== previous.lifecycle) {
     throw new TypeError("terminal goal lifecycle is sticky");
   }
+  if (draft.lifecycle !== "waiting_external") delete draft.waitFor;
   draft.parentEventId = previous.eventId;
   draft.eventId = options.eventId ?? newEventId();
   draft.revision = previous.revision + 1;
@@ -1002,6 +1032,7 @@ export function goalProgressHash(checkpoint: GoalCheckpointV2): string {
     objective: checkpoint.objective,
     lifecycle: checkpoint.lifecycle,
     pauseReason: checkpoint.pauseReason,
+    waitFor: checkpoint.waitFor,
     acceptanceCriteria: checkpoint.acceptanceCriteria.map(criterionProgress),
     phases: checkpoint.phases.map((phase) => ({
       id: phase.id,

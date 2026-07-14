@@ -208,6 +208,43 @@ test("accepts and serializes a fully populated valid V2 checkpoint", () => {
   assert.notStrictEqual(cloned.phases[0], value.phases[0]);
 });
 
+test("waitFor round-trips strictly, remains optional, and is confined to waiting_external", () => {
+  const oldCheckpoint = checkpoint();
+  assert.equal(Object.hasOwn(oldCheckpoint, "waitFor"), false);
+  assert.equal(validateGoalCheckpointV2(oldCheckpoint).ok, true, "older V2 checkpoints remain valid");
+
+  for (const kind of ["background_task", "workflow", "subagent"] as const) {
+    const waiting = checkpoint({ lifecycle: "waiting_external", waitFor: { kind, id: `${kind}_1` } });
+    const result = validateGoalCheckpointV2(waiting);
+    assert.equal(result.ok, true, kind);
+    assert.deepEqual(JSON.parse(serializeGoalCheckpoint(waiting)).waitFor, waiting.waitFor);
+  }
+
+  assertInvalid(checkpoint({
+    lifecycle: "waiting_external",
+    waitFor: { kind: "unknown" as never, id: "job_1" },
+  }), /waitFor/);
+  assertInvalid(checkpoint({
+    lifecycle: "waiting_external",
+    waitFor: { kind: "workflow", id: "   " },
+  }), /waitFor/);
+  assertInvalid(checkpoint({
+    lifecycle: "waiting_external",
+    waitFor: { kind: "workflow", id: "x".repeat(GOAL_BOUNDS.id + 1) },
+  }), /waitFor/);
+  assertInvalid(checkpoint({
+    lifecycle: "running",
+    waitFor: { kind: "workflow", id: "workflow_1" },
+  }), /requires waiting_external/);
+
+  const paused = advanceCheckpoint(
+    checkpoint({ lifecycle: "waiting_external", waitFor: { kind: "background_task", id: "bg_003" } }),
+    { lifecycle: "paused", pauseReason: "user" },
+    { now: 2_001, eventId: "event_wait_paused" },
+  );
+  assert.equal(paused.waitFor, undefined, "lifecycle transitions out of waiting clear correlation");
+});
+
 test("enforces public string, collection, counter, relationship, and unknown-field bounds", () => {
   const maxStrings = checkpoint({
     eventId: "e".repeat(GOAL_BOUNDS.id),

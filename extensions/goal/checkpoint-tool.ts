@@ -55,6 +55,11 @@ const EvidenceInput = StrictObject({
   digest: Type.Optional(Type.String({ minLength: 1, maxLength: GOAL_BOUNDS.digest })),
 });
 
+const WaitForInput = StrictObject({
+  kind: StringEnum(["background_task", "workflow", "subagent"] as const),
+  id: NonEmptyId,
+});
+
 /** Strict, provider-compatible parameters for the model-facing goal_checkpoint tool. */
 export const GoalCheckpointParams = StrictObject({
   action: StringEnum([
@@ -69,6 +74,7 @@ export const GoalCheckpointParams = StrictObject({
   phaseId: Type.Optional(NonEmptyId),
   summary: Text,
   nextAction: Type.Optional(Text),
+  waitFor: Type.Optional(WaitForInput),
   decisions: Type.Optional(Type.Array(DecisionInput, { maxItems: GOAL_BOUNDS.decisions })),
   evidence: Type.Optional(Type.Array(EvidenceInput, { maxItems: GOAL_BOUNDS.evidence })),
   phases: Type.Optional(Type.Array(PhaseInput, { maxItems: GOAL_BOUNDS.phases })),
@@ -231,6 +237,15 @@ function validateAction(checkpoint: GoalCheckpointV2, params: GoalCheckpointPara
   if (params.action === "phase_candidate_complete" && params.phaseId === undefined) {
     fail("phase_candidate_complete requires phaseId");
   }
+  if (params.waitFor !== undefined && params.action !== "waiting_external") {
+    fail("waitFor may only be used with waiting_external");
+  }
+  if (params.waitFor !== undefined && !cleanText(params.waitFor.id)) {
+    fail("waitFor.id must be non-empty after trimming");
+  }
+  if (params.waitFor?.kind === "subagent") {
+    fail("waitFor.kind subagent is unavailable until subagents emit typed completion metadata");
+  }
 
   if (params.phaseId !== undefined && params.action !== "set_plan") {
     phaseIndex(checkpoint, params.phaseId);
@@ -275,6 +290,9 @@ export function applyGoalCheckpoint(
   params: GoalCheckpointParams,
   currentRun: GoalCheckpointRunIdentity,
 ): GoalCheckpointV2 {
+  if (Array.isArray((params as { waitFor?: unknown }).waitFor)) {
+    fail("waiting_external accepts one waitFor; wait on one task at a time or consolidate owned work");
+  }
   if (!Check(GoalCheckpointParams, params)) fail("parameters do not match the strict schema");
   if (isTerminalLifecycle(checkpoint)) fail("terminal goals cannot be updated");
   if (params.expectedRevision !== checkpoint.revision) {
@@ -298,6 +316,12 @@ export function applyGoalCheckpoint(
   return advanceCheckpoint(checkpoint, (draft) => {
     const summary = cleanText(params.summary);
     const phaseId = params.phaseId === undefined ? undefined : cleanText(params.phaseId);
+
+    if (params.action === "waiting_external" && params.waitFor !== undefined) {
+      draft.waitFor = { kind: params.waitFor.kind, id: cleanText(params.waitFor.id) };
+    } else {
+      delete draft.waitFor;
+    }
 
     if (params.action === "set_plan") {
       draft.constraints = params.constraints === undefined

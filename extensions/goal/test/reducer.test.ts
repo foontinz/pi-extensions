@@ -90,6 +90,18 @@ function inFlight(suffix = "one", options: { maxEpochRuns?: number; maxElapsedMs
   return observePending(dispatch(initial(options), suffix).state, suffix).state;
 }
 
+function waitingExternal(
+  kind: "background_task" | "workflow" | "subagent" = "background_task",
+  id = "bg_003",
+  options: { maxEpochRuns?: number; maxElapsedMs?: number } = {},
+): GoalCheckpointV2 {
+  const state = initial(options);
+  state.lifecycle = "waiting_external";
+  state.waitFor = { kind, id };
+  state.ledger.nextAction = "Wait for typed completion.";
+  return state;
+}
+
 test("dispatch persists its lease before dispatching and never creates a second lease", () => {
   const state = initial();
   const before = structuredClone(state);
@@ -308,6 +320,165 @@ test("a checkpointless run gets exactly one persisted repair dispatch, then paus
   assert.equal(second.state.scheduler.activeRun, undefined);
   assert.equal(second.state.budgets.totalRuns, 2, "a second repair was not allocated");
   assert.equal(second.state.budgets.totalTurns, 5);
+});
+
+test("a matching typed external completion wakes in the same epoch and is idempotent", () => {
+  const state = waitingExternal();
+  state.epoch = 4;
+  state.budgets.epochRuns = 2;
+  state.budgets.totalRuns = 7;
+  state.budgets.totalTurns = 19;
+  const completed = reduceGoal(state, {
+    type: "external_completed",
+    kind: "background_task",
+    id: "bg_003",
+    outcome: "succeeded",
+    now: 130,
+    eventId: "event_external_completed",
+  });
+
+  expectPersistFirst(completed);
+  assert.deepEqual(completed.effects.map((effect) => effect.type), ["persist"]);
+  assert.equal(completed.state.lifecycle, "recovering");
+  assert.equal(completed.state.waitFor, undefined);
+  assert.equal(completed.state.pauseReason, undefined);
+  assert.equal(completed.state.epoch, 4);
+  assert.equal(completed.state.budgets.epochRuns, 2);
+  assert.equal(completed.state.budgets.totalRuns, 7);
+  assert.equal(completed.state.budgets.totalTurns, 19);
+  assert.equal(
+    completed.state.ledger.nextAction,
+    "External dependency background_task bg_003 completed; reconcile its results against the active phase before continuing.",
+  );
+
+  expectUnchanged(reduceGoal(completed.state, {
+    type: "external_completed",
+    kind: "background_task",
+    id: "bg_003",
+    outcome: "succeeded",
+    now: 131,
+    eventId: "event_external_duplicate",
+  }), completed.state);
+});
+
+test("external completion mismatches and stale callbacks are harmless", () => {
+  const state = waitingExternal();
+  const baseAction = {
+    type: "external_completed" as const,
+    kind: "background_task" as const,
+    id: "bg_003",
+    outcome: "succeeded" as const,
+    now: 130,
+    eventId: "event_external_base",
+  };
+
+  expectUnchanged(reduceGoal(state, { ...baseAction, id: "bg_other" }), state);
+  expectUnchanged(reduceGoal(state, { ...baseAction, kind: "workflow" }), state);
+
+  const noWait = waitingExternal();
+  delete noWait.waitFor;
+  expectUnchanged(reduceGoal(noWait, baseAction), noWait);
+
+  const running = initial();
+  expectUnchanged(reduceGoal(running, baseAction), running);
+
+  const leased = waitingExternal();
+  leased.scheduler = {
+    state: "dispatch_pending",
+    dispatch: {
+      dispatchId: "dispatch_waiting",
+      goalId: leased.goalId,
+      epoch: leased.epoch,
+      revision: leased.revision,
+      runId: "run_waiting",
+      createdAt: 120,
+    },
+  };
+  leased.budgets.epochRuns = 1;
+  leased.budgets.totalRuns = 1;
+  expectUnchanged(reduceGoal(leased, baseAction), leased);
+
+  const compacting = waitingExternal();
+  compacting.scheduler = { state: "compaction_pending" };
+  compacting.compaction = { generation: 1, state: "pending", requestedAtRevision: compacting.revision };
+  expectUnchanged(reduceGoal(compacting, baseAction), compacting);
+
+  for (const lifecycle of ["succeeded", "cancelled", "failed"] as const) {
+    const terminal = initial();
+    terminal.lifecycle = lifecycle;
+    expectUnchanged(reduceGoal(terminal, { ...baseAction, eventId: `event_external_${lifecycle}` }), terminal);
+  }
+});
+
+test("human resume, pause, and cancel clear typed wait correlation", () => {
+  const actions = [
+    { type: "resume" as const, now: 130, eventId: "event_wait_resume" },
+    { type: "pause" as const, now: 130, eventId: "event_wait_pause" },
+    { type: "cancel" as const, now: 130, eventId: "event_wait_cancel" },
+  ];
+  for (const action of actions) {
+    const result = reduceGoal(waitingExternal(), action);
+    expectPersistFirst(result);
+    assert.equal(result.state.waitFor, undefined, action.type);
+    assert.notEqual(result.state.lifecycle, "waiting_external", action.type);
+  }
+});
+
+test("a failed external dependency diagnoses without changing criteria, while exhausted budget pauses", () => {
+  const failedState = waitingExternal("workflow", "workflow-7");
+  failedState.acceptanceCriteria = [{
+    id: "criterion-external",
+    description: "The dependency result is verified",
+    status: "pending",
+  }];
+  failedState.planVersion = 1;
+  failedState.phases = [{
+    id: "phase-external",
+    title: "Reconcile dependency",
+    intent: "Inspect typed completion without self-verifying",
+    status: "running",
+    dependencies: [],
+    criteria: [{ id: "phase-criterion-external", description: "Result is diagnosed", status: "pending" }],
+  }];
+  failedState.activePhaseId = "phase-external";
+  const criteriaBefore = structuredClone(failedState.acceptanceCriteria);
+  const phasesBefore = structuredClone(failedState.phases);
+  const failed = reduceGoal(failedState, {
+    type: "external_completed",
+    kind: "workflow",
+    id: "workflow-7",
+    outcome: "failed",
+    detail: "workflow cancelled",
+    now: 130,
+    eventId: "event_external_failed",
+  });
+  expectPersistFirst(failed);
+  assert.equal(failed.state.lifecycle, "recovering");
+  assert.equal(failed.state.waitFor, undefined);
+  assert.match(failed.state.ledger.nextAction ?? "", /failed \(workflow cancelled\); diagnose the failure/);
+  assert.match(failed.state.ledger.nextAction ?? "", /Do not mark criteria satisfied/);
+  assert.deepEqual(failed.state.acceptanceCriteria, criteriaBefore);
+  assert.deepEqual(failed.state.phases, phasesBefore);
+
+  const exhaustedState = waitingExternal("background_task", "bg_budget", { maxEpochRuns: 1 });
+  exhaustedState.budgets.epochRuns = 1;
+  exhaustedState.budgets.totalRuns = 1;
+  const exhausted = reduceGoal(exhaustedState, {
+    type: "external_completed",
+    kind: "background_task",
+    id: "bg_budget",
+    outcome: "succeeded",
+    now: 140,
+    eventId: "event_external_budget",
+  });
+  expectPersistFirst(exhausted);
+  assert.deepEqual(exhausted.effects.map((effect) => effect.type), ["persist", "notify"]);
+  assert.equal(exhausted.state.lifecycle, "paused");
+  assert.equal(exhausted.state.pauseReason, "budget");
+  assert.equal(exhausted.state.waitFor, undefined);
+  assert.equal(exhausted.state.epoch, exhaustedState.epoch);
+  assert.equal(exhausted.state.budgets.epochRuns, 1);
+  assert.match(exhausted.state.ledger.nextAction ?? "", /background_task bg_budget completed/);
 });
 
 test("resume starts a new epoch while preserving lifetime counters and elapsed origin", () => {

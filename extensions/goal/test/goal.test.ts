@@ -207,6 +207,15 @@ class ExtensionHarness {
     return results;
   }
 
+  async preflightTool(toolName: string, input: Record<string, unknown> = {}): Promise<any> {
+    const [result] = await this.emit("tool_call", {
+      toolCallId: `preflight-${this.nextId++}`,
+      toolName,
+      input,
+    });
+    return result;
+  }
+
   appendAssistant(text = "working", stopReason = "stop"): Entry {
     return this.append({
       type: "message",
@@ -218,6 +227,16 @@ class ExtensionHarness {
     return this.append({
       type: "message",
       message: { role: "user", content: [{ type: "text", text }] },
+    });
+  }
+
+  appendCustomMessage(customType: string, details: unknown, content = "typed extension notification"): Entry {
+    return this.append({
+      type: "custom_message",
+      customType,
+      content,
+      display: true,
+      details: structuredClone(details),
     });
   }
 
@@ -387,6 +406,7 @@ async function settleWithProgress(
 async function enterWaitingExternal(
   harness: ExtensionHarness,
   question = "Should the release target staging or production?",
+  waitFor?: GoalCheckpointParams["waitFor"],
 ): Promise<GoalCheckpointV2> {
   await createAndObserve(harness);
   await settleWithProgress(harness);
@@ -396,8 +416,9 @@ async function enterWaitingExternal(
     expectedRevision: active.revision,
     phaseId: active.activePhaseId,
     summary: "Engineering is paused for the user's deployment decision.",
-    nextAction: `Await the user's answer: ${question}`,
+    nextAction: `Await the dependency: ${question}`,
     openQuestions: [question],
+    ...(waitFor ? { waitFor } : {}),
   });
   harness.appendCheckpointResult(result);
   harness.appendAssistant("Waiting for the user's answer.");
@@ -504,6 +525,9 @@ test("an ordinary user answer can durably resume a waiting goal without a slash 
   assert.equal(harness.latestPersisted().lifecycle, "recovering");
   assert.equal(harness.latestPersisted().epoch, waiting.epoch + 1);
   assert.match(harness.latestPersisted().ledger.nextAction ?? "", /Use staging\./);
+  const afterResumeMutation = await harness.preflightTool("edit");
+  assert.equal(afterResumeMutation?.block, true);
+  assert.match(afterResumeMutation?.reason ?? "", /goal_resume must be the final tool call/);
 
   harness.idle = true;
   await harness.emit("agent_settled");
@@ -544,6 +568,297 @@ test("a clarification question leaves a waiting goal untouched", async () => {
   }, before);
 });
 
+test("background completion between the wait checkpoint and run settlement wakes exactly once", async () => {
+  const harness = new ExtensionHarness();
+  await createAndObserve(harness);
+  await settleWithProgress(harness);
+  const active = harness.latestPersisted();
+  const controlsBefore = harness.controls().length;
+
+  const result = await harness.callCheckpoint({
+    action: "waiting_external",
+    expectedRevision: active.revision,
+    phaseId: active.activePhaseId,
+    summary: "Started one owned background task.",
+    nextAction: "Wait for bg_003.",
+    waitFor: { kind: "background_task", id: "bg_003" },
+  });
+  const waitCheckpoint = result.details.checkpoint;
+  harness.appendCheckpointResult(result);
+  harness.appendCustomMessage("enhanced-bash-background", {
+    jobs: [{ id: "bg_003", kind: "bash", status: "exited", exitCode: 0 }],
+    monitorEvents: [],
+  });
+  harness.appendAssistant("The typed completion arrived; checkpoint settlement remains authoritative.");
+  await harness.emit("agent_settled");
+
+  const woke = harness.latestPersisted();
+  assert.equal(harness.controls().length, controlsBefore + 1);
+  assert.equal(woke.scheduler.state, "run_in_flight");
+  assert.equal(woke.lifecycle, "recovering");
+  assert.equal(woke.waitFor, undefined);
+  assert.equal(woke.epoch, waitCheckpoint.epoch, "machine wake does not refresh the epoch");
+  assert.match(woke.ledger.nextAction ?? "", /background_task bg_003 completed/);
+
+  const entries = harness.branch.length;
+  await harness.emit("agent_settled");
+  assert.equal(harness.branch.length, entries);
+  assert.equal(harness.controls().length, controlsBefore + 1);
+});
+
+test("typed completion matching ignores stale, unrelated, malformed, and prose-only callbacks", async () => {
+  const harness = new ExtensionHarness();
+  await createAndObserve(harness);
+  await settleWithProgress(harness);
+  const controlsBefore = harness.controls().length;
+
+  harness.appendCustomMessage("enhanced-bash-background", {
+    jobs: [{ id: "bg_stale", kind: "bash", status: "exited", exitCode: 0 }],
+  }, "stale completion before the wait checkpoint");
+  const active = harness.latestPersisted();
+  const result = await harness.callCheckpoint({
+    action: "waiting_external",
+    expectedRevision: active.revision,
+    phaseId: active.activePhaseId,
+    summary: "Wait for the current generation of bg_stale.",
+    nextAction: "Wait for typed terminal metadata.",
+    waitFor: { kind: "background_task", id: "bg_stale" },
+  });
+  harness.appendCheckpointResult(result);
+  harness.appendAssistant("Waiting after recording the correlation.");
+  await harness.emit("agent_settled");
+  assert.equal(harness.latestPersisted().lifecycle, "waiting_external", "pre-checkpoint completion is stale");
+
+  harness.appendCustomMessage("enhanced-bash-background", {
+    jobs: [{ id: "bg_other", kind: "bash", status: "exited", exitCode: 0 }],
+  });
+  harness.appendCustomMessage("enhanced-bash-background", {
+    jobs: [{ id: "bg_stale", kind: "bash", status: "running", exitCode: 0 }],
+  });
+  harness.appendCustomMessage("enhanced-bash-background", {
+    jobs: [{ id: "bg_stale", status: "exited", exitCode: "0" }],
+  });
+  harness.appendCustomMessage("enhanced-bash-background", { jobs: "not-an-array" });
+  harness.appendCustomMessage("some-prose-callback", undefined, "bg_stale finished successfully");
+  harness.append({
+    type: "message",
+    message: {
+      role: "toolResult",
+      toolName: "bash",
+      toolCallId: "untrusted-completion-shaped-result",
+      isError: false,
+      content: [{ type: "text", text: "bg_stale completed" }],
+      details: { jobs: [{ id: "bg_stale", kind: "bash", status: "exited", exitCode: 0 }] },
+    },
+  });
+  harness.appendAssistant("No trusted matching terminal metadata was present.");
+  await harness.emit("agent_settled");
+
+  assert.equal(harness.latestPersisted().lifecycle, "waiting_external");
+  assert.deepEqual(harness.latestPersisted().waitFor, { kind: "background_task", id: "bg_stale" });
+  assert.equal(harness.controls().length, controlsBefore);
+});
+
+test("failed typed completion enters diagnosis without satisfying criteria", async () => {
+  const harness = new ExtensionHarness();
+  const waiting = await enterWaitingExternal(
+    harness,
+    "background task bg_failure",
+    { kind: "background_task", id: "bg_failure" },
+  );
+  const criteriaBefore = structuredClone(waiting.acceptanceCriteria);
+  const controlsBefore = harness.controls().length;
+
+  harness.appendCustomMessage("enhanced-bash-background", {
+    jobs: [{ id: "bg_failure", kind: "bash", status: "failed", exitCode: 17 }],
+  });
+  harness.appendAssistant("The callback turn cannot self-verify goal criteria.");
+  await harness.emit("agent_settled");
+
+  const woke = harness.latestPersisted();
+  assert.equal(harness.controls().length, controlsBefore + 1);
+  assert.equal(woke.lifecycle, "recovering");
+  assert.equal(woke.scheduler.state, "run_in_flight");
+  assert.match(woke.ledger.nextAction ?? "", /failed \(exit code 17\); diagnose the failure/);
+  assert.match(woke.ledger.nextAction ?? "", /Do not mark criteria satisfied/);
+  assert.deepEqual(woke.acceptanceCriteria, criteriaBefore);
+});
+
+test("monitor timeout and workflow failure terminal statuses map to diagnosis", async () => {
+  const monitor = new ExtensionHarness();
+  await enterWaitingExternal(monitor, "finite monitor mon_001", {
+    kind: "background_task",
+    id: "mon_001",
+  });
+  monitor.appendCustomMessage("enhanced-bash-background", {
+    jobs: [{ id: "mon_001", kind: "monitor", status: "timed_out" }],
+  });
+  monitor.appendAssistant("Finite monitor terminated.");
+  await monitor.emit("agent_settled");
+  assert.match(monitor.latestPersisted().ledger.nextAction ?? "", /failed \(timed out\)/);
+
+  const workflow = new ExtensionHarness();
+  await enterWaitingExternal(workflow, "workflow workflow-error", {
+    kind: "workflow",
+    id: "workflow-error",
+  });
+  workflow.appendCustomMessage("workflow-notification", {
+    runId: "workflow-error",
+    status: "failed",
+    error: "untrusted producer detail",
+  });
+  workflow.appendAssistant("Workflow failure callback settled.");
+  await workflow.emit("agent_settled");
+  assert.match(workflow.latestPersisted().ledger.nextAction ?? "", /failed \(workflow failed\)/);
+  assert.doesNotMatch(workflow.latestPersisted().ledger.nextAction ?? "", /untrusted producer detail/);
+});
+
+test("a typed completion steered into an unrelated turn wakes when that turn settles", async () => {
+  const harness = new ExtensionHarness();
+  await enterWaitingExternal(harness, "task bg_steered", {
+    kind: "background_task",
+    id: "bg_steered",
+  });
+  const controlsBefore = harness.controls().length;
+  await harness.beginUserPrompt("Can you restate what this task is for?");
+  harness.appendCustomMessage("enhanced-bash-background", {
+    jobs: [{ id: "bg_steered", kind: "bash", status: "exited", exitCode: 0 }],
+  });
+  harness.appendAssistant("The unrelated clarification turn has now settled.");
+  await harness.emit("agent_settled");
+
+  assert.equal(harness.controls().length, controlsBefore + 1);
+  assert.equal(harness.latestPersisted().lifecycle, "recovering");
+  assert.equal(harness.latestPersisted().scheduler.state, "run_in_flight");
+});
+
+test("workflow completion wakes from restore and maps terminal failure statuses", async () => {
+  const restored = new ExtensionHarness();
+  const waiting = await enterWaitingExternal(
+    restored,
+    "workflow run workflow-restore",
+    { kind: "workflow", id: "workflow-restore" },
+  );
+  const controlsBefore = restored.controls().length;
+  restored.appendCustomMessage("workflow-notification", {
+    runId: "workflow-restore",
+    status: "completed",
+    agents: 2,
+    failures: 0,
+  });
+
+  await restored.emit("session_start");
+  assert.equal(restored.controls().length, controlsBefore + 1);
+  assert.equal(restored.latestPersisted().lifecycle, "recovering");
+  assert.equal(restored.latestPersisted().epoch, waiting.epoch);
+  assert.equal(restored.latestPersisted().waitFor, undefined);
+  assert.match(restored.latestPersisted().ledger.nextAction ?? "", /workflow workflow-restore completed/);
+
+  const failed = new ExtensionHarness();
+  await enterWaitingExternal(failed, "workflow run workflow-failed", {
+    kind: "workflow",
+    id: "workflow-failed",
+  });
+  failed.appendCustomMessage("workflow-notification", {
+    runId: "workflow-failed",
+    status: "cancelled",
+  });
+  failed.appendAssistant("Cancelled workflow callback settled.");
+  await failed.emit("agent_settled");
+  assert.match(failed.latestPersisted().ledger.nextAction ?? "", /failed \(workflow cancelled\)/);
+});
+
+test("a persisted machine wake retries dispatch later and ignores duplicate completion entries", async () => {
+  const harness = new ExtensionHarness();
+  await enterWaitingExternal(harness, "task bg_delayed", {
+    kind: "background_task",
+    id: "bg_delayed",
+  });
+  const controlsBefore = harness.controls().length;
+  harness.pending = true;
+  harness.appendCustomMessage("enhanced-bash-background", {
+    jobs: [{ id: "bg_delayed", kind: "bash", status: "exited", exitCode: 0 }],
+  });
+  harness.appendAssistant("Completion observed while another message is pending.");
+  await harness.emit("agent_settled");
+
+  const recoveredRevision = harness.latestPersisted().revision;
+  assert.equal(harness.latestPersisted().lifecycle, "recovering");
+  assert.equal(harness.latestPersisted().scheduler.state, "idle");
+  assert.equal(harness.controls().length, controlsBefore);
+
+  harness.appendCustomMessage("enhanced-bash-background", {
+    jobs: [{ id: "bg_delayed", kind: "bash", status: "exited", exitCode: 0 }],
+  });
+  harness.appendAssistant("Duplicate callback.");
+  await harness.emit("agent_settled");
+  assert.equal(harness.latestPersisted().revision, recoveredRevision);
+  assert.equal(harness.controls().length, controlsBefore);
+
+  harness.pending = false;
+  await harness.emit("agent_settled");
+  assert.equal(harness.controls().length, controlsBefore + 1);
+  assert.equal(harness.latestPersisted().scheduler.state, "run_in_flight");
+});
+
+test("a persisted typed machine wake survives reload before its dispatch", async () => {
+  const harness = new ExtensionHarness();
+  await enterWaitingExternal(harness, "task bg_reload_delayed", {
+    kind: "background_task",
+    id: "bg_reload_delayed",
+  });
+  const controlsBefore = harness.controls().length;
+  harness.pending = true;
+  harness.appendCustomMessage("enhanced-bash-background", {
+    jobs: [{ id: "bg_reload_delayed", kind: "bash", status: "exited", exitCode: 0 }],
+  });
+  harness.appendAssistant("Typed completion persisted before dispatch became eligible.");
+  await harness.emit("agent_settled");
+  assert.equal(harness.latestPersisted().lifecycle, "recovering");
+  assert.equal(harness.latestPersisted().scheduler.state, "idle");
+  assert.equal(harness.controls().length, controlsBefore);
+
+  harness.pending = false;
+  await harness.emit("session_start");
+  assert.equal(harness.controls().length, controlsBefore + 1);
+  assert.equal(harness.latestPersisted().lifecycle, "recovering");
+  assert.equal(harness.latestPersisted().scheduler.state, "run_in_flight");
+});
+
+test("waiting and blocked goals gate mutating tools but preserve read-only and protocol access", async () => {
+  const waitingHarness = new ExtensionHarness();
+  await enterWaitingExternal(waitingHarness);
+  waitingHarness.idle = false;
+
+  for (const toolName of ["read", "grep", "find", "ls", GOAL_RESUME_TOOL, GOAL_CHECKPOINT_TOOL]) {
+    assert.equal(await waitingHarness.preflightTool(toolName), undefined, `${toolName} remains available`);
+  }
+  for (const toolName of ["bash", "edit", "write", "custom_mutator"]) {
+    const blocked = await waitingHarness.preflightTool(toolName);
+    assert.equal(blocked?.block, true, `${toolName} is blocked`);
+    assert.match(blocked?.reason ?? "", /Should the release target staging or production/);
+    assert.match(blocked?.reason ?? "", /goal_resume/);
+    assert.match(blocked?.reason ?? "", /\/goal pause/);
+  }
+
+  await waitingHarness.command("pause");
+  assert.equal(await waitingHarness.preflightTool("bash"), undefined, "explicit pause releases the wait gate");
+
+  const runningHarness = new ExtensionHarness();
+  assert.equal(await runningHarness.preflightTool("bash"), undefined, "an absent goal does not gate tools");
+  await createAndObserve(runningHarness);
+  assert.equal(await runningHarness.preflightTool("write"), undefined, "a goal-owned run is not gated");
+  await runningHarness.command("stop");
+  assert.equal(await runningHarness.preflightTool("write"), undefined, "a terminal goal does not gate tools");
+
+  const blockedHarness = new ExtensionHarness();
+  await createAndObserve(blockedHarness);
+  blockedHarness.appendAssistant("[[GOAL_BLOCKED: choose the migration strategy]]");
+  await blockedHarness.emit("agent_settled");
+  assert.equal((await blockedHarness.preflightTool("edit"))?.block, true);
+  assert.equal(await blockedHarness.preflightTool("read"), undefined);
+});
+
 test("goal_checkpoint result details are authoritative and settlement queues one continuation", async () => {
   const harness = new ExtensionHarness();
   const active = await createAndObserve(harness);
@@ -556,6 +871,9 @@ test("goal_checkpoint result details are authoritative and settlement queues one
     "tool execution is speculative until Pi appends its result details",
   );
   assert.equal(result.details.checkpoint.ledger.recentProgress.at(-1), "authoritative durable progress");
+  const afterCheckpointMutation = await harness.preflightTool("bash");
+  assert.equal(afterCheckpointMutation?.block, true);
+  assert.match(afterCheckpointMutation?.reason ?? "", /goal_checkpoint must be the final tool call/);
   harness.appendCheckpointResult(result);
   harness.appendAssistant("Finished this run normally.");
   await harness.emit("agent_settled");
