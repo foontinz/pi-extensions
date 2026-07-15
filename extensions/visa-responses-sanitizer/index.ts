@@ -50,25 +50,33 @@ function stripFields(value: unknown, seen = new Set<object>()): void {
   }
 }
 
+/**
+ * Pure transform: given a provider payload, return a sanitized copy with the
+ * offending fields removed from Responses `input` items, or `undefined` when
+ * there is nothing to change. Never mutates the input payload.
+ */
+export function sanitizeResponsesPayload(payload: unknown): (Record<string, unknown> & { input: unknown[] }) | undefined {
+  if (!isResponsesStylePayload(payload) || !containsStripField(payload.input)) return undefined;
+  // Do not mutate Pi's payload or nested input items: later extensions and
+  // retry paths may still observe them. structuredClone also avoids unsafe
+  // object-copy handling for keys such as "__proto__".
+  try {
+    const input = structuredClone(payload.input);
+    stripFields(input);
+    return { ...payload, input };
+  } catch {
+    // Provider payloads are expected to be structured-cloneable. If a custom
+    // extension supplied an unsupported value, fail open rather than breaking
+    // the request for a sanitizer-only compatibility workaround.
+    return undefined;
+  }
+}
+
 export default function (pi: ExtensionAPI) {
   pi.on("before_provider_request", (event, ctx) => {
     // This is intentionally narrow. Other OpenAI-compatible Responses
     // providers may accept or require these fields, so leave them untouched.
     if (ctx.model?.provider !== "visa-openai" || ctx.model.api !== "openai-responses") return;
-    if (!isResponsesStylePayload(event.payload) || !containsStripField(event.payload.input)) return;
-
-    // Do not mutate Pi's payload or nested input items: later extensions and
-    // retry paths may still observe them. structuredClone also avoids unsafe
-    // object-copy handling for keys such as "__proto__".
-    try {
-      const input = structuredClone(event.payload.input);
-      stripFields(input);
-      return { ...event.payload, input };
-    } catch {
-      // Provider payloads are expected to be structured-cloneable. If a custom
-      // extension supplied an unsupported value, fail open rather than breaking
-      // the request for a sanitizer-only compatibility workaround.
-      return;
-    }
+    return sanitizeResponsesPayload(event.payload);
   });
 }

@@ -157,6 +157,11 @@ export function parseInvocation(argv: string[]): Invocation {
   }
 }
 
+function paneLabel(state: Pick<PrState, "key" | "title">, status: string): string {
+  const name = state.title?.trim();
+  return name ? `${name} · ${state.key} · ${status}` : `${state.key} · ${status}`;
+}
+
 async function watch(input: string, io: CliIo): Promise<void> {
   const app = appPaths();
   await ensureAppDirs(app);
@@ -172,9 +177,10 @@ async function watch(input: string, io: CliIo): Promise<void> {
 
   let state = await loadPrState(key, app);
   if (!state) {
-    state = createPrState({ key, url: resolved.url, headRefName: resolved.headRefName, baseRefName: resolved.baseRefName });
+    state = createPrState({ key, url: resolved.url, title: resolved.title, headRefName: resolved.headRefName, baseRefName: resolved.baseRefName });
   } else {
     state.url = resolved.url;
+    state.title = resolved.title;
     state.headRefName = resolved.headRefName;
     state.baseRefName = resolved.baseRefName;
   }
@@ -213,7 +219,7 @@ async function watch(input: string, io: CliIo): Promise<void> {
     state.status = "watching";
     state.lastError = null;
     await savePrState(state, app);
-    await setPaneLabel(pane.ref, key, `${key} · watching`);
+    await setPaneLabel(pane.ref, key, paneLabel(state, "watching"));
     io.out(`${pane.disposition === "created" ? "Watching" : "Already watching"} ${key} in pane ${pane.ref.paneId}`);
   } catch (error) {
     state.status = "error";
@@ -344,7 +350,7 @@ async function runPoller(key: string, once: boolean, io: CliIo): Promise<void> {
     await recoverInterruptedRun(state, app, client);
     const host = parsePrKey(key).host;
     let ownLogin: string | null = null;
-    if (state.tmux) await setPaneLabel(state.tmux, key, `${key} · watching`);
+    if (state.tmux) await setPaneLabel(state.tmux, key, paneLabel(state, "watching"));
     io.out(`[${new Date().toISOString()}] ${key} · poller started${once ? " (--once)" : ""}`);
 
     while (!controller.signal.aborted) {
@@ -376,7 +382,7 @@ async function runPoller(key: string, once: boolean, io: CliIo): Promise<void> {
         }
         if (state.tmux) {
           const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-          await setPaneLabel(state.tmux, key, `${key} · watching · ${time}`);
+          await setPaneLabel(state.tmux, key, paneLabel(state, `watching · ${time}`));
         }
         if (result.terminalState !== null) {
           io.out(`[${new Date().toISOString()}] ${key} · PR ${result.terminalState.toLowerCase()}; watcher stopped`);
@@ -385,7 +391,7 @@ async function runPoller(key: string, once: boolean, io: CliIo): Promise<void> {
 
         if (state.pendingEvents.length > 0) {
           io.out(`\a[${new Date().toISOString()}] ${key} · dispatching ${state.pendingEvents.length} queued event${state.pendingEvents.length === 1 ? "" : "s"}`);
-          if (state.tmux) await setPaneLabel(state.tmux, key, `${key} · agent running`);
+          if (state.tmux) await setPaneLabel(state.tmux, key, paneLabel(state, "agent running"));
           const dispatched = await dispatchPendingEvents(state, config, { app, signal: controller.signal });
           if (dispatched) {
             if (dispatched.escalation) {
@@ -396,7 +402,7 @@ async function runPoller(key: string, once: boolean, io: CliIo): Promise<void> {
             if (dispatched.error) io.error(`${key} · agent error: ${dispatched.error}`);
             if (dispatched.notificationError) io.error(`${key} · notification failed: ${dispatched.notificationError}`);
           }
-          if (state.tmux) await setPaneLabel(state.tmux, key, `${key} · watching`);
+          if (state.tmux) await setPaneLabel(state.tmux, key, paneLabel(state, "watching"));
         }
         if (once) return;
         await waitWithAbort(config.pollIntervalSec * 1_000, controller.signal);
@@ -410,7 +416,7 @@ async function runPoller(key: string, once: boolean, io: CliIo): Promise<void> {
           io.error(`\u001b[31m\a${key} · polling entered error state after 5 failures\u001b[0m`);
           await notifyEscalation(`PR babysitter: ${key}`, "Polling entered error state after five failures").catch(() => false);
         }
-        if (state.tmux) await setPaneLabel(state.tmux, key, `${key} · error ${state.consecutiveErrors}`);
+        if (state.tmux) await setPaneLabel(state.tmux, key, paneLabel(state, `error ${state.consecutiveErrors}`));
         if (once) throw failure;
 
         let delay = backoffMilliseconds(config.pollIntervalSec, state.consecutiveErrors);

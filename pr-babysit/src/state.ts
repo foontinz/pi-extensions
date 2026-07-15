@@ -57,6 +57,7 @@ export interface PrState {
   schemaVersion: 1;
   key: string;
   url: string;
+  title: string | null;
   repoRoot: string | null;
   worktreePath: string | null;
   headRefName: string | null;
@@ -87,6 +88,7 @@ export interface PrState {
 export interface InitialPrState {
   key: string;
   url?: string;
+  title?: string | null;
   repoRoot?: string | null;
   worktreePath?: string | null;
   headRefName?: string | null;
@@ -229,6 +231,7 @@ export function createPrState(input: InitialPrState, now = new Date()): PrState 
     schemaVersion: 1,
     key: parsed.key,
     url: input.url ?? `https://${parsed.host}/${parsed.owner}/${parsed.repo}/pull/${parsed.number}`,
+    title: input.title ?? null,
     repoRoot: input.repoRoot ?? null,
     worktreePath: input.worktreePath ?? null,
     headRefName: input.headRefName ?? null,
@@ -284,6 +287,7 @@ export function parsePrState(value: unknown, expectedKey?: string): PrState {
     schemaVersion: 1,
     key,
     url: string(state.url, "state.url"),
+    title: state.title === undefined ? null : nullableString(state.title, "state.title"),
     repoRoot: nullableString(state.repoRoot, "state.repoRoot"),
     worktreePath: nullableString(state.worktreePath, "state.worktreePath"),
     headRefName: nullableString(state.headRefName, "state.headRefName"),

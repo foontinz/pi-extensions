@@ -45,7 +45,7 @@ node src/cli.ts ack ESCALATION-UUID
 node src/cli.ts unwatch owner/repo#123
 ```
 
-`watch` is idempotent. It provisions one managed worktree and one foreground pane in the tmux `babysitting` window per PR. State, event history, prompts, JSONL output, sessions, and escalation history remain under `~/.pr-babysitter`; only explicit `unwatch` removes the worktree, and state is archived rather than discarded.
+`watch` is idempotent. It provisions one managed worktree and one foreground pane in the tmux `babysitting` window per PR. The pane border is labelled with the PR title alongside its `owner/repo#N` key and current status. State, event history, prompts, JSONL output, sessions, and escalation history remain under `~/.pr-babysitter`; only explicit `unwatch` removes the worktree, and state is archived rather than discarded.
 
 A bare PR number resolves against the current Git repository. `run --pr [host/]owner/repo#N` is an internal pane command; `--once` is useful for controlled diagnostics.
 
