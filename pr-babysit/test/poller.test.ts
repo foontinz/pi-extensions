@@ -59,6 +59,73 @@ test("baseline and repeated snapshots emit each external event exactly once", as
   assert.deepEqual(late.cursors.issueCommentIdsAtSince, [2, 3, 4, 5, 6]);
 });
 
+test("tagging the owner login escalates directly instead of queueing agent work", async () => {
+  const state = createPrState({ key: "owner/repo#1" });
+  apply(state, diffPollSnapshot(state, await fixture("baseline"), "foontinz", "2026-01-01T00:10:00Z"));
+
+  const snapshot = structuredClone(await fixture("changes"));
+  snapshot.issueComments[1]!.body = "Please check this @foontinz";
+  snapshot.issueComments[1]!.raw = { ...snapshot.issueComments[1]!.raw, html_url: "https://github.com/owner/repo/pull/1#issuecomment-2" };
+  const diff = diffPollSnapshot(state, snapshot, "foontinz", "2026-01-01T00:15:00Z");
+
+  assert.equal(diff.escalationRequests.length, 1);
+  assert.equal(diff.escalationRequests[0]?.eventId, "comment:2:2026-01-01T00:11:00.000Z");
+  assert.match(diff.escalationRequests[0]?.reason ?? "", /@foontinz was mentioned/);
+  assert.deepEqual(diff.events.map((event) => event.actor), ["charlie", "dave", "erin", "frank"]);
+});
+
+test("pollOnce persists direct mention escalations without pending events", async () => {
+  const home = await mkdtemp(join(tmpdir(), "pr-babysit-poller-mention-"));
+  const app = appPaths(home);
+  const state = createPrState({ key: "owner/repo#1" });
+  const baseline = await fixture("baseline");
+  const mention = structuredClone(baseline);
+  mention.issueComments.push({
+    id: 77,
+    body: "Can you check this @foontinz?",
+    createdAt: "2026-01-01T00:11:00.000Z",
+    updatedAt: "2026-01-01T00:11:00.000Z",
+    actor: "alice",
+    raw: { id: 77, html_url: "https://github.com/owner/repo/pull/1#issuecomment-77" },
+  });
+  const snapshots = [baseline, mention];
+  const client: SnapshotClient = {
+    async pollSnapshot() {
+      const next = snapshots.shift();
+      if (!next) throw new Error("fixture exhausted");
+      return next;
+    },
+  };
+
+  await pollOnce(client, state, "foontinz", app, { observedAt: new Date("2026-01-01T00:10:00Z") });
+  const result = await pollOnce(client, state, "foontinz", app, { observedAt: new Date("2026-01-01T00:12:00Z") });
+
+  assert.deepEqual(result.events, []);
+  assert.equal(result.createdEscalations.length, 1);
+  const persisted = await loadPrState(state.key, app);
+  assert.equal(persisted?.pendingEvents.length, 0);
+  assert.equal(persisted?.escalations.length, 1);
+  assert.match(persisted?.escalations[0]?.details ?? "", /issuecomment-77/);
+});
+
+test("empty review bodies do not emit redundant global review events", async () => {
+  const state = createPrState({ key: "owner/repo#1" });
+  apply(state, diffPollSnapshot(state, await fixture("baseline"), "foontinz", "2026-01-01T00:10:00Z"));
+
+  const snapshot = structuredClone(await fixture("baseline"));
+  snapshot.reviews.push({
+    id: 11,
+    body: "   \n",
+    state: "COMMENTED",
+    submittedAt: "2026-01-01T00:11:00.000Z",
+    actor: "frank",
+    raw: { id: 11, body: "   \n" },
+  });
+  const diff = diffPollSnapshot(state, snapshot, "foontinz", "2026-01-01T00:12:00Z");
+  assert.deepEqual(diff.events, []);
+  assert.equal(diff.cursors.lastReviewId, 11);
+});
+
 test("CI fires only after settlement, conflict flips once per head, and closure stops", async () => {
   const state = createPrState({ key: "owner/repo#1" });
   apply(state, diffPollSnapshot(state, await fixture("baseline"), "foontinz", "2026-01-01T00:10:00Z"));

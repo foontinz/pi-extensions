@@ -364,7 +364,14 @@ async function runPoller(key: string, once: boolean, io: CliIo): Promise<void> {
         const result = await pollOnce(client, state, ownLogin, app, { signal: controller.signal });
         if (result.initialized) io.out(`[${new Date().toISOString()}] ${key} · baseline established`);
         for (const event of result.events) io.out(`[${new Date().toISOString()}] ${key} · queued ${event.type}: ${event.summary}`);
-        if (!result.initialized && result.events.length === 0) {
+        for (const escalation of result.createdEscalations) {
+          io.error(`\u001b[31m\a${key} · ESCALATED ${escalation.id}: ${escalation.reason}\u001b[0m`);
+          await notifyEscalation(`PR babysitter: ${key}`, escalation.reason).catch((error: unknown) => {
+            io.error(`${key} · notification failed: ${(error as Error).message}`);
+            return false;
+          });
+        }
+        if (!result.initialized && result.events.length === 0 && result.createdEscalations.length === 0) {
           io.out(`[${new Date().toISOString()}] ${key} · no new events`);
         }
         if (state.tmux) {

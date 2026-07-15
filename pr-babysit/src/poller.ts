@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
 
+import { addEscalation, type EscalationRequest } from "./escalation.ts";
 import { type ApiComment, type ApiReview, type GhRunOptions, type PollSnapshot, type PrRef } from "./gh.ts";
 import { type AppPaths, appPaths, parsePrKey } from "./paths.ts";
 import {
   appendEventRecords,
+  type Escalation,
   type EventRecord,
   type JsonValue,
   type PrState,
@@ -23,8 +25,14 @@ const PASSED_CHECK_CONCLUSIONS = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
 
 export type TerminalPrState = "CLOSED" | "MERGED";
 
+export interface DirectEscalationRequest extends Pick<EscalationRequest, "reason" | "details"> {
+  eventId: string;
+  summary: string;
+}
+
 export interface PollDiff {
   events: EventRecord[];
+  escalationRequests: DirectEscalationRequest[];
   cursors: PrState["cursors"];
   terminalState: TerminalPrState | null;
   initialized: boolean;
@@ -32,6 +40,7 @@ export interface PollDiff {
 
 export interface PollOnceResult extends PollDiff {
   snapshot: PollSnapshot;
+  createdEscalations: Escalation[];
 }
 
 export interface SnapshotClient {
@@ -68,6 +77,20 @@ function ignored(actor: string | null, _body: string, ownLogin: string): boolean
   // The reply marker is public and attacker-controlled. Only authenticated
   // authorship may suppress a comment; copied markers from others stay queued.
   return actor?.toLowerCase() === ownLogin.toLowerCase();
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function mentionsLogin(body: string, login: string): boolean {
+  return new RegExp(`(^|[^A-Za-z0-9_-])@${escapeRegExp(login)}(?![A-Za-z0-9_-])`, "i").test(body);
+}
+
+function rawString(value: unknown, field: string): string | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const candidate = (value as Record<string, unknown>)[field];
+  return typeof candidate === "string" ? candidate : null;
 }
 
 interface AdvancedComments {
@@ -187,14 +210,28 @@ function reviewCommentEvent(comment: ApiComment): EventRecord {
   };
 }
 
+function mentionEscalation(event: EventRecord, body: string, ownLogin: string): DirectEscalationRequest {
+  const source = rawString(event.raw, "html_url");
+  return {
+    eventId: event.id,
+    summary: event.summary,
+    reason: `@${ownLogin} was mentioned`,
+    details: `${event.summary}${source ? ` Source: ${source}.` : ""} Body: ${bodySummary(body)}`,
+  };
+}
+
+function hasActionableReviewBody(review: ApiReview): boolean {
+  return review.body.trim() !== "";
+}
+
 function reviewEvent(review: ApiReview, observedAt: string): EventRecord {
   return {
     id: `review:${review.id}`,
     type: "review",
     observedAt: review.submittedAt === null ? observedAt : normalizeTimestamp(review.submittedAt),
     actor: review.actor,
-    summary: `Review ${review.state}${review.actor ? ` by @${review.actor}` : ""}${review.body ? `: ${bodySummary(review.body)}` : ""}`,
-    raw: json(review.raw, "review.raw"),
+    summary: `Review ${review.state}${review.actor ? ` by @${review.actor}` : ""}: ${bodySummary(review.body)}`,
+    raw: json({ ...review.raw, body: review.body }, "review.raw"),
     runAttempts: 0,
   };
 }
@@ -233,17 +270,31 @@ export function diffPollSnapshot(
   const headChanged = state.cursors.headOid !== null && state.cursors.headOid !== snapshot.pr.headRefOid;
   const terminalState = snapshot.pr.state === "OPEN" ? null : snapshot.pr.state;
   const events: EventRecord[] = [];
+  const escalationRequests: DirectEscalationRequest[] = [];
 
   if (!baseline && terminalState === null) {
     for (const comment of issue.fresh) {
-      if (!ignored(comment.actor, comment.body, ownLogin)) events.push(issueCommentEvent(comment));
+      if (ignored(comment.actor, comment.body, ownLogin)) continue;
+      const event = issueCommentEvent(comment);
+      if (mentionsLogin(comment.body, ownLogin)) escalationRequests.push(mentionEscalation(event, comment.body, ownLogin));
+      else events.push(event);
     }
     for (const comment of reviewComments.fresh) {
-      if (!ignored(comment.actor, comment.body, ownLogin)) events.push(reviewCommentEvent(comment));
+      if (ignored(comment.actor, comment.body, ownLogin)) continue;
+      const event = reviewCommentEvent(comment);
+      if (mentionsLogin(comment.body, ownLogin)) escalationRequests.push(mentionEscalation(event, comment.body, ownLogin));
+      else events.push(event);
     }
     for (const review of snapshot.reviews) {
-      if (previousReviewId !== null && review.id > previousReviewId && !ignored(review.actor, review.body, ownLogin)) {
-        events.push(reviewEvent(review, observedAt));
+      if (
+        previousReviewId !== null &&
+        review.id > previousReviewId &&
+        hasActionableReviewBody(review) &&
+        !ignored(review.actor, review.body, ownLogin)
+      ) {
+        const event = reviewEvent(review, observedAt);
+        if (mentionsLogin(review.body, ownLogin)) escalationRequests.push(mentionEscalation(event, review.body, ownLogin));
+        else events.push(event);
       }
     }
     if (
@@ -282,6 +333,7 @@ export function diffPollSnapshot(
     ...(state.lastRun?.eventIds ?? []),
   ]);
   const uniqueEvents = events.filter((event) => !alreadyQueued.has(event.id));
+  const uniqueEscalationRequests = escalationRequests.filter((request) => !alreadyQueued.has(request.eventId));
   const cursors: PrState["cursors"] = {
     initializedAt: state.cursors.initializedAt ?? observedAt,
     issueCommentsSince: issue.since,
@@ -295,7 +347,7 @@ export function diffPollSnapshot(
     prState: snapshot.pr.state,
   };
 
-  return { events: uniqueEvents, cursors, terminalState, initialized: baseline };
+  return { events: uniqueEvents, escalationRequests: uniqueEscalationRequests, cursors, terminalState, initialized: baseline };
 }
 
 export async function pollOnce(
@@ -319,6 +371,9 @@ export async function pollOnce(
   nextState.headRefName = snapshot.pr.headRefName;
   nextState.baseRefName = snapshot.pr.baseRefName;
   nextState.pendingEvents.push(...diff.events);
+  const createdEscalations = diff.escalationRequests.map((request) =>
+    addEscalation(nextState, request, null, options.observedAt ?? new Date())
+  );
   nextState.consecutiveErrors = 0;
   nextState.lastError = null;
   nextState.status = "watching";
@@ -329,7 +384,7 @@ export async function pollOnce(
   await savePrState(nextState, app);
   Object.assign(state, nextState);
 
-  return { ...diff, snapshot };
+  return { ...diff, snapshot, createdEscalations };
 }
 
 export async function recordPollError(state: PrState, error: Error, app: AppPaths = appPaths()): Promise<void> {

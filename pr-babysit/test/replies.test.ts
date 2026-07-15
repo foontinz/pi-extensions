@@ -2,20 +2,20 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { ApiComment } from "../src/gh.ts";
-import { requiredReplyTargets, verifyReplySnapshot, verifyRequiredReplies } from "../src/replies.ts";
+import { replyEventMarker, requiredReplyTargets, verifyReplySnapshot, verifyRequiredReplies } from "../src/replies.ts";
 import type { EventRecord } from "../src/state.ts";
 
 const runId = "00000000-0000-4000-8000-000000000001";
 const marker = `<!-- pr-babysitter:run=${runId} -->`;
 
-function event(id: string, type: EventRecord["type"]): EventRecord {
+function event(id: string, type: EventRecord["type"], raw: Record<string, unknown> = {}): EventRecord {
   return {
     id,
     type,
     observedAt: "2026-01-01T00:00:00.000Z",
     actor: "reviewer",
     summary: "request",
-    raw: {},
+    raw: raw as EventRecord["raw"],
     runAttempts: 0,
   };
 }
@@ -35,7 +35,7 @@ const events = [
   event("comment:11:2026-01-01T00:00:00.000Z", "comment"),
   event("comment:12:2026-01-01T00:00:00.000Z", "comment"),
   event("review_comment:21:2026-01-01T00:00:00.000Z", "review_comment"),
-  event("review:31", "review"),
+  event("review:31", "review", { body: "Please handle this." }),
 ];
 
 test("reply verification requires a distinct authored response for every trusted target", () => {
@@ -53,6 +53,29 @@ test("reply verification requires a distinct authored response for every trusted
     [events[3]?.id, 103],
   ]);
   assert.equal(requiredReplyTargets("owner/repo#1", events).length, 4);
+});
+
+test("nested review comments verify against the GitHub thread root parent", () => {
+  const nested = event("review_comment:22:2026-01-01T00:00:00.000Z", "review_comment", { in_reply_to_id: 21 });
+  const review = [comment(202, `Nested threaded response ${marker}`, "owner", { in_reply_to_id: 21 })];
+  const receipts = verifyReplySnapshot("owner/repo#1", [nested], runId, "owner", [], review);
+  assert.deepEqual(receipts, [{ eventId: nested.id, replyId: 202, kind: "review_comment" }]);
+});
+
+test("stable event markers let retries reuse already-posted replies without double-posting", () => {
+  const retryRunId = "11111111-1111-4111-8111-111111111111";
+  const targetEvent = events[0]!;
+  const previousRunReply = comment(
+    104,
+    `Reply to https://github.com/owner/repo/pull/1#issuecomment-11: fixed ${replyEventMarker(targetEvent.id)} <!-- pr-babysitter:run=${retryRunId} -->`,
+  );
+  const receipts = verifyReplySnapshot("owner/repo#1", [targetEvent], runId, "owner", [previousRunReply], []);
+  assert.deepEqual(receipts, [{ eventId: targetEvent.id, replyId: 104, kind: "issue_comment" }]);
+});
+
+test("blank review bodies do not require a global pull-request reply", () => {
+  const blank = event("review:32", "review", { body: "  \n" });
+  assert.deepEqual(requiredReplyTargets("owner/repo#1", [blank]), []);
 });
 
 test("Enterprise reply links and API verification preserve the explicit hostname", async () => {

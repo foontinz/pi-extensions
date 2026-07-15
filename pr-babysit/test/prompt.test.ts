@@ -51,13 +51,15 @@ test("trusted reply routing requires one response per source comment and preserv
   assert.match(routing, /issuecomment-2/);
   assert.match(routing, /pulls\/1\/comments\/3\/replies/);
   assert.match(routing, /pullrequestreview-4/);
+  assert.match(routing, /pr-babysitter:event=comment:1/);
+  assert.match(routing, /before the final run marker/);
   assert.equal((routing.match(/^- /gm) ?? []).length, 4);
   const enterpriseRouting = buildReplyInstructions("ghe.example.test/owner/repo#1", [event()]);
   assert.match(enterpriseRouting, /gh api --hostname ghe\.example\.test --method POST/);
   assert.match(enterpriseRouting, /https:\/\/ghe\.example\.test\/owner\/repo\/pull\/1#issuecomment-1/);
 
   const prompt = buildRunPrompt(state(), events, "00000000-0000-4000-8000-000000000001");
-  assert.match(prompt, /answer every source comment\/review separately/i);
+  assert.match(prompt, /answer only the trusted reply targets/i);
   assert.equal(prompt.match(/<untrusted_pr_content/g)?.length, 1);
   assert.throws(() => buildReplyInstructions(state().key, [{ ...event(), id: "comment:not-numeric" }]), /Invalid comment event ID/);
 });
@@ -72,6 +74,7 @@ test("runner rules pin branch, marker, isolation scope, escalation file, and per
   assert.match(rules, /only through gh and only for this pull request/i);
   assert.match(rules, /pr-babysitter:run=00000000/);
   assert.match(rules, /Answer every trusted reply target separately/);
+  assert.match(rules, /event marker/);
   assert.match(rules, /review-comment reply must stay in that review thread/);
   assert.match(rules, /\/tmp\/control\/escalation\.json/);
   assert.match(rules, /do not push or reply/i);

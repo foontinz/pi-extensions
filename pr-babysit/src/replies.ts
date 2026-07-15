@@ -4,7 +4,7 @@ import type { EventRecord } from "./state.ts";
 
 export type ReplyTarget = { host: string } & (
   | { kind: "issue_comment"; eventId: string; sourceId: number; sourceUrl: string; endpoint: string }
-  | { kind: "review_comment"; eventId: string; sourceId: number; endpoint: string }
+  | { kind: "review_comment"; eventId: string; sourceId: number; threadRootId: number; endpoint: string }
   | { kind: "review"; eventId: string; sourceId: number; sourceUrl: string; endpoint: string }
 );
 
@@ -24,6 +24,18 @@ function numericEventId(event: EventRecord, prefix: string): number {
   const match = new RegExp(`^${prefix}:(\\d+)(?::|$)`).exec(event.id);
   if (!match?.[1]) throw new Error(`Invalid ${event.type} event ID for reply routing`);
   return Number(match[1]);
+}
+
+function rawNumber(value: unknown, field: string): number | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const candidate = (value as Record<string, unknown>)[field];
+  return typeof candidate === "number" && Number.isSafeInteger(candidate) && candidate > 0 ? candidate : null;
+}
+
+function rawString(value: unknown, field: string): string {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return "";
+  const candidate = (value as Record<string, unknown>)[field];
+  return typeof candidate === "string" ? candidate : "";
 }
 
 export function requiredReplyTargets(key: string, events: readonly EventRecord[]): ReplyTarget[] {
@@ -49,10 +61,12 @@ export function requiredReplyTargets(key: string, events: readonly EventRecord[]
         kind: "review_comment",
         eventId: event.id,
         sourceId,
+        threadRootId: rawNumber(event.raw, "in_reply_to_id") ?? sourceId,
         endpoint: `${repository}/pulls/${parsed.number}/comments/${sourceId}/replies`,
       }];
     }
     if (event.type === "review") {
+      if (rawString(event.raw, "body").trim() === "") return [];
       const sourceId = numericEventId(event, "review");
       return [{
         host: parsed.host,
@@ -67,9 +81,17 @@ export function requiredReplyTargets(key: string, events: readonly EventRecord[]
   });
 }
 
+export function replyEventMarker(eventId: string): string {
+  return `<!-- pr-babysitter:event=${eventId} -->`;
+}
+
 function rawReplyParent(comment: ApiComment): number | null {
   const value = comment.raw.in_reply_to_id;
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function hasReceiptMarker(body: string, runMarker: string, eventId: string): boolean {
+  return body.includes(runMarker) || body.includes(replyEventMarker(eventId));
 }
 
 export function verifyReplySnapshot(
@@ -93,8 +115,8 @@ export function verifyReplySnapshot(
       const reply = reviewComments.find((comment) =>
         !usedReviewReplies.has(comment.id) &&
         comment.actor?.toLowerCase() === own &&
-        comment.body.includes(marker) &&
-        rawReplyParent(comment) === target.sourceId
+        hasReceiptMarker(comment.body, marker, target.eventId) &&
+        rawReplyParent(comment) === target.threadRootId
       );
       if (!reply) {
         missing.push(target.eventId);
@@ -111,7 +133,7 @@ export function verifyReplySnapshot(
     const reply = issueComments.find((comment) =>
       !usedIssueReplies.has(comment.id) &&
       comment.actor?.toLowerCase() === own &&
-      comment.body.includes(marker) &&
+      hasReceiptMarker(comment.body, marker, target.eventId) &&
       comment.body.startsWith(attribution)
     );
     if (!reply) {
