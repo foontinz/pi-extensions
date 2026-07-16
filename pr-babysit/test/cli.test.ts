@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { displayStatus, main, parseInvocation, recoveryHint } from "../src/cli.ts";
+import { displayStatus, main, paneLabel, parseInvocation, recoveryHint } from "../src/cli.ts";
 import { createPrState } from "../src/state.ts";
 
 test("CLI parser canonicalizes keys and enforces command-specific syntax", () => {
@@ -64,6 +64,21 @@ test("help documents prerequisites, retained state, and concrete recovery action
     /gh auth status/,
   );
   assert.match(recoveryHint("worktree has uncommitted changes"), /--force/);
+});
+
+test("pane labels always lead with repository, PR number, and a cropped PR name", () => {
+  assert.equal(
+    paneLabel({ key: "owner/repo#42", title: "Keep pane labels useful" }, "watching"),
+    "repo #42 · Keep pane labels useful · watching",
+  );
+  assert.equal(
+    paneLabel({ key: "ghe.example.test/owner/repo#7", title: "A title that is deliberately much longer than forty characters" }, "agent running"),
+    "repo #7 · A title that is deliberately much longe… · agent running",
+  );
+  assert.equal(
+    paneLabel({ key: "owner/repo#1", title: null }, "watching"),
+    "repo #1 · untitled PR · watching",
+  );
 });
 
 test("terminal PR state is visible even after its pane exits", () => {

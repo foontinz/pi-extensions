@@ -157,9 +157,19 @@ export function parseInvocation(argv: string[]): Invocation {
   }
 }
 
-function paneLabel(state: Pick<PrState, "key" | "title">, status: string): string {
-  const name = state.title?.trim();
-  return name ? `${name} · ${state.key} · ${status}` : `${state.key} · ${status}`;
+const MAX_PANE_PR_NAME_LENGTH = 40;
+
+function cropPanePrName(title: string | null): string {
+  const name = title?.replace(/\s+/g, " ").trim() || "untitled PR";
+  const characters = Array.from(name);
+  return characters.length <= MAX_PANE_PR_NAME_LENGTH
+    ? name
+    : `${characters.slice(0, MAX_PANE_PR_NAME_LENGTH - 1).join("")}…`;
+}
+
+export function paneLabel(state: Pick<PrState, "key" | "title">, status: string): string {
+  const { repo, number } = parsePrKey(state.key);
+  return `${repo} #${number} · ${cropPanePrName(state.title)} · ${status}`;
 }
 
 async function watch(input: string, io: CliIo): Promise<void> {
