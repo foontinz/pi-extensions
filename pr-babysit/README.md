@@ -41,11 +41,12 @@ Optional `baseMergeMessage` (a single-line string) sets the commit message used 
 ```sh
 node src/cli.ts watch https://github.com/OWNER/REPO/pull/123
 node src/cli.ts status
+node src/cli.ts status --all
 node src/cli.ts ack ESCALATION-UUID
 node src/cli.ts unwatch owner/repo#123
 ```
 
-`watch` is idempotent. It provisions one managed worktree and one foreground pane in the tmux `babysitting` window per PR. The pane border is labelled `repo #N · cropped PR title · status`, keeping the repository and PR number visible even for long titles. State, event history, prompts, JSONL output, sessions, and escalation history remain under `~/.pr-babysitter`; only explicit `unwatch` removes the worktree, and state is archived rather than discarded.
+`watch` is idempotent. It provisions one managed worktree and one foreground pane in the tmux `babysitting` window per PR. The pane border is labelled `repo #N · cropped PR title · status`, keeping the repository and PR number visible even for long titles. `status` shows active PRs; use `status --all` to include retained merged and closed PRs. State, event history, prompts, JSONL output, sessions, and escalation history remain under `~/.pr-babysitter`; only explicit `unwatch` removes the worktree, and state is archived rather than discarded.
 
 A bare PR number resolves against the current Git repository. `run --pr [host/]owner/repo#N` is an internal pane command; `--once` is useful for controlled diagnostics.
 
@@ -77,7 +78,7 @@ The hook is defense in depth, not a general-purpose host sandbox: pi's built-in 
 - **dirty worktree on unwatch:** commit or stash wanted work, or explicitly discard it with `unwatch owner/repo#N --force`.
 - **escalation:** inspect its run artifacts, then run `ack <id>`.
 - **corrupt state:** `status` names the exact invalid state file and exits nonzero; restore or remove only that file.
-- **merged/closed PR:** the pane exits while the worktree and history remain until `unwatch`.
+- **merged/closed PR:** the pane exits and the PR is hidden from default `status`; use `status --all` to inspect it. The worktree and history remain until `unwatch`.
 
 Use `PR_BABYSIT_HOME` for an isolated state root and `PR_BABYSIT_TMUX_SOCKET` for an isolated tmux server.
 

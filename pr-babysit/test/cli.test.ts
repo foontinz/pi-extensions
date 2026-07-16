@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { displayStatus, main, paneLabel, parseInvocation, recoveryHint } from "../src/cli.ts";
+import { displayStatus, isTerminalPrState, main, paneLabel, parseInvocation, recoveryHint } from "../src/cli.ts";
 import { createPrState } from "../src/state.ts";
 
 test("CLI parser canonicalizes keys and enforces command-specific syntax", () => {
@@ -11,6 +11,9 @@ test("CLI parser canonicalizes keys and enforces command-specific syntax", () =>
     input: "https://github.com/o/r/pull/2",
   });
   assert.deepEqual(parseInvocation(["watch", "2"]), { command: "watch", input: "2" });
+  assert.deepEqual(parseInvocation(["status"]), { command: "status", all: false });
+  assert.deepEqual(parseInvocation(["status", "--all"]), { command: "status", all: true });
+  assert.deepEqual(parseInvocation(["status", "-a"]), { command: "status", all: true });
   assert.deepEqual(parseInvocation(["unwatch", "o/r#1", "--force"]), {
     command: "unwatch",
     key: "o/r#1",
@@ -81,12 +84,15 @@ test("pane labels always lead with repository, PR number, and a cropped PR name"
   );
 });
 
-test("terminal PR state is visible even after its pane exits", () => {
+test("terminal PR states are identifiable for default status filtering and remain displayable with --all", () => {
   const state = createPrState({ key: "owner/repo#1" });
   assert.equal(displayStatus(state), "initializing");
+  assert.equal(isTerminalPrState(state), false);
   state.status = "watching";
   state.cursors.prState = "MERGED";
   assert.equal(displayStatus(state), "merged");
+  assert.equal(isTerminalPrState(state), true);
   state.cursors.prState = "CLOSED";
   assert.equal(displayStatus(state), "closed");
+  assert.equal(isTerminalPrState(state), true);
 });

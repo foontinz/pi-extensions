@@ -28,7 +28,7 @@ const HELP = `pr-babysit ${VERSION}
 
 Usage:
   pr-babysit watch <pr-url|number|[host/]owner/repo#N>
-  pr-babysit status
+  pr-babysit status [--all]
   pr-babysit unwatch <[host/]owner/repo#N> [--force]
   pr-babysit ack <escalation-id>
   pr-babysit run --pr <[host/]owner/repo#N> [--once]
@@ -41,7 +41,8 @@ Operation:
   watch is idempotent and accepts a GitHub.com or Enterprise PR URL, canonical
   [host/]owner/repo#N key, or a bare number in a Git repository. Worktrees,
   event history, sessions, and run artifacts stay under ~/.pr-babysitter until
-  explicit unwatch. run is an internal pane command.
+  explicit unwatch. status hides merged/closed PRs unless --all is passed. run
+  is an internal pane command.
 
 Recovery:
   stale pane       rerun watch for the same PR; durable pending work is retained
@@ -59,7 +60,7 @@ export type Invocation =
   | { command: "help" }
   | { command: "version" }
   | { command: "watch"; input: string }
-  | { command: "status" }
+  | { command: "status"; all: boolean }
   | { command: "unwatch"; key: string; force: boolean }
   | { command: "ack"; escalationId: string }
   | { command: "run"; key: string; once: boolean };
@@ -112,10 +113,13 @@ export function parseInvocation(argv: string[]): Invocation {
       return { command: "watch", input: oneArgument(parsed.positionals, "watch", "PR URL, number, or owner/repo#N") };
     }
     case "status": {
-      const parsed = parseCommandArgs(args, { help: { type: "boolean", short: "h" } });
+      const parsed = parseCommandArgs(args, {
+        all: { type: "boolean", short: "a", default: false },
+        help: { type: "boolean", short: "h" },
+      });
       if (parsed.values.help) return { command: "help" };
       if (parsed.positionals.length !== 0) throw new UsageError("status accepts no positional arguments");
-      return { command: "status" };
+      return { command: "status", all: parsed.values.all === true };
     }
     case "unwatch": {
       const parsed = parseCommandArgs(args, {
@@ -261,9 +265,15 @@ export function displayStatus(state: Pick<PrState, "status" | "cursors">): strin
     : state.status;
 }
 
-async function status(io: CliIo): Promise<number> {
+export function isTerminalPrState(state: Pick<PrState, "cursors">): boolean {
+  return state.cursors.prState === "MERGED" || state.cursors.prState === "CLOSED";
+}
+
+async function status(io: CliIo, includeTerminal: boolean): Promise<number> {
   const entries = await listPrStates();
-  const valid = entries.filter((entry): entry is typeof entry & { state: PrState } => entry.state !== undefined);
+  const valid = entries
+    .filter((entry): entry is typeof entry & { state: PrState } => entry.state !== undefined)
+    .filter((entry) => includeTerminal || !isTerminalPrState(entry.state));
   const rows = await Promise.all(
     valid
       .map((entry) => entry.state)
@@ -277,7 +287,7 @@ async function status(io: CliIo): Promise<number> {
       })),
   );
 
-  if (rows.length === 0) io.out("No PRs watched.");
+  if (rows.length === 0) io.out(includeTerminal ? "No PRs watched." : "No active PRs watched.");
   else io.out(formatRows(rows));
 
   const corrupt = entries.filter((entry) => entry.error !== undefined);
@@ -496,7 +506,7 @@ export async function main(argv = process.argv.slice(2), io: CliIo = {
         await watch(invocation.input, io);
         return 0;
       case "status":
-        return status(io);
+        return status(io, invocation.all);
       case "unwatch":
         await unwatch(invocation.key, invocation.force, io);
         return 0;
