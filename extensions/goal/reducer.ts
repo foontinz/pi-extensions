@@ -400,19 +400,17 @@ function settle(state: GoalCheckpointV2, action: GoalSettleRunAction): GoalReduc
     if (!checkpointRecorded) {
       draft.lifecycle = "paused";
       draft.pauseReason = "dispatch";
-    } else if (mustPauseForBudget && executable(draft)) {
-      pauseForLimit(draft, "budget");
     }
-  }, (checkpoint) => {
+    // Reaching the budget on an already-dispatched run must not invalidate that
+    // run's checkpoint or prevent post-settlement phase reconciliation. The
+    // dispatch gate enforces the limit before any subsequent run is allocated.
+  }, () => {
     if (!checkpointRecorded) return [{
       type: "notify",
       level: "warning",
       message: (run.repairAttempt ?? 0) > 0
         ? "Goal paused because its checkpoint repair run also omitted a checkpoint."
         : "Goal paused because its checkpointless run could not be repaired within budget.",
-    }];
-    if (checkpoint.lifecycle === "paused" && checkpoint.pauseReason === "budget") return [{
-      type: "notify", level: "warning", message: "Goal paused because its run or elapsed-time budget was exhausted.",
     }];
     return [];
   });

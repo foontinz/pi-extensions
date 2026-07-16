@@ -414,6 +414,9 @@ function exitCodeIn(value: unknown, depth = 0): number | undefined {
 function successfulToolResult(message: Record<string, unknown>): boolean {
   if (message.isError === true) return false;
   const exitCode = exitCodeIn(message);
+  // Pi's stock bash tool throws on a non-zero exit and therefore persists
+  // successful results without an exitCode. Custom bash tools may include one,
+  // in which case an explicit non-zero value still fails closed.
   return exitCode === undefined || exitCode === 0;
 }
 
@@ -426,13 +429,15 @@ function observationSupportsEvidence(evidence: GoalEvidence, observation: ToolOb
   const toolName = observation.toolName;
   if (evidence.kind === "file") return toolName === "read" || toolName === "write" || toolName === "edit";
   if (evidence.kind === "command" || evidence.kind === "test" || evidence.kind === "git") {
-    if (toolName !== "bash" || exitCodeIn(observation.message) !== 0) return false;
+    if (toolName !== "bash") return false;
     const command = commandFromInvocation(observation.invocation)?.trim() ?? "";
+    if (!command) return false;
     if (evidence.kind === "git") return /^(?:git\s|[^\n]*\bgit\s)/i.test(command);
-    if (evidence.kind === "test") {
-      return /(?:^|\s)(?:test|pytest|vitest|jest|mocha)(?:\s|$)|\b(?:npm|pnpm|yarn)\s+(?:run\s+)?test\b|\bcargo\s+test\b|\bgo\s+test\b/i.test(command);
-    }
-    return command.length > 0;
+    // "test" is a semantic label supplied by the verifier. Trying to infer it
+    // from executable names rejected valid commands such as `python -m
+    // unittest` and project-specific verification scripts. Correlation to the
+    // exact successful bash observation is the provenance boundary.
+    return true;
   }
   return false;
 }
@@ -655,6 +660,46 @@ function criteriaSatisfied(
     if (!supported) return false;
   }
   return true;
+}
+
+const REJECTION_EXPLANATIONS: Record<EvidenceRejectionReason, string> = {
+  duplicate_id: "the evidence ID is duplicated",
+  uncorrelated_run: "the evidence run is not correlated to exactly one goal-control run",
+  source_missing: "no matching tool result was found in the correlated run; use the exact command, path, tool-call ID, or result-entry ID",
+  tool_failed: "the matched tool result failed or its tool type is incompatible with the evidence kind",
+  checkpoint_is_not_evidence: "a goal checkpoint cannot prove its own claim",
+  artifact_unverified: "no adapter-verified artifact with the matching run and digest exists",
+  validator_rejected: "the adapter's semantic validator rejected the observation",
+};
+
+/**
+ * Produce bounded, criterion-specific feedback for the next goal run. This is
+ * deliberately derived from adapter reconciliation rather than model prose.
+ */
+export function explainCriteriaVerificationFailure(
+  criteria: readonly GoalCriterion[],
+  reconciliation: GoalEvidenceReconciliation,
+  maxLength = GOAL_BOUNDS.text,
+): string {
+  const lines = ["Phase verification rejected the following evidence:"];
+  for (const criterion of criteria) {
+    const declared = new Set(criterion.evidenceIds ?? []);
+    const supports = ({ evidence }: { evidence: GoalEvidence }) =>
+      evidence.criterionId === criterion.id || declared.has(evidence.id);
+    if (reconciliation.verified.some(supports)) continue;
+    const rejected = reconciliation.rejected.filter(supports);
+    if (rejected.length === 0) {
+      lines.push(`- ${criterion.id}: no correlated evidence was supplied.`);
+      continue;
+    }
+    for (const { evidence, reason } of rejected.slice(-3)) {
+      const locator = evidence.locator.length > 240 ? `${evidence.locator.slice(0, 239)}…` : evidence.locator;
+      lines.push(`- ${criterion.id} / ${evidence.id}: ${REJECTION_EXPLANATIONS[reason]}; submitted locator=${JSON.stringify(locator)}.`);
+    }
+  }
+  lines.push("Re-run only the missing observation and submit its exact invocation as the locator; do not repeat evidence that already verified.");
+  const text = lines.join("\n");
+  return text.length <= maxLength ? text : `${text.slice(0, Math.max(0, maxLength - 1))}…`;
 }
 
 /** Criterion status (`satisfied`/`waived`) is not proof; only reconciled evidence is. */

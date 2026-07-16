@@ -173,7 +173,7 @@ function renderPacket(
     `- This run belongs to goal=${checkpoint.goalId}, epoch=${checkpoint.epoch}, revision=${checkpoint.revision}, activePhase=${protocolPhase}.`,
     "- Work only on the exact next action and the bounded active phase. Inspect current files/evidence before repeating possibly interrupted work.",
     `- Before ending this run, call goal_checkpoint exactly once with expectedRevision=${checkpoint.revision} and an accurate action: set_plan, progress, phase_candidate_complete, goal_candidate_complete, blocked, or waiting_external.`,
-    "- Supply a concise summary and an exact nextAction unless completion is being claimed. Record only durable summaries, decisions, and evidence references—never raw history, logs, or artifact contents.",
+    "- Supply concise durable summaries, decisions, evidence, and an exact nextAction—not raw logs. Evidence locators must exactly copy successful tool invocations/IDs; bare artifact paths require adapter-verified digests.",
     "- If the tool rejects a stale revision, stop changing goal state and reconcile from the newest checkpoint; never retry using guessed state.",
     "- phase_candidate_complete and goal_candidate_complete are claims only. They enter verification; they do not mark success. Never claim verification without observed evidence or explicit user acceptance.",
     "- Use blocked only for a concrete user decision or user-performed prerequisite. Include the exact question in openQuestions or the exact requested action in nextAction.",

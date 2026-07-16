@@ -30,6 +30,7 @@ import {
   areCriteriaVerifiablySatisfied,
   evaluateDispatchEligibility,
   evaluateProactiveCompaction,
+  explainCriteriaVerificationFailure,
   goalControlMatches,
   locateGoalRunEntries,
   reconcileSuccessfulEvidence,
@@ -1028,10 +1029,18 @@ export default function goalExtension(pi: ExtensionAPI): void {
             }
           });
         } else {
+          const diagnostics = explainCriteriaVerificationFailure(phase.criteria, evidence);
           persistAdapterTransition(ctx, (draft) => {
             const candidate = draft.phases.find((item) => item.id === draft.activePhaseId);
-            if (candidate) candidate.status = "verifying";
-            draft.ledger.nextAction = "Gather and record observable evidence for the active phase criteria.";
+            if (candidate) {
+              // A rejected claim is work again, not an indefinitely self-looping
+              // verification state. The next run receives exact adapter-owned
+              // rejection diagnostics and may gather only the missing proof.
+              candidate.status = "running";
+              candidate.nextAction = diagnostics;
+            }
+            draft.lifecycle = "running";
+            draft.ledger.nextAction = diagnostics;
           });
         }
       }

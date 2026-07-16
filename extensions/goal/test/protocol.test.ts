@@ -16,6 +16,7 @@ import {
   areCriteriaVerifiablySatisfied,
   evaluateDispatchEligibility,
   evaluateProactiveCompaction,
+  explainCriteriaVerificationFailure,
   locateDescendantAssistantEntry,
   locateGoalControlEntry,
   locateGoalRunEntries,
@@ -617,6 +618,8 @@ test("proactive compaction observes exact thresholds and never retriggers for to
 
 test("evidence requires a successful correlated tool result and criteria require verified evidence", () => {
   const ok = evidence("e-ok", "criterion-ok", "tool:call-ok");
+  const stockBash = evidence("e-stock-bash", "criterion-stock-bash", "tool:call-stock-bash");
+  const pythonTest = evidence("e-python-test", "criterion-python-test", "tool:call-python-test");
   const nonzero = evidence("e-nonzero", "criterion-nonzero", "tool:call-nonzero");
   const errored = evidence("e-error", "criterion-error", "tool:call-error");
   const checkpointResult = evidence("e-checkpoint", "criterion-checkpoint", "tool:call-checkpoint");
@@ -628,11 +631,15 @@ test("evidence requires a successful correlated tool result and criteria require
     control(),
     assistant("assistant-tools", [
       { type: "toolCall", id: "call-ok", name: "bash", arguments: { command: "npm test" } },
+      { type: "toolCall", id: "call-stock-bash", name: "bash", arguments: { command: "python3 scripts/verify_release.py" } },
+      { type: "toolCall", id: "call-python-test", name: "bash", arguments: { command: "python3 -m unittest scripts/test_release.py" } },
       { type: "toolCall", id: "call-nonzero", name: "bash", arguments: { command: "npm run broken" } },
       { type: "toolCall", id: "call-error", name: "read", arguments: { path: "missing" } },
       { type: "toolCall", id: "call-checkpoint", name: GOAL_CHECKPOINT_TOOL, arguments: {} },
     ]),
     toolResult("result-ok", "call-ok", "bash", { exitCode: 0 }),
+    toolResult("result-stock-bash", "call-stock-bash", "bash"),
+    toolResult("result-python-test", "call-python-test", "bash"),
     toolResult("result-nonzero", "call-nonzero", "bash", { exitCode: 1 }),
     toolResult("result-error", "call-error", "read", { isError: true }),
     toolResult("result-checkpoint", "call-checkpoint", GOAL_CHECKPOINT_TOOL),
@@ -644,11 +651,15 @@ test("evidence requires a successful correlated tool result and criteria require
     toolResult("result-outside", "call-outside", "bash", { exitCode: 0 }),
   ];
   const reconciliation = reconcileSuccessfulEvidence(
-    [ok, nonzero, errored, checkpointResult, missing, outsideRun, uncorrelated],
+    [ok, stockBash, pythonTest, nonzero, errored, checkpointResult, missing, outsideRun, uncorrelated],
     branch,
     { goalId: controlDetails.goalId },
   );
-  assert.deepEqual(reconciliation.verified.map(({ evidence: item }) => item.id), ["e-ok"]);
+  assert.deepEqual(reconciliation.verified.map(({ evidence: item }) => item.id), [
+    "e-ok",
+    "e-stock-bash",
+    "e-python-test",
+  ]);
   assert.deepEqual(
     Object.fromEntries(reconciliation.rejected.map(({ evidence: item, reason }) => [item.id, reason])),
     {
@@ -674,6 +685,9 @@ test("evidence requires a successful correlated tool result and criteria require
   };
   assert.equal(areCriteriaVerifiablySatisfied([supported], reconciliation), true);
   assert.equal(areCriteriaVerifiablySatisfied([supported, unsupportedButClaimed], reconciliation), false);
+  const diagnostics = explainCriteriaVerificationFailure([unsupportedButClaimed], reconciliation);
+  assert.match(diagnostics, /criterion-claimed: no correlated evidence was supplied/);
+  assert.match(diagnostics, /exact invocation as the locator/);
   assert.equal(
     areCriteriaVerifiablySatisfied([supported, unsupportedButClaimed], reconciliation, {
       explicitlyAcceptedCriterionIds: ["criterion-claimed"],

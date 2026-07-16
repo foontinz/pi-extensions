@@ -912,6 +912,37 @@ test("goal_checkpoint result details are authoritative and settlement queues one
   assert.equal(harness.controls().length, 2);
 });
 
+test("rejected phase evidence returns to work with criterion-specific diagnostics", async () => {
+  const harness = new ExtensionHarness();
+  await createAndObserve(harness);
+  await settleWithProgress(harness); // establish the initial plan and dispatch phase work
+
+  const active = harness.latestPersisted();
+  const result = await harness.callCheckpoint({
+    action: "phase_candidate_complete",
+    expectedRevision: active.revision,
+    phaseId: "phase-1",
+    summary: "Claim phase completion with a deliberately missing observation.",
+    evidence: [{
+      id: "evidence-missing",
+      criterionId: "phase-criterion-1",
+      kind: "test",
+      description: "A test result that is not on the branch.",
+      locator: "tool:call-that-does-not-exist",
+    }],
+  });
+  harness.appendCheckpointResult(result);
+  harness.appendAssistant("Completion claim recorded.");
+  await harness.emit("agent_settled");
+
+  const recovered = harness.latestPersisted();
+  assert.equal(recovered.lifecycle, "running");
+  assert.equal(recovered.phases[0]?.status, "running");
+  assert.match(recovered.ledger.nextAction ?? "", /phase-criterion-1 \/ evidence-missing/);
+  assert.match(recovered.ledger.nextAction ?? "", /no matching tool result/i);
+  assert.equal(recovered.scheduler.state, "run_in_flight", "one corrective work run is dispatched with diagnostics");
+});
+
 test("session reload and tree navigation pause runnable state and never auto-dispatch", async () => {
   const harness = new ExtensionHarness();
   const reloadState = createInitialCheckpoint("restore after reload", { now: 10 });

@@ -222,6 +222,38 @@ test("an exactly correlated settlement is committed once and then deduplicated",
   expectUnchanged(replay, settled.state);
 });
 
+test("the final allowed run settles before the budget blocks another dispatch", () => {
+  const active = inFlight("final_budget", { maxEpochRuns: 1 });
+  assert.equal(active.budgets.epochRuns, 1);
+  const run = active.scheduler.activeRun!;
+  const settled = reduceGoal(active, {
+    type: "settle_run",
+    runId: run.runId,
+    dispatchId: run.dispatchId,
+    goalId: run.goalId,
+    epoch: run.epoch,
+    checkpointRecorded: true,
+    turns: 1,
+    now: 131,
+    eventId: "event_settle_final_budget",
+  });
+  expectPersistFirst(settled);
+  assert.equal(settled.state.scheduler.state, "idle");
+  assert.equal(settled.state.lifecycle, "planning", "settlement preserves the checkpoint lifecycle for reconciliation");
+  assert.equal(settled.state.pauseReason, undefined);
+
+  const blocked = reduceGoal(settled.state, {
+    type: "dispatch",
+    dispatchId: "dispatch_over_budget",
+    runId: "run_over_budget",
+    now: 132,
+    eventId: "event_dispatch_over_budget",
+  });
+  expectPersistFirst(blocked);
+  assert.equal(blocked.state.lifecycle, "paused");
+  assert.equal(blocked.state.pauseReason, "budget");
+});
+
 test("an unrelated settlement is harmlessly ignored while another run owns the lease", () => {
   const active = inFlight("settle_unrelated");
   const unrelated = reduceGoal(active, {
