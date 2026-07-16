@@ -15,8 +15,8 @@
     ]
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.80.5",
-    "@earendil-works/pi-tui": "^0.80.5",
+    "@earendil-works/pi-coding-agent": "^0.80.9",
+    "@earendil-works/pi-tui": "^0.80.9",
     "proper-lockfile": "^4.1.2"
   },
   "devDependencies": {

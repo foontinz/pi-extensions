@@ -75,8 +75,9 @@ test("agent thinking inherits the root level and supports per-agent overrides", 
   await runner.run(`
     await agent("inherit");
     await agent("override", { thinking: "off" });
+    await agent("maximum", { thinking: "max" });
   `);
-  assert.deepEqual(observed, ["high", "off"]);
+  assert.deepEqual(observed, ["high", "off", "max"]);
 });
 
 test("agent rejects invalid thinking levels", async () => {

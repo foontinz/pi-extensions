@@ -18,7 +18,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { getSharedMcpGateway } from "../mcp/gateway.js";
 import { createMcpProxyTool } from "../mcp/proxy-tool.js";
-import { createBareResourceLoader, getSharedHandles, resolveModelPattern } from "../core/in-process-runner.js";
+import { createBareResourceLoader, getSharedModelRuntime, resolveModelPattern } from "../core/in-process-runner.js";
 
 export interface InProcessStartOptions {
   cwd: string;
@@ -64,10 +64,9 @@ export interface InProcessHandle {
 }
 
 let createSession: typeof createAgentSession = createAgentSession;
+let createModelRuntime: typeof getSharedModelRuntime = getSharedModelRuntime;
 
 export function startInProcessAgent(options: InProcessStartOptions): InProcessHandle {
-  const { authStorage, modelRegistry } = getSharedHandles();
-  const model = resolveModelPattern(options.model);
   let aborted = false;
   let forceAborted = false;
   let completionDelivered = false;
@@ -145,7 +144,7 @@ export function startInProcessAgent(options: InProcessStartOptions): InProcessHa
     forceAbort,
     dispose: forceAbort,
     detachStartupSignal,
-    modelResolved: !options.model || model !== undefined,
+    modelResolved: !options.model,
   };
 
   if (options.signal?.aborted) forceAbort();
@@ -157,6 +156,10 @@ export function startInProcessAgent(options: InProcessStartOptions): InProcessHa
   void (async () => {
     try {
       if (forceAborted) return;
+      const modelRuntime = await createModelRuntime();
+      if (forceAborted) return;
+      const model = resolveModelPattern(options.model, modelRuntime);
+      handle.modelResolved = !options.model || model !== undefined;
       const customTools: ToolDefinition[] = [];
       let toolAllowlist = options.tools.length > 0 ? [...options.tools] : undefined;
       if (options.mcp) {
@@ -166,8 +169,7 @@ export function startInProcessAgent(options: InProcessStartOptions): InProcessHa
       const created = await createSession({
         cwd: options.cwd,
         agentDir: getAgentDir(),
-        authStorage,
-        modelRegistry,
+        modelRuntime,
         model: model as never,
         thinkingLevel: options.thinking as never,
         resourceLoader: createBareResourceLoader(undefined, options.appendSystemPrompt ? [options.appendSystemPrompt] : []),
@@ -219,5 +221,8 @@ export function startInProcessAgent(options: InProcessStartOptions): InProcessHa
 export const __inProcessSupervisorTest = {
   setCreateAgentSession(factory: typeof createAgentSession | undefined): void {
     createSession = factory ?? createAgentSession;
+  },
+  setModelRuntime(factory: typeof getSharedModelRuntime | undefined): void {
+    createModelRuntime = factory ?? getSharedModelRuntime;
   },
 };

@@ -26,9 +26,9 @@
  *         against `out tok` (tps × total ≈ out tok).
  */
 
+import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { AuthStorage, getAgentDir, ModelRegistry, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { stream } from "@earendil-works/pi-ai/compat";
+import { getAgentDir, ModelRuntime, SettingsManager } from "@earendil-works/pi-coding-agent";
 import type { Api, Model } from "@earendil-works/pi-ai/compat";
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
@@ -121,8 +121,8 @@ interface ModelReport {
 }
 
 async function runOnce(
+  modelRuntime: ModelRuntime,
   model: Model<Api>,
-  auth: { apiKey?: string; headers?: Record<string, string> },
   opts: Options,
 ): Promise<RunResult> {
   const controller = new AbortController();
@@ -138,10 +138,10 @@ async function runOnce(
   let completed = false;
 
   try {
-    const events = stream(
+    const events = modelRuntime.stream(
       model,
       { messages: [{ role: "user", content: [{ type: "text", text: opts.prompt }], timestamp: Date.now() }] },
-      { apiKey: auth.apiKey, headers: auth.headers, maxTokens: opts.maxTokens, signal: controller.signal },
+      { maxTokens: opts.maxTokens, signal: controller.signal },
     );
 
     for await (const ev of events) {
@@ -190,7 +190,7 @@ async function runOnce(
 
 async function benchModel(
   key: string,
-  registry: ModelRegistry,
+  modelRuntime: ModelRuntime,
   opts: Options,
   progress: (msg: string) => void,
 ): Promise<ModelReport> {
@@ -198,23 +198,26 @@ async function benchModel(
   const modelId = rest.join("/");
   if (!provider || !modelId) return { key, api: "?", runs: [], skipped: `invalid model key "${key}" (expected provider/id)` };
 
-  const model = registry.find(provider, modelId);
-  if (!model) return { key, api: "?", runs: [], skipped: "not found in model registry (dynamic/unpinned provider?)" };
+  const model = modelRuntime.getModel(provider, modelId);
+  if (!model) return { key, api: "?", runs: [], skipped: "not found in model runtime (dynamic/unpinned provider?)" };
 
-  const ra = await registry.getApiKeyAndHeaders(model);
-  if (!ra.ok) return { key, api: model.api, runs: [], skipped: `auth: ${ra.error}` };
-  if (ra.env) for (const [k, v] of Object.entries(ra.env)) process.env[k] = v;
-  const auth = { apiKey: ra.apiKey, headers: ra.headers };
+  try {
+    if (!(await modelRuntime.getAuth(model))) {
+      return { key, api: model.api, runs: [], skipped: `auth: provider ${provider} is not configured` };
+    }
+  } catch (error) {
+    return { key, api: model.api, runs: [], skipped: `auth: ${error instanceof Error ? error.message : String(error)}` };
+  }
 
   if (opts.warmup) {
     progress(`${key}  warmup…`);
-    await runOnce(model, auth, opts);
+    await runOnce(modelRuntime, model, opts);
   }
 
   const runs: RunResult[] = [];
   for (let i = 0; i < opts.runs; i++) {
     progress(`${key}  run ${i + 1}/${opts.runs}…`);
-    const r = await runOnce(model, auth, opts);
+    const r = await runOnce(modelRuntime, model, opts);
     runs.push(r);
     if (!r.ok) progress(`${key}  run ${i + 1}/${opts.runs} failed: ${r.error ?? "no tokens"}`);
   }
@@ -347,8 +350,11 @@ function printTable(aggs: Agg[]): void {
 async function main(): Promise<void> {
   const opts = parseOptions(process.argv.slice(2));
 
-  const authStorage = AuthStorage.create();
-  const registry = ModelRegistry.create(authStorage);
+  const agentDir = getAgentDir();
+  const modelRuntime = await ModelRuntime.create({
+    authPath: join(agentDir, "auth.json"),
+    modelsPath: join(agentDir, "models.json"),
+  });
 
   let keys = opts.models;
   if (!keys) {
@@ -377,7 +383,7 @@ async function main(): Promise<void> {
 
   const reports: ModelReport[] = [];
   for (const key of keys) {
-    reports.push(await benchModel(key, registry, opts, progress));
+    reports.push(await benchModel(key, modelRuntime, opts, progress));
   }
   if (isTTY && !opts.json) process.stderr.write("\r\x1b[K");
 

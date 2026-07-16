@@ -214,7 +214,7 @@ const storeWarnings: StoreDiagnosticWarning[] = [];
 const MAX_STORE_WARNINGS = 50;
 const CALLBACK_STACK_DELAY_MS = 250;
 
-const ThinkingSchema = StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const, {
+const ThinkingSchema = StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, {
   description: "Optional Pi thinking level for the subagent process.",
 });
 

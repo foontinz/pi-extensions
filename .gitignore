@@ -20,6 +20,7 @@ mcp.json
 mcp-cache.json
 mcp-oauth/
 models.json
+models-store.json
 sessions/
 /subagents/
 bin/

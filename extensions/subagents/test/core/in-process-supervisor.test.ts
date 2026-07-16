@@ -21,13 +21,23 @@ function fakeSession(overrides: Record<string, unknown> = {}) {
   } as any;
 }
 
+test.beforeEach(() => {
+  __inProcessSupervisorTest.setModelRuntime(async () => ({
+    getModels: () => [],
+    hasConfiguredAuth: () => false,
+  }) as any);
+});
+
 test.afterEach(() => {
   __inProcessSupervisorTest.setCreateAgentSession(undefined);
+  __inProcessSupervisorTest.setModelRuntime(undefined);
 });
 
 test("execute signal force-aborts pending session startup and disposes a late-created session", async () => {
   let releaseCreate!: (value: { session: any }) => void;
   const createPending = new Promise<{ session: any }>((resolve) => { releaseCreate = resolve; });
+  let markCreateStarted!: () => void;
+  const createStarted = new Promise<void>((resolve) => { markCreateStarted = resolve; });
   let promptCalls = 0;
   let abortCalls = 0;
   let disposeCalls = 0;
@@ -36,7 +46,10 @@ test("execute signal force-aborts pending session startup and disposes a late-cr
     abort: async () => { abortCalls += 1; },
     dispose: () => { disposeCalls += 1; },
   });
-  __inProcessSupervisorTest.setCreateAgentSession(async () => await createPending as any);
+  __inProcessSupervisorTest.setCreateAgentSession(async () => {
+    markCreateStarted();
+    return await createPending as any;
+  });
 
   const controller = new AbortController();
   const outcomes: InProcessOutcome[] = [];
@@ -49,6 +62,7 @@ test("execute signal force-aborts pending session startup and disposes a late-cr
     onDone: (outcome) => outcomes.push(outcome),
   });
 
+  await createStarted;
   controller.abort(new Error("tool cancelled"));
   assert.deepEqual(outcomes, [{ aborted: true }]);
   releaseCreate({ session });

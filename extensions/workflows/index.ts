@@ -101,7 +101,7 @@ export interface WorkflowSnapshot {
 }
 
 const DEFAULT_WORKFLOW_TOOLS = ["read", "bash"];
-const THINKING_LEVELS = new Set<SubagentThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
+const THINKING_LEVELS = new Set<SubagentThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const MAX_AGENTS = 100;
 const DEFAULT_CONCURRENCY = 8;
 const DEFAULT_WORKFLOW_TIMEOUT_MS = 30 * 60 * 1000;
@@ -202,7 +202,7 @@ export default function workflowsExtension(pi: ExtensionAPI) {
       "Good fits: parallel code review, repo-wide search+summarize, batch refactors/migrations, generating tests or docs across many files, comparing approaches, multi-step pipelines. A quick planning phase() then parallel() agents usually beats sequential hand work.",
       "It does spawn multiple agents and use tokens, so match the agent count to the work (a handful for small jobs, more for big fan-outs) rather than avoiding it — the parallelism and isolated context windows are the point.",
       "Workflow agents run in-process with minimal tools by default: read,bash. Pass opts.tools to widen.",
-      "Workflow agents inherit the root session's selected thinking level; pass opts.thinking ('off' through 'xhigh') to override it per agent.",
+      "Workflow agents inherit the root session's selected thinking level; pass opts.thinking ('off' through 'max') to override it per agent.",
       "Reviews and verification are often time-consuming; give them generous overall timeoutMs and per-agent opts.timeoutMs instead of short deadlines.",
       "Hooks (async): agent(task, opts) -> result; parallel(items, fn); pipeline(items, fns); workflow(script). Sync: phase(name); log(...); args(); failures().",
       "agent() returns null on failure (recorded in failures()). Pass opts.schema.required for JSON-shape validation + retry.",

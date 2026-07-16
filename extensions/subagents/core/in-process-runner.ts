@@ -1,11 +1,11 @@
 import * as fs from "node:fs";
+import * as path from "node:path";
 import {
-  AuthStorage,
   createAgentSession,
   createExtensionRuntime,
   getAgentDir,
   getLastAssistantUsage,
-  ModelRegistry,
+  ModelRuntime,
   type ResourceLoader,
   SessionManager,
   SettingsManager,
@@ -16,21 +16,31 @@ import { getSharedMcpGateway } from "../mcp/gateway.js";
 import { createMcpProxyTool } from "../mcp/proxy-tool.js";
 import { emptyUsageStats, type SubagentResult, type TerminalReason, type UsageStats } from "./types.js";
 
-// Shared, process-wide handles so fanned-out agents don't each rebuild auth/model
-// state (decision E). Lazily created and reused across concurrent sessions.
-let sharedAuthStorage: ReturnType<typeof AuthStorage.create> | undefined;
-let sharedModelRegistry: ReturnType<typeof ModelRegistry.create> | undefined;
+// Shared, process-wide runtime so fanned-out agents don't each rebuild auth/model
+// state (decision E). Creation is async in Pi 0.80.8+, so concurrent callers
+// coalesce on one promise. A failed creation is cleared so a later run can retry.
+let sharedModelRuntime: Promise<ModelRuntime> | undefined;
 
-export function getSharedHandles(): { authStorage: ReturnType<typeof AuthStorage.create>; modelRegistry: ReturnType<typeof ModelRegistry.create> } {
-  if (!sharedAuthStorage) sharedAuthStorage = AuthStorage.create();
-  if (!sharedModelRegistry) sharedModelRegistry = ModelRegistry.create(sharedAuthStorage);
-  return { authStorage: sharedAuthStorage, modelRegistry: sharedModelRegistry };
+export function getSharedModelRuntime(): Promise<ModelRuntime> {
+  if (!sharedModelRuntime) {
+    const agentDir = getAgentDir();
+    sharedModelRuntime = ModelRuntime.create({
+      authPath: path.join(agentDir, "auth.json"),
+      modelsPath: path.join(agentDir, "models.json"),
+    }).catch((error: unknown) => {
+      sharedModelRuntime = undefined;
+      throw error;
+    });
+  }
+  return sharedModelRuntime;
 }
 
-type ModelPatternRegistry = Pick<ReturnType<typeof ModelRegistry.create>, "getAll" | "hasConfiguredAuth">;
+let createModelRuntime: typeof getSharedModelRuntime = getSharedModelRuntime;
+
+type ModelPatternRegistry = Pick<ModelRuntime, "getModels" | "hasConfiguredAuth">;
 type PatternModel = { provider: string; id: string };
 
-const CLI_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
+const CLI_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 function modelPatternQueries(pattern: string): string[] {
   const queries = [pattern.toLowerCase()];
@@ -42,7 +52,7 @@ function modelPatternQueries(pattern: string): string[] {
 }
 
 function chooseModelMatch(
-  candidates: PatternModel[],
+  candidates: readonly PatternModel[],
   queries: string[],
   registry: ModelPatternRegistry,
 ): PatternModel | undefined {
@@ -54,7 +64,7 @@ function chooseModelMatch(
         ? model.id.toLowerCase() === query
         : model.id.toLowerCase().includes(query));
       if (matches.length > 0) {
-        return matches.find((model) => registry.hasConfiguredAuth(model as never)) ?? matches[0];
+        return matches.find((model) => registry.hasConfiguredAuth(model.provider)) ?? matches[0];
       }
     }
   }
@@ -68,11 +78,10 @@ function chooseModelMatch(
  */
 export function resolveModelPattern(
   pattern: string | undefined,
-  registry?: ModelPatternRegistry,
+  modelRuntime: ModelPatternRegistry,
 ): unknown | undefined {
   if (!pattern || !pattern.trim()) return undefined;
-  const modelRegistry = registry ?? getSharedHandles().modelRegistry;
-  const all = modelRegistry.getAll() as PatternModel[];
+  const all = modelRuntime.getModels() as readonly PatternModel[];
   const raw = pattern.trim();
   const separator = raw.indexOf("/");
   const firstSegment = separator >= 0 ? raw.slice(0, separator).toLowerCase() : undefined;
@@ -80,18 +89,18 @@ export function resolveModelPattern(
 
   if (firstSegment && providers.has(firstSegment)) {
     const providerCandidates = all.filter((model) => model.provider.toLowerCase() === firstSegment);
-    const canonical = chooseModelMatch(providerCandidates, modelPatternQueries(raw.slice(separator + 1)), modelRegistry);
+    const canonical = chooseModelMatch(providerCandidates, modelPatternQueries(raw.slice(separator + 1)), modelRuntime);
     if (canonical) return canonical;
 
     // A known provider-looking prefix can also be part of a literal model ID
     // (for example, an OpenRouter ID). Only fall back after canonical matching fails.
-    return chooseModelMatch(all, modelPatternQueries(raw), modelRegistry);
+    return chooseModelMatch(all, modelPatternQueries(raw), modelRuntime);
   }
 
-  return chooseModelMatch(all, modelPatternQueries(raw), modelRegistry);
+  return chooseModelMatch(all, modelPatternQueries(raw), modelRuntime);
 }
 
-export type SubagentThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+export type SubagentThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface InProcessSubagentOptions {
   task: string;
@@ -140,7 +149,6 @@ export async function runSubagentInProcess(
     return { output: "", usage: emptyUsageStats(), error: { reason: "stop", message: "aborted before start" } };
   }
 
-  const { authStorage, modelRegistry } = getSharedHandles();
   const sessionManager = options.sessionDir
     ? SessionManager.create(options.cwd, options.sessionDir, options.sessionId ? { id: options.sessionId } : undefined)
     : SessionManager.inMemory(options.cwd);
@@ -167,6 +175,9 @@ export async function runSubagentInProcess(
 
   type Session = Awaited<ReturnType<typeof createAgentSession>>["session"];
   type Cancellation = { reason: "stop" | "timeout"; message: string };
+  type RuntimeOutcome =
+    | { kind: "runtime-created"; modelRuntime: ModelRuntime }
+    | { kind: "runtime-error"; error: unknown };
   type CreationOutcome =
     | { kind: "created"; session: Session }
     | { kind: "create-error"; error: unknown };
@@ -263,12 +274,32 @@ export async function runSubagentInProcess(
     // addEventListener does not replay an abort that happened before registration.
     if (options.signal?.aborted) onAbort();
 
+    const runtimePromise: Promise<RuntimeOutcome> = createModelRuntime().then(
+      (modelRuntime): RuntimeOutcome => ({ kind: "runtime-created", modelRuntime }),
+      (error): RuntimeOutcome => ({ kind: "runtime-error", error }),
+    );
+    const runtimeStartup = await Promise.race([
+      runtimePromise,
+      cancellationPromise.then((value) => ({ kind: "cancelled" as const, value })),
+    ]);
+    if (runtimeStartup.kind === "cancelled") {
+      return { output: "", usage: emptyUsageStats(), sessionFile: persistedTranscript(), error: runtimeStartup.value };
+    }
+    if (runtimeStartup.kind === "runtime-error") {
+      const message = runtimeStartup.error instanceof Error ? runtimeStartup.error.message : String(runtimeStartup.error);
+      return { output: "", usage: emptyUsageStats(), sessionFile: persistedTranscript(), error: { reason: "error", message } };
+    }
+    const { modelRuntime } = runtimeStartup;
+    checkDeadline();
+    if (cancellation) {
+      return { output: "", usage: emptyUsageStats(), sessionFile: persistedTranscript(), error: cancellation };
+    }
+
     const creationPromise: Promise<CreationOutcome> = Promise.resolve()
       .then(() => createSession({
         cwd: options.cwd,
         agentDir: getAgentDir(),
-        authStorage,
-        modelRegistry,
+        modelRuntime,
         resourceLoader: createBareResourceLoader(options.systemPrompt, options.appendSystemPrompt),
         thinkingLevel: options.thinkingLevel,
         tools: toolAllowlist,
@@ -483,3 +514,9 @@ function parseJsonOutput(output: string): unknown | undefined {
     return undefined;
   }
 }
+
+export const __inProcessRunnerTest = {
+  setModelRuntime(factory: typeof getSharedModelRuntime | undefined): void {
+    createModelRuntime = factory ?? getSharedModelRuntime;
+  },
+};

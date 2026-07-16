@@ -34,8 +34,8 @@ Last updated: after the subprocess→in-process migration and dead-code removal.
     `ResourceLoader` that loads **no** extensions/skills (avoids recursion + MCP
     reconnect). `getSystemPrompt()` undefined → pi builds its default coding prompt;
     `getAppendSystemPrompt()` carries our additions (matches old `--append-system-prompt`).
-  - `getSharedHandles()` — process-wide singleton `AuthStorage` + `ModelRegistry`
-    reused across concurrent sessions.
+  - `getSharedModelRuntime()` — process-wide async `ModelRuntime` singleton reused
+    across concurrent sessions.
   - `resolveModelPattern(pattern)` — best-effort `provider/id` / substring → `Model`.
 - `supervisor/in-process-supervisor.ts`
   - `startInProcessAgent(opts)` — event/callback-driven driver for `run_agent` jobs:

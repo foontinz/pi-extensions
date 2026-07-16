@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { CreateAgentSessionResult } from "@earendil-works/pi-coding-agent";
-import { createBareResourceLoader, resolveModelPattern, runSubagentInProcess } from "../../core/in-process-runner.js";
+import { __inProcessRunnerTest, createBareResourceLoader, resolveModelPattern, runSubagentInProcess } from "../../core/in-process-runner.js";
 
 type ResolverRegistry = NonNullable<Parameters<typeof resolveModelPattern>[1]>;
 
 function modelRegistry(models: Array<{ provider: string; id: string }>, authenticated: string[] = []): ResolverRegistry {
+  const authenticatedProviders = new Set(authenticated.map((key) => key.split("/", 1)[0]));
   return {
-    getAll: () => models,
-    hasConfiguredAuth: (model: { provider: string; id: string }) => authenticated.includes(`${model.provider}/${model.id}`),
+    getModels: () => models,
+    hasConfiguredAuth: (providerId: string) => authenticatedProviders.has(providerId),
   } as unknown as ResolverRegistry;
 }
 
@@ -22,6 +23,14 @@ function deferred<T>(): { promise: Promise<T>; resolve(value: T): void; reject(e
 function nextTurn(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
 }
+
+test.beforeEach(() => {
+  __inProcessRunnerTest.setModelRuntime(async () => ({}) as never);
+});
+
+test.afterEach(() => {
+  __inProcessRunnerTest.setModelRuntime(undefined);
+});
 
 function blockFor(ms: number): void {
   const end = Date.now() + ms;
@@ -95,6 +104,7 @@ test("resolveModelPattern distinguishes real colon IDs from CLI thinking suffixe
 
   assert.deepEqual(resolveModelPattern("team/model:free", registry), { provider: "gateway", id: "team/model:free" });
   assert.deepEqual(resolveModelPattern("team/model:xhigh", registry), { provider: "gateway", id: "team/model" });
+  assert.deepEqual(resolveModelPattern("team/model:max", registry), { provider: "gateway", id: "team/model" });
   assert.deepEqual(resolveModelPattern("named:high", registry), { provider: "gateway", id: "named:high" });
 });
 
@@ -133,6 +143,26 @@ test("external abort settles pending creation promptly and disposes a late sessi
   await nextTurn();
   assert.equal(promptCalls, 0);
   assert.equal(disposeCalls, 1);
+});
+
+test("timeout covers asynchronous model runtime creation", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  __inProcessRunnerTest.setModelRuntime(() => new Promise(() => {}));
+  let createCalls = 0;
+
+  const run = runSubagentInProcess(
+    { task: "must not run", cwd: process.cwd(), timeoutMs: 50 },
+    async () => {
+      createCalls += 1;
+      return { session: fakeSession() } as CreateAgentSessionResult;
+    },
+  );
+  t.mock.timers.tick(50);
+
+  const result = await settlesPromptly(run);
+  assert.equal(result.error?.reason, "timeout");
+  assert.equal(result.error?.message, "subagent timed out after 50ms");
+  assert.equal(createCalls, 0);
 });
 
 test("timeout covers session creation and disposes a late-created session", async (t) => {

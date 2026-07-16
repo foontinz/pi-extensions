@@ -73,7 +73,7 @@ in-process equivalents using an injectable launcher seam.
   creation (pool 4); P1.4 lean default tools. In-process primitive
   (`subagents/core/in-process-runner.ts`, `createAgentSession` + bare `ResourceLoader`
   + `SessionManager.inMemory` + per-agent abort/timeout + usage capture + shared
-  process-wide `AuthStorage`/`ModelRegistry`). New `workflows` ext with `Workflow` tool
+  process-wide async `ModelRuntime`). New `workflows` ext with `Workflow` tool
   + `agent/parallel/pipeline/workflow/phase/log/args/failures` hooks, concurrency cap
   (8) + agent cap (100), 429 backoff, stall watchdog, schema validate+retry, usage
   rollup envelope, `script`/`scriptPath`/`name` sources + inline-script persistence,
@@ -111,7 +111,7 @@ in-process equivalents using an injectable launcher seam.
   parent-side schema validate+retry; concurrency semaphore (8–12) + agent-count cap
   + stall watchdog; progress events + background-task delivery.
 - **Spikes:** 16 concurrent in-process sessions (A), re-entrancy from the tool's
-  `call()` (B), shared `AuthStorage`/`ModelRegistry` under concurrency (E).
+  `call()` (B), shared `ModelRuntime` under concurrency (E).
 
 ---
 
@@ -285,7 +285,7 @@ more. Normal `run_agent` omitted-tools behavior stays the portable read-only def
   separate auth/model/network instances; heavier. Else keep VM on main thread + accept
   sync-hang risk. Design choice.
 - **D. MCP** — not free for nested sessions; only blocks if workflows need MCP (P3.3).
-- **E. Auth/model sharing** — reuse the parent's `AuthStorage`/`ModelRegistry` across
+- **E. Auth/model sharing** — reuse one process-wide async `ModelRuntime` across
   children (both accepted options); verify token refresh under concurrency.
 
 ## Cross-references

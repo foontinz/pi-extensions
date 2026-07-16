@@ -71,7 +71,7 @@ With `background:false` it waits and returns the envelope:
   label?: string;
   tools?: string[];          // default: ["read","bash"]
   systemPrompt?: string;
-  thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
                               // default: inherit the root session's selected level
   timeoutMs?: number;        // per-agent
   cwd?: string;              // run the agent in this dir (resolved against workflow cwd)
@@ -165,8 +165,8 @@ ack or summary. Errors are always shown.
 - **Usage rollup:** token usage is aggregated across all agents into `usage`.
 - **Abort:** the tool's abort signal, the stall watchdog, and session shutdown all
   abort in-flight agents.
-- **Shared handles:** all agents reuse one process-wide `AuthStorage` / `ModelRegistry`
-  (validated under concurrency) instead of rebuilding them per agent.
+- **Shared runtime:** all agents reuse one process-wide async `ModelRuntime`
+  (validated under concurrency) instead of rebuilding model/auth state per agent.
 - **Background delivery:** background runs notify the parent session on completion via
   an idle-aware `sendUserMessage` (`followUp` when idle, else `steer`).
 
