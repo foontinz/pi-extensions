@@ -36,6 +36,9 @@ usage-cache.json.bak
 # Skill Loader local state
 /skill-loader/
 
+# Skill Forge per-project queue, watermarks, proposals, and leases
+/skill-forge/
+
 # Workflow inline-script run artifacts
 /workflows/
 

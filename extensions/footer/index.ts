@@ -4,7 +4,8 @@
  * Replaces the built-in three-line footer with a two-line layout:
  *
  *   ~/.pi/agent (main)                                  gpt-5.6-sol · low
- *   ↑77k ↓8.7k R1.3M $1.31 (sub) · 17%/372k   MCP: 0/2 · tools: minimized
+ *   ↑77k ↓8.7k R1.3M $1.31 (sub) · 17%/372k                 MCP: 0/2
+ *   forge 0 ready · caught up · on
  *
  * Differences from the built-in footer:
  * - no provider name next to the model
@@ -19,6 +20,8 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 /** Extension statuses hidden from the footer (keyed by their setStatus key). */
 const HIDDEN_STATUS_KEYS = new Set(["tool-view"]);
+/** Statuses pinned to their own left-aligned row directly below token usage. */
+const BELOW_STATS_STATUS_KEYS = new Set(["skill-forge"]);
 
 /** Minimal structural view of the TUI theme (fg color names vary by version). */
 interface FooterTheme {
@@ -56,6 +59,18 @@ function sanitizeStatusText(text: string): string {
 		.replace(/[\r\n\t]/g, " ")
 		.replace(/ +/g, " ")
 		.trim();
+}
+
+export function partitionExtensionStatuses(statuses: ReadonlyMap<string, string>): { inline: string; belowStats: string } {
+	const entries = Array.from(statuses.entries())
+		.filter(([key]) => !HIDDEN_STATUS_KEYS.has(key))
+		.sort(([a], [b]) => a.localeCompare(b))
+		.map(([key, text]) => [key, sanitizeStatusText(text)] as const)
+		.filter(([, text]) => text.length > 0);
+	return {
+		inline: entries.filter(([key]) => !BELOW_STATS_STATUS_KEYS.has(key)).map(([, text]) => text).join(" · "),
+		belowStats: entries.filter(([key]) => BELOW_STATS_STATUS_KEYS.has(key)).map(([, text]) => text).join(" · "),
+	};
 }
 
 /**
@@ -154,12 +169,7 @@ class CompactFooterComponent {
 		statsParts.push(percentPart);
 
 		const stats = statsParts.join(" ");
-		const statuses = Array.from(this.footerData.getExtensionStatuses().entries())
-			.filter(([key]) => !HIDDEN_STATUS_KEYS.has(key))
-			.sort(([a], [b]) => a.localeCompare(b))
-			.map(([, text]) => sanitizeStatusText(text))
-			.filter((text) => text.length > 0)
-			.join(" · ");
+		const { inline: statuses, belowStats } = partitionExtensionStatuses(this.footerData.getExtensionStatuses());
 
 		const ellipsis = dim("...");
 		const lines: string[] = [];
@@ -171,8 +181,10 @@ class CompactFooterComponent {
 		const line2 = statuses ? layoutRow(stats, dim(statuses), width) : stats;
 		if (line2 !== null) {
 			lines.push(truncateToWidth(line2, width, ellipsis));
+			if (belowStats) lines.push(truncateToWidth(dim(belowStats), width, ellipsis));
 		} else {
 			lines.push(truncateToWidth(stats, width, ellipsis));
+			if (belowStats) lines.push(truncateToWidth(dim(belowStats), width, ellipsis));
 			lines.push(truncateToWidth(dim(statuses), width, ellipsis));
 		}
 		return lines;
