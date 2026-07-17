@@ -1,6 +1,6 @@
 import { sha256 } from "./storage.ts";
 import { redactSecrets } from "./sessions.ts";
-import type { AnalyzerCandidate, AnalyzerInvalidation, ApplyingLease, EvidenceRef, ForgeState, Proposal, ProvenanceRecord, Scope } from "./types.ts";
+import type { AnalyzerCandidate, AnalyzerInvalidation, ApplyingLease, EvidenceRef, ForgeState, InstallKind, Proposal, ProvenanceRecord, Scope } from "./types.ts";
 
 const TERMINAL = new Set(["accepted", "rejected", "invalidated"]);
 
@@ -229,6 +229,11 @@ export function setScopeOverride(proposal: Proposal, scope: Scope): void {
   proposal.selectedScope = scope; proposal.updatedAt = new Date().toISOString();
 }
 
+export function setKindOverride(proposal: Proposal, kind: InstallKind): void {
+  requireStatus(proposal, "change install kind", ["ready", "deferred", "apply_failed"]);
+  proposal.selectedKind = kind; proposal.updatedAt = new Date().toISOString();
+}
+
 export function editProposal(proposal: Proposal, markdown: string): void {
   requireStatus(proposal, "be edited", ["ready"]);
   const canonical = canonicalSkillMd(proposal.skillName, proposal.description, markdown);
@@ -273,8 +278,8 @@ export function beginApplying(proposal: Proposal, applying: ApplyingLease): void
 export function finishAccepted(proposal: Proposal, applying: ApplyingLease): void {
   if (proposal.status === "accepted" && proposal.installed?.contentDigest === applying.contentDigest) return;
   if (proposal.status !== "applying" || proposal.applying?.owner !== applying.owner || proposal.applying.token !== applying.token) throw new Error("Applying ownership was lost");
-  proposal.status = "accepted"; proposal.selectedScope = applying.scope;
-  proposal.installed = { scope: applying.scope, path: applying.path, contentDigest: applying.contentDigest, installedAt: new Date().toISOString() };
+  proposal.status = "accepted"; proposal.selectedScope = applying.scope; proposal.selectedKind = applying.kind ?? "skill";
+  proposal.installed = { scope: applying.scope, kind: applying.kind ?? "skill", path: applying.path, contentDigest: applying.contentDigest, installedAt: new Date().toISOString() };
   delete proposal.applying; proposal.updatedAt = new Date().toISOString();
 }
 

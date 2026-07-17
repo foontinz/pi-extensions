@@ -29,23 +29,25 @@ Project installs require Pi project trust. Names/frontmatter are sanitized, path
 
 ## Commands
 
-- `/forge` — rich TUI inbox, or a plain-text inbox outside TUI
+- `/forge` — rich TUI inbox (sorted by confidence, scrolling list, type-to-filter, `ctrl+r` rejects the highlighted proposal, truncated to terminal width), or a plain-text inbox outside TUI
 - `/forge status`
 - `/forge sync`
 - `/forge analyze`
 - `/forge pause` / `/forge resume`
 - `/forge inspect <id>`
 - `/forge edit <id>`
-- `/forge accept <id> [user|project]`
+- `/forge accept <id> [user|project] [skill|prompt]`
 - `/forge reject <id> [reason]`
 - `/forge defer <id>`
 - `/forge reopen <id>`
 - `/forge scope <id> <user|project>`
+- `/forge kind <id> <skill|prompt>`
 - `/forge retry [id|all]`
 - `/forge doctor`
-- `/skill-forge ...` — alias
 
-The TUI review flow displays proposed scope metadata and provenance separately, opens an editor containing only `SKILL.md`, and requires confirmation of the exact scope, target, digest, and content before installation. Accepted skills offer a safe Pi resource reload.
+The TUI review flow displays proposed scope metadata and provenance separately, opens an editor containing only `SKILL.md`, and requires confirmation of the exact scope, kind, target, digest, and content before installation. Accepted resources offer a safe Pi resource reload.
+
+Each proposal installs either as a **skill** (`<scope>/skills/<name>/SKILL.md`, auto-loaded by the agent) or as a **prompt template** (`<scope>/prompts/<name>.md`, invoked manually as the `/<name>` slash command). The review menu's `accept as…` picks kind and scope interactively; `set kind` / `set scope` persist overrides on the proposal.
 
 ## Storage
 

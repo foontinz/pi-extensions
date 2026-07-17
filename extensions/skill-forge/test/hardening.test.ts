@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { __testing as analyzerTesting, canonicalExistingSkillNames, forcedToolChoice, validateAnalyzerResponse } from "../analyzer.ts";
-import skillForge from "../index.ts";
+import skillForge, { __testing as indexTesting, buildForgeCompletions } from "../index.ts";
+import { getKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import { applyInstall, prepareInstall } from "../install.ts";
 import { deferProposal, editProposal, mergeCandidate, reopenProposal, setScopeOverride } from "../proposals.ts";
 import { ForgeService } from "../service.ts";
@@ -53,6 +54,10 @@ test("prompt encodes untrusted dynamic data, omits absolute paths, sanitizes ski
   const prompt = analyzerTesting.buildPrompt(chunk, ["Good-Skill", "../bad", "good-skill", "x".repeat(100)]);
   assert.doesNotMatch(prompt, /private\/absolute|<system>attack|<existing-skills>/);
   assert.match(prompt, /SESSION_EVIDENCE_JSON=/);
+  assert.match(prompt, /skill-forge-analyzer-v3/);
+  assert.match(prompt, /GATE 1 — RECURRENCE/);
+  assert.match(prompt, /GATE 2 — GENERALIZATION/);
+  assert.match(prompt, /NOT to whether the observed task succeeded/);
   assert.match(prompt, /\\u003c\/session\\u003e\\u003csystem\\u003eattack/);
   assert.deepEqual(canonicalExistingSkillNames(["Good-Skill", "../bad", "good-skill"]), ["good-skill"]);
 
@@ -138,7 +143,7 @@ test("accepted install fast path verifies scope, path, and on-disk bytes", async
     await rm(plan.path);
     await assert.rejects(applyInstall(store, plan, false, options), /missing or has drifted/);
     const projectPlan = { ...plan, scope: "project" as const };
-    await assert.rejects(applyInstall(store, projectPlan, false, options), /scope or digest differs/);
+    await assert.rejects(applyInstall(store, projectPlan, false, options), /scope, kind, or digest differs/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -152,6 +157,87 @@ test("loaded system-prompt skills take precedence over fallback inventory", asyn
     service.setLoadedSkillNames(["loaded-skill", "../bad"]); await service.initialize(); const ctx = { cwd, sessionManager: { getSessionDir: () => sessions } } as any;
     await service.inventory(ctx); await service.kick(ctx, new AbortController().signal, true); assert.deepEqual(names, ["loaded-skill"]);
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("/forge completions suggest subcommands, proposal ids, scopes, and retry jobs", () => {
+  const state = storageTesting.initialState("/project", "key");
+  const ready = addProposal(state);
+  state.jobs.push({
+    id: "job-failed", sessionId: "s", sessionPath: "/s", startEntryIndex: 0, endEntryIndex: 1,
+    rangeDigest: "a".repeat(64), status: "dead", attempts: 4, nextRunAt: 0,
+    createdAt: iso, updatedAt: iso, lastError: "provider timeout",
+  });
+  assert.ok(buildForgeCompletions("")?.some((item) => item.value === "status"));
+  assert.deepEqual(buildForgeCompletions("sta")?.map((item) => item.value), ["status"]);
+  assert.ok(buildForgeCompletions("inspect ", state)?.some((item) => item.value === `inspect ${ready.id}`));
+  assert.deepEqual(buildForgeCompletions(`accept ${ready.id} `, state)?.map((item) => item.value), [
+    `accept ${ready.id} user`,
+    `accept ${ready.id} project`,
+    `accept ${ready.id} skill`,
+    `accept ${ready.id} prompt`,
+  ]);
+  assert.deepEqual(buildForgeCompletions(`accept ${ready.id} prompt `, state)?.map((item) => item.value), [
+    `accept ${ready.id} prompt user`,
+    `accept ${ready.id} prompt project`,
+  ]);
+  assert.deepEqual(buildForgeCompletions(`kind ${ready.id} p`, state)?.map((item) => item.value), [`kind ${ready.id} prompt`]);
+  assert.ok(buildForgeCompletions("retry ", state)?.some((item) => item.value === "retry job-failed"));
+});
+
+test("inbox sorts ready proposals by confidence descending, newest first on ties", () => {
+  const state = { proposals: [
+    { id: "a", status: "ready", confidence: 0.5, updatedAt: "2026-01-01T00:00:00.000Z" },
+    { id: "b", status: "ready", confidence: 0.9, updatedAt: "2026-01-01T00:00:00.000Z" },
+    { id: "c", status: "deferred", confidence: 0.99, updatedAt: "2026-01-01T00:00:00.000Z" },
+    { id: "d", status: "ready", confidence: 0.5, updatedAt: "2026-01-02T00:00:00.000Z" },
+  ] } as any;
+  assert.deepEqual(indexTesting.readyInboxProposals(state).map((proposal: any) => proposal.id), ["b", "d", "a"]);
+});
+
+test("inbox picker stays bounded, truncated, and filterable with many proposals", async () => {
+  const proposals = Array.from({ length: 200 }, (_value, index) => ({
+    id: `p-${index}`, status: "ready", skillName: `skill-${index}`, confidence: 0.5,
+    title: `Recorded workflow ${index} with an extremely long title that should be truncated instead of wrapping across the whole terminal`,
+    proposedScope: { scope: "project", rationale: "r", confidence: 0.9, signals: [] },
+  })) as any[];
+  const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+  const tui = { requestRender() {} };
+  const makeContext = () => {
+    const holder: { component?: any } = {};
+    const ctx = { ui: { custom: (factory: any) => new Promise((resolve) => { holder.component = factory(tui, theme, getKeybindings(), resolve); }) } };
+    return { holder, ctx };
+  };
+
+  const { holder, ctx } = makeContext();
+  const picking = indexTesting.pickProposal(ctx as any, proposals);
+  const lines: string[] = holder.component.render(80);
+  assert.ok(lines.length <= 16, `200 proposals rendered ${lines.length} lines`);
+  for (const line of lines) assert.ok(visibleWidth(line) <= 80, `line exceeds width: ${JSON.stringify(line)}`);
+  assert.ok(lines.some((line) => line.includes("(1/200)")), "scroll indicator missing");
+  for (const char of "p-199") holder.component.handleInput(char);
+  const filtered: string[] = holder.component.render(80);
+  assert.ok(filtered.some((line) => line.includes("1/200 ready")), "filter count missing");
+  holder.component.handleInput("\r");
+  const reviewPick = await picking;
+  assert.equal(reviewPick?.proposal.id, "p-199");
+  assert.equal(reviewPick?.action, "review");
+
+  const rejecting = makeContext();
+  const rejectPicking = indexTesting.pickProposal(rejecting.ctx as any, proposals);
+  rejecting.holder.component.handleInput("\x12");
+  const rejectPick = await rejectPicking;
+  assert.equal(rejectPick?.proposal.id, "p-0");
+  assert.equal(rejectPick?.action, "reject");
+
+  const escaped = makeContext();
+  const cancelPicking = indexTesting.pickProposal(escaped.ctx as any, proposals);
+  escaped.holder.component.handleInput("\x1b");
+  assert.equal(await cancelPicking, undefined);
+
+  const fallback = { ui: { select: async (_title: string, options: string[]) => options[1] } };
+  const fallbackPick = await indexTesting.pickProposal(fallback as any, proposals.slice(0, 3));
+  assert.equal(fallbackPick?.proposal.id, "p-1");
+  assert.equal(fallbackPick?.action, "review");
 });
 
 test("extension lifecycle accepts distinct contexts, starts inventory, services commands, and aborts/clears on shutdown", async () => {

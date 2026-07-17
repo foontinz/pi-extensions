@@ -1,17 +1,18 @@
 import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, link, lstat, mkdir, open, readFile, realpath, rename, rm } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { beginApplying, failApplying, finishAccepted, validateInstallableSkill } from "./proposals.ts";
 import type { ProjectStore } from "./storage.ts";
 import { sha256 } from "./storage.ts";
-import type { ApplyingLease, Proposal, Scope } from "./types.ts";
+import type { ApplyingLease, InstallKind, Proposal, Scope } from "./types.ts";
 
 export interface InstallOptions { projectCwd: string; agentDir: string; configDirName: string; projectTrusted: boolean }
 interface Identity { dev: number; ino: number; size: number; mtimeMs: number; ctimeMs: number }
 export interface InstallPlan {
   proposalId: string;
   scope: Scope;
+  kind: InstallKind;
   base: string;
   root: string;
   skillDir: string;
@@ -81,12 +82,20 @@ export function boundedDiff(before: string, after: string, maximum = 8_000): str
   return lines.join("\n");
 }
 
-export async function prepareInstall(proposal: Proposal, scope: Scope, options: InstallOptions): Promise<InstallPlan> {
+export function installTarget(skillName: string, scope: Scope, kind: InstallKind, options: InstallOptions): { base: string; root: string; dir: string; path: string } {
+  const base = resolve(scope === "project" ? options.projectCwd : options.agentDir);
+  const kindDir = kind === "prompt" ? "prompts" : "skills";
+  const root = resolve(scope === "project" ? join(base, options.configDirName, kindDir) : join(base, kindDir));
+  // Skills install as <root>/<name>/SKILL.md; prompts are single <root>/<name>.md templates.
+  const dir = kind === "prompt" ? root : resolve(root, skillName);
+  const path = kind === "prompt" ? resolve(root, `${skillName}.md`) : resolve(dir, "SKILL.md");
+  return { base, root, dir, path };
+}
+
+export async function prepareInstall(proposal: Proposal, scope: Scope, options: InstallOptions, kind: InstallKind = "skill"): Promise<InstallPlan> {
   if (scope === "project" && !options.projectTrusted) throw new Error("Project skill installation requires project trust");
   validateInstallableSkill(proposal.skillMd, proposal.skillName);
-  const base = resolve(scope === "project" ? options.projectCwd : options.agentDir);
-  const root = resolve(scope === "project" ? join(base, options.configDirName, "skills") : join(base, "skills"));
-  const skillDir = resolve(root, proposal.skillName); const path = resolve(skillDir, "SKILL.md");
+  const { base, root, dir: skillDir, path } = installTarget(proposal.skillName, scope, kind, options);
   if (!inside(root, base) || !inside(skillDir, root) || !inside(path, root)) throw new Error("Skill install path is not confined to its scope root");
   let chain = base;
   for (const component of ["", ...relative(base, path).split(sep).filter(Boolean)]) {
@@ -101,14 +110,14 @@ export async function prepareInstall(proposal: Proposal, scope: Scope, options: 
     const current = await readRegularNoFollow(path); existing = current.content; destinationIdentity = current.identity;
   }
   return {
-    proposalId: proposal.id, scope, base, root, skillDir, path, content: proposal.skillMd, contentDigest: sha256(proposal.skillMd),
+    proposalId: proposal.id, scope, kind, base, root, skillDir, path, content: proposal.skillMd, contentDigest: sha256(proposal.skillMd),
     collision: existing === undefined ? "none" : existing === proposal.skillMd ? "identical" : "different",
     ...(existing !== undefined ? { existing, destinationIdentity, diff: boundedDiff(existing, proposal.skillMd) } : {}),
   };
 }
 
 function assertReviewedCollision(reviewed: InstallPlan, current: InstallPlan, confirmed: boolean): void {
-  if (reviewed.path !== current.path || reviewed.root !== current.root || reviewed.contentDigest !== current.contentDigest || reviewed.scope !== current.scope) throw new Error("Install target or proposal changed after review");
+  if (reviewed.path !== current.path || reviewed.root !== current.root || reviewed.contentDigest !== current.contentDigest || reviewed.scope !== current.scope || reviewed.kind !== current.kind) throw new Error("Install target or proposal changed after review");
   if (reviewed.collision === "different" && !confirmed) throw new Error("Existing skill differs; explicit collision confirmation is required");
   if (reviewed.collision !== current.collision) throw new Error(`Destination changed after review (${reviewed.collision} -> ${current.collision})`);
   if (reviewed.collision !== "none" && (reviewed.existing !== current.existing || !sameIdentity(reviewed.destinationIdentity, current.destinationIdentity))) throw new Error("Destination changed after collision review");
@@ -138,10 +147,10 @@ export async function applyInstall(store: ProjectStore, reviewed: InstallPlan, c
     const proposal = state.proposals.find((item) => item.id === reviewed.proposalId);
     if (!proposal) throw new Error(`Unknown proposal: ${reviewed.proposalId}`);
     if (proposal.status === "accepted") {
-      if (!proposal.installed || proposal.installed.contentDigest !== reviewed.contentDigest || proposal.installed.scope !== reviewed.scope) {
-        throw new Error("Accepted proposal scope or digest differs; reopen it as a new revision before installing elsewhere");
+      if (!proposal.installed || proposal.installed.contentDigest !== reviewed.contentDigest || proposal.installed.scope !== reviewed.scope || (proposal.installed.kind ?? "skill") !== reviewed.kind) {
+        throw new Error("Accepted proposal scope, kind, or digest differs; reopen it as a new revision before installing elsewhere");
       }
-      const currentAccepted = await prepareInstall(proposal, reviewed.scope, options);
+      const currentAccepted = await prepareInstall(proposal, reviewed.scope, options, reviewed.kind);
       if (currentAccepted.path !== proposal.installed.path || currentAccepted.collision !== "identical" || currentAccepted.contentDigest !== proposal.installed.contentDigest) {
         throw new Error("Accepted skill installation is missing or has drifted; reopen the proposal before repairing it");
       }
@@ -150,9 +159,9 @@ export async function applyInstall(store: ProjectStore, reviewed: InstallPlan, c
     if (proposal.status !== "ready") throw new Error(`Proposal ${proposal.id} cannot be accepted from status ${proposal.status}`);
     // Re-derive the target from locked proposal content and caller-owned roots,
     // then revalidate every collision, including an identical destination.
-    plan = await prepareInstall(proposal, reviewed.scope, options);
+    plan = await prepareInstall(proposal, reviewed.scope, options, reviewed.kind);
     assertReviewedCollision(reviewed, plan, collisionConfirmed);
-    applying = { scope: plan.scope, path: plan.path, contentDigest: plan.contentDigest, startedAt: new Date().toISOString(), owner, token, expiresAt: Date.now() + APPLY_LEASE_MS };
+    applying = { scope: plan.scope, kind: plan.kind, path: plan.path, contentDigest: plan.contentDigest, startedAt: new Date().toISOString(), owner, token, expiresAt: Date.now() + APPLY_LEASE_MS };
     beginApplying(proposal, applying);
   });
   if (!applying) return; // Idempotent already-accepted finalization.
@@ -169,7 +178,7 @@ export async function applyInstall(store: ProjectStore, reviewed: InstallPlan, c
         const current = await readRegularNoFollow(plan.path);
         if (!sameIdentity(plan.destinationIdentity, current.identity) || current.content !== plan.existing) throw new Error("Destination changed before write");
       }
-      const temporary = join(plan.skillDir, `.SKILL.md.${process.pid}.${randomBytes(8).toString("hex")}.tmp`);
+      const temporary = join(plan.skillDir, `.${basename(plan.path)}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`);
       const handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | NOFOLLOW, 0o600);
       try { await handle.writeFile(plan.content, "utf8"); await handle.sync(); }
       finally { await handle.close(); }

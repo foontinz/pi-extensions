@@ -1,7 +1,8 @@
 export const STATE_VERSION = 2;
-export const ANALYZER_PROMPT_VERSION = "skill-forge-analyzer-v2";
+export const ANALYZER_PROMPT_VERSION = "skill-forge-analyzer-v3";
 
 export type Scope = "user" | "project";
+export type InstallKind = "skill" | "prompt";
 export type ProposalStatus = "ready" | "deferred" | "rejected" | "invalidated" | "applying" | "accepted" | "apply_failed";
 export type JobStatus = "queued" | "leased" | "retry" | "dead";
 
@@ -108,6 +109,8 @@ export interface ProvenanceRecord {
 
 export interface ApplyingLease {
   scope: Scope;
+  /** Absent in states written before prompt installs existed; treat as "skill". */
+  kind?: InstallKind;
   path: string;
   contentDigest: string;
   startedAt: string;
@@ -129,6 +132,7 @@ export interface Proposal {
   skillMd: string;
   proposedScope: ProposedScope;
   selectedScope?: Scope;
+  selectedKind?: InstallKind;
   operation: "create" | "update";
   status: ProposalStatus;
   createdAt: string;
@@ -137,7 +141,7 @@ export interface Proposal {
   reviewerEditedAt?: string;
   rejectionReason?: string;
   applying?: ApplyingLease;
-  installed?: { scope: Scope; path: string; contentDigest: string; installedAt: string };
+  installed?: { scope: Scope; kind?: InstallKind; path: string; contentDigest: string; installedAt: string };
   lastApplyError?: string;
 }
 

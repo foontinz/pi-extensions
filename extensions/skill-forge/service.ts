@@ -478,10 +478,11 @@ export class ForgeService {
         const pid = Number.parseInt(applying.owner.split("-")[0] ?? "", 10);
         if (applying.expiresAt > Date.now() && processAlive(pid)) continue;
         try {
+          const kindDir = (applying.kind ?? "skill") === "prompt" ? "prompts" : "skills";
           const root = resolve(applying.scope === "project"
-            ? join(this.store.cwd, this.projectConfigDirName, "skills")
-            : join(this.agentDir, "skills"));
-          const expectedPath = resolve(root, proposal.skillName, "SKILL.md");
+            ? join(this.store.cwd, this.projectConfigDirName, kindDir)
+            : join(this.agentDir, kindDir));
+          const expectedPath = (applying.kind ?? "skill") === "prompt" ? resolve(root, `${proposal.skillName}.md`) : resolve(root, proposal.skillName, "SKILL.md");
           if (resolve(applying.path) !== expectedPath) throw new Error("Applying path does not match its recorded scope and skill name");
           const value = await lstat(expectedPath);
           if (value.isSymbolicLink() || !value.isFile()) throw new Error("Applying destination is not a regular non-symlink file");

@@ -56,6 +56,37 @@ test("install requires trust, confines paths, rejects symlink components, and wr
   } finally { await rm(s.root, { recursive: true, force: true }); }
 });
 
+test("prompt kind installs a single slash-command template and survives applying recovery", async () => {
+  const f = await fixture();
+  try {
+    const plan = await prepareInstall(f.proposal, "user", options(f), "prompt");
+    assert.equal(plan.kind, "prompt");
+    assert.equal(plan.path, join(f.agent, "prompts", "safe-workflow.md"));
+    await applyInstall(f.store, plan, false, options(f));
+    assert.equal(await readFile(plan.path, "utf8"), f.proposal.skillMd);
+    const accepted = (await f.store.read()).proposals[0]!;
+    assert.equal(accepted.status, "accepted");
+    assert.equal(accepted.installed?.kind, "prompt");
+    assert.equal(accepted.selectedKind, "prompt");
+
+    // Interrupted prompt apply with matching on-disk bytes recovers to accepted.
+    await f.store.withLock((state) => {
+      const proposal = state.proposals[0]!; proposal.status = "applying";
+      proposal.applying = { scope: "user", kind: "prompt", path: plan.path, contentDigest: plan.contentDigest, startedAt: new Date().toISOString(), owner: "99999999-dead", token: "recovery", expiresAt: 0 };
+    });
+    const service = new ForgeService(f.store, f.agent, ".pi", async () => [], async () => { throw new Error("unused"); });
+    await service.initialize();
+    const recovered = (await f.store.read()).proposals[0]!;
+    assert.equal(recovered.status, "accepted");
+    assert.equal(recovered.installed?.kind, "prompt");
+
+    // Project-scope prompt goes under .pi/prompts.
+    await f.store.withLock((state) => { state.proposals[0]!.status = "ready"; delete state.proposals[0]!.installed; });
+    const projectPlan = await prepareInstall((await f.store.read()).proposals[0]!, "project", options(f), "prompt");
+    assert.equal(projectPlan.path, join(f.cwd, ".pi", "prompts", "safe-workflow.md"));
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
 test("collision requires explicit confirmation/diff and never silently overwrites", async () => {
   const f = await fixture();
   try {
@@ -105,7 +136,7 @@ test("extension registers commands/events but no model-facing tools or recursive
     on(name: string) { events.push(name); },
     registerTool() { tools++; }, sendMessage() { messages++; }, sendUserMessage() { messages++; },
   } as any);
-  assert.deepEqual(commands.sort(), ["forge", "skill-forge"]);
+  assert.deepEqual(commands, ["forge"]);
   assert.equal(tools, 0);
   assert.equal(messages, 0);
   assert.ok(events.includes("session_start") && events.includes("session_shutdown") && events.includes("agent_settled"));
