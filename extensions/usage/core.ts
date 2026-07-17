@@ -2,7 +2,8 @@
  * Shared usage data loading.
  *
  * Scans the active session directory for assistant-turn cost entries and
- * aggregates them per day and per model (used by the `/usage` panel).
+ * returns a deduplicated flat entry list plus aggregates per day, per model,
+ * and per project (used by the `/usage` panel).
  *
  * The cache stores complete per-file assistant entries. Files are only reused
  * when their complete filesystem stamp matches; changed files are read again
@@ -12,35 +13,57 @@
 
 import type { Stats } from "node:fs";
 import { open, readdir, readFile, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 // ─── types ───────────────────────────────────────────────────────────────────
 
-export interface DayCost {
+export interface Cost {
   total: number;
-  input: number;
-  output: number;
-  turns: number;
-}
-
-export interface ModelStats {
-  turns: number;
   input: number;
   output: number;
   cacheRead: number;
   cacheWrite: number;
-  total: number;
 }
 
-// Grand totals share the per-model shape; today's slice shares the per-day shape.
-export type Grand = ModelStats;
-export type TodayCost = DayCost;
+export interface Tokens {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  reasoning: number;
+}
+
+/** One deduplicated assistant turn with everything the panel drills into. */
+export interface UsageEntry {
+  day: string;
+  model: string;
+  project: string;
+  cost: Cost;
+  tokens: Tokens;
+}
+
+/** Aggregate over any group of entries (a day, a model, a project, everything). */
+export interface GroupStats {
+  turns: number;
+  cost: Cost;
+  tokens: Tokens;
+}
 
 export interface UsageData {
-  days: Map<string, DayCost>;
-  models: Map<string, ModelStats>;
-  grand: Grand;
+  entries: UsageEntry[];
+  days: Map<string, GroupStats>;
+  models: Map<string, GroupStats>;
+  projects: Map<string, GroupStats>;
+  grand: GroupStats;
+}
+
+export function emptyStats(): GroupStats {
+  return {
+    turns: 0,
+    cost: { total: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
+  };
 }
 
 // ─── paths & date helpers ─────────────────────────────────────────────────────
@@ -64,23 +87,20 @@ export function todayKey(): string {
 
 // ─── per-file entries ─────────────────────────────────────────────────────────
 
-interface Cost {
-  total: number;
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-}
-
 interface AssistantUsageEntry {
   /** Present on current Pi session entries; absent on legacy/malformed entries. */
   entryId?: string;
   day: string;
   model: string;
   cost: Cost;
+  tokens: Tokens;
 }
 
 interface FileAggregate {
+  /** Session cwd from the header line; absent on legacy/truncated files. */
+  project?: string;
+  /** Session start (header timestamp); orders originals before their forks. */
+  startedAt?: string;
   entries: AssistantUsageEntry[];
 }
 
@@ -92,20 +112,41 @@ function finiteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
-function costValue(value: unknown): number {
+function numberOrZero(value: unknown): number {
   return finiteNumber(value) ? value : 0;
 }
 
 /** Parse all complete JSON values in a stable file snapshot. */
 function parseSessionFile(text: string): FileAggregate {
   const entries: AssistantUsageEntry[] = [];
+  let project: string | undefined;
+  let startedAt: string | undefined;
+  let headerSeen = false;
 
   // split() deliberately includes a final line without a trailing newline.
   // A concurrently written partial final line simply fails JSON.parse and is
   // picked up after the writer changes the file stamp on a later load.
   for (const rawLine of text.split("\n")) {
     const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
-    if (!line || !line.includes('"cost"')) continue;
+    if (!line) continue;
+
+    // The session header (usually the first line) carries the project cwd
+    // and the session start time.
+    if (!headerSeen && line.includes('"type":"session"')) {
+      headerSeen = true;
+      try {
+        const header: unknown = JSON.parse(line);
+        if (isRecord(header) && header.type === "session") {
+          if (typeof header.cwd === "string" && header.cwd) project = header.cwd;
+          if (typeof header.timestamp === "string" && header.timestamp) startedAt = header.timestamp;
+        }
+      } catch {
+        // Malformed header — fall back to the directory-derived project name.
+      }
+      continue;
+    }
+
+    if (!line.includes('"cost"')) continue;
 
     try {
       const entry: unknown = JSON.parse(line);
@@ -114,9 +155,21 @@ function parseSessionFile(text: string): FileAggregate {
 
       const usage = isRecord(entry.message.usage) ? entry.message.usage : undefined;
       const cost = usage && isRecord(usage.cost) ? usage.cost : undefined;
-      // Keep the existing behaviour of ignoring zero-cost assistant turns.
-      if (!cost || !finiteNumber(cost.total) || !cost.total) continue;
+      if (!usage || !cost || !finiteNumber(cost.total)) continue;
       if (typeof entry.timestamp !== "string") continue;
+
+      const tokens: Tokens = {
+        input: numberOrZero(usage.input),
+        output: numberOrZero(usage.output),
+        cacheRead: numberOrZero(usage.cacheRead),
+        cacheWrite: numberOrZero(usage.cacheWrite),
+        reasoning: numberOrZero(usage.reasoning),
+      };
+      // Skip turns with neither cost nor tokens (aborted/empty turns), but
+      // keep zero-cost turns from free or local models so token and turn
+      // totals stay complete.
+      const tokenSum = tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite + tokens.reasoning;
+      if (!cost.total && !tokenSum) continue;
 
       const modelId = typeof entry.message.model === "string" && entry.message.model
         ? entry.message.model
@@ -132,18 +185,19 @@ function parseSessionFile(text: string): FileAggregate {
         model,
         cost: {
           total: cost.total,
-          input: costValue(cost.input),
-          output: costValue(cost.output),
-          cacheRead: costValue(cost.cacheRead),
-          cacheWrite: costValue(cost.cacheWrite),
+          input: numberOrZero(cost.input),
+          output: numberOrZero(cost.output),
+          cacheRead: numberOrZero(cost.cacheRead),
+          cacheWrite: numberOrZero(cost.cacheWrite),
         },
+        tokens,
       });
     } catch {
       // One malformed JSONL line must not make the rest of this file unusable.
     }
   }
 
-  return { entries };
+  return { ...(project ? { project } : {}), ...(startedAt ? { startedAt } : {}), entries };
 }
 
 // ─── stable snapshots ─────────────────────────────────────────────────────────
@@ -208,7 +262,7 @@ async function readStableSnapshot(path: string): Promise<{ stamp: FileStamp; tex
 
 // ─── on-disk cache ────────────────────────────────────────────────────────────
 
-const CACHE_VERSION = 3;
+const CACHE_VERSION = 5;
 
 interface FileCacheEntry extends FileAggregate {
   stamp: FileStamp;
@@ -221,12 +275,17 @@ interface CacheFile {
 }
 
 function parseCachedUsageEntry(value: unknown): AssistantUsageEntry | undefined {
-  if (!isRecord(value) || typeof value.day !== "string" || typeof value.model !== "string" || !isRecord(value.cost)) {
+  if (!isRecord(value) || typeof value.day !== "string" || typeof value.model !== "string" ||
+      !isRecord(value.cost) || !isRecord(value.tokens)) {
     return undefined;
   }
-  const { cost } = value;
+  const { cost, tokens } = value;
   if (!finiteNumber(cost.total) || !finiteNumber(cost.input) || !finiteNumber(cost.output) ||
       !finiteNumber(cost.cacheRead) || !finiteNumber(cost.cacheWrite)) {
+    return undefined;
+  }
+  if (!finiteNumber(tokens.input) || !finiteNumber(tokens.output) || !finiteNumber(tokens.cacheRead) ||
+      !finiteNumber(tokens.cacheWrite) || !finiteNumber(tokens.reasoning)) {
     return undefined;
   }
   if (value.entryId !== undefined && typeof value.entryId !== "string") return undefined;
@@ -242,6 +301,13 @@ function parseCachedUsageEntry(value: unknown): AssistantUsageEntry | undefined 
       cacheRead: cost.cacheRead,
       cacheWrite: cost.cacheWrite,
     },
+    tokens: {
+      input: tokens.input,
+      output: tokens.output,
+      cacheRead: tokens.cacheRead,
+      cacheWrite: tokens.cacheWrite,
+      reasoning: tokens.reasoning,
+    },
   };
 }
 
@@ -252,6 +318,8 @@ function parseFileCacheEntry(value: unknown): FileCacheEntry | undefined {
       !finiteNumber(stamp.mtimeMs) || !finiteNumber(stamp.ctimeMs)) {
     return undefined;
   }
+  if (value.project !== undefined && typeof value.project !== "string") return undefined;
+  if (value.startedAt !== undefined && typeof value.startedAt !== "string") return undefined;
 
   const entries: AssistantUsageEntry[] = [];
   for (const rawEntry of value.entries) {
@@ -268,6 +336,8 @@ function parseFileCacheEntry(value: unknown): FileCacheEntry | undefined {
       mtimeMs: stamp.mtimeMs,
       ctimeMs: stamp.ctimeMs,
     },
+    ...(typeof value.project === "string" && value.project ? { project: value.project } : {}),
+    ...(typeof value.startedAt === "string" && value.startedAt ? { startedAt: value.startedAt } : {}),
     entries,
   };
 }
@@ -341,24 +411,68 @@ async function resolveFile(path: string, previous: FileCacheEntry | undefined): 
   }
 }
 
-function addDay(days: Map<string, DayCost>, key: string, cost: Cost): void {
-  const day = days.get(key) ?? { total: 0, input: 0, output: 0, turns: 0 };
-  day.total += cost.total;
-  day.input += cost.input;
-  day.output += cost.output;
-  day.turns += 1;
-  days.set(key, day);
+function addToStats(stats: GroupStats, entry: UsageEntry): void {
+  stats.turns += 1;
+  stats.cost.total += entry.cost.total;
+  stats.cost.input += entry.cost.input;
+  stats.cost.output += entry.cost.output;
+  stats.cost.cacheRead += entry.cost.cacheRead;
+  stats.cost.cacheWrite += entry.cost.cacheWrite;
+  stats.tokens.input += entry.tokens.input;
+  stats.tokens.output += entry.tokens.output;
+  stats.tokens.cacheRead += entry.tokens.cacheRead;
+  stats.tokens.cacheWrite += entry.tokens.cacheWrite;
+  stats.tokens.reasoning += entry.tokens.reasoning;
 }
 
-function addModel(models: Map<string, ModelStats>, key: string, cost: Cost): void {
-  const model = models.get(key) ?? { turns: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
-  model.turns += 1;
-  model.input += cost.input;
-  model.output += cost.output;
-  model.cacheRead += cost.cacheRead;
-  model.cacheWrite += cost.cacheWrite;
-  model.total += cost.total;
-  models.set(key, model);
+function addToGroup(groups: Map<string, GroupStats>, key: string, entry: UsageEntry): void {
+  let stats = groups.get(key);
+  if (!stats) {
+    stats = emptyStats();
+    groups.set(key, stats);
+  }
+  addToStats(stats, entry);
+}
+
+/** Aggregate any entry subset (the panel re-runs this over range filters). */
+export function aggregateEntries(entries: Iterable<UsageEntry>): Omit<UsageData, "entries"> {
+  const days = new Map<string, GroupStats>();
+  const models = new Map<string, GroupStats>();
+  const projects = new Map<string, GroupStats>();
+  const grand = emptyStats();
+
+  for (const entry of entries) {
+    addToGroup(days, entry.day, entry);
+    addToGroup(models, entry.model, entry);
+    addToGroup(projects, entry.project, entry);
+    addToStats(grand, entry);
+  }
+
+  return { days, models, projects, grand };
+}
+
+/**
+ * Best-effort project label for a session file without a readable header:
+ * the session directory name is Pi's escaped cwd (`--Users-alice-dev-app--`),
+ * which is ambiguous to unescape, so it is shown as-is.
+ */
+function fallbackProject(path: string, sessionDir: string): string {
+  const dir = dirname(path);
+  if (dir === sessionDir) return "(unknown project)";
+  return basename(dir);
+}
+
+/**
+ * Sortable session start key. Prefers the header timestamp; falls back to the
+ * timestamp Pi encodes in the file name ("2026-07-16T22-56-46-455Z_…"),
+ * normalized to ISO so both forms compare correctly. Files with no known
+ * start sort last so sessions with a known (earlier) start win deduplication.
+ */
+function sessionStartKey(path: string, file: { startedAt?: string }): string {
+  if (file.startedAt) return file.startedAt;
+  const m = basename(path).match(/^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z/);
+  if (m) return `${m[1]}T${m[2]}:${m[3]}:${m[4]}.${m[5]}Z`;
+  return "9999-12-31T23:59:59.999Z";
 }
 
 /**
@@ -382,12 +496,20 @@ export async function loadUsageData(sessionDir = defaultSessionsRoot()): Promise
     }
   }
 
-  const days = new Map<string, DayCost>();
-  const models = new Map<string, ModelStats>();
-  const grand: Grand = { turns: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+  const entries: UsageEntry[] = [];
   const seenAssistantEntryIds = new Set<string>();
 
-  for (const file of nextFiles.values()) {
+  // Deduplicate in session-start order: a fork/clone always starts after the
+  // session it copied, so the original session wins and copied history stays
+  // attributed to its original project regardless of file-walk order.
+  const ordered = [...nextFiles.entries()].sort((a, b) => {
+    const ka = sessionStartKey(a[0], a[1]);
+    const kb = sessionStartKey(b[0], b[1]);
+    return ka < kb ? -1 : ka > kb ? 1 : a[0].localeCompare(b[0]);
+  });
+
+  for (const [path, file] of ordered) {
+    const project = file.project ?? fallbackProject(path, sessionDir);
     for (const entry of file.entries) {
       // Forked/cloned sessions copy the original entry IDs. Count a copied
       // assistant turn once while leaving legacy entries without IDs intact.
@@ -395,23 +517,15 @@ export async function loadUsageData(sessionDir = defaultSessionsRoot()): Promise
         if (seenAssistantEntryIds.has(entry.entryId)) continue;
         seenAssistantEntryIds.add(entry.entryId);
       }
-
-      addDay(days, entry.day, entry.cost);
-      addModel(models, entry.model, entry.cost);
-      grand.turns += 1;
-      grand.input += entry.cost.input;
-      grand.output += entry.cost.output;
-      grand.cacheRead += entry.cost.cacheRead;
-      grand.cacheWrite += entry.cost.cacheWrite;
-      grand.total += entry.cost.total;
+      entries.push({ day: entry.day, model: entry.model, project, cost: entry.cost, tokens: entry.tokens });
     }
   }
 
   await writeCache(nextFiles);
-  return { days, models, grand };
+  return { entries, ...aggregateEntries(entries) };
 }
 
-/** Today's cost pulled straight from loaded data (used by the /usage panel). */
-export function todayCostFrom(data: UsageData): TodayCost {
-  return data.days.get(todayKey()) ?? { total: 0, input: 0, output: 0, turns: 0 };
+/** Today's stats pulled straight from loaded data (used by the /usage panel). */
+export function todayCostFrom(data: UsageData): GroupStats {
+  return data.days.get(todayKey()) ?? emptyStats();
 }
