@@ -1,418 +1,325 @@
 import { isDeepStrictEqual } from "node:util";
-import { assertCanonicalJson } from "./canonical-json.js";
+import { cloneCanonicalJson } from "./canonical-json.js";
 import type {
-  WorkflowAgentRecord,
-  WorkflowBudget,
-  WorkflowEvent,
-  WorkflowFailure,
-  WorkflowInput,
-  WorkflowRunRecord,
-  WorkflowStatus,
-  WorkflowTerminalIntent,
-  WorkflowTerminalStatus,
+  WorkflowAttemptRecordV1,
+  WorkflowBudgetSnapshot,
+  WorkflowCleanupOutcomeV1,
+  WorkflowLeafRecordV1,
+  WorkflowLeafStatus,
+  WorkflowMeta,
+  WorkflowOwnerV1,
+  WorkflowRunEvent,
+  WorkflowRunRecordV1,
+  WorkflowRunStatus,
+  WorkflowSourceProvenanceV1,
   WorkflowTransition,
-  WorkflowUsage,
 } from "./contracts.js";
-import { emptyWorkflowUsage, WORKFLOW_AGENT_STATUS_VALUES, WORKFLOW_STATUS_VALUES, WORKFLOW_TERMINAL_STATUS_VALUES } from "./contracts.js";
-import {
-  MAX_OUTPUT_BYTES,
-  MAX_WORKFLOW_AGENTS,
-  MAX_WORKFLOW_CONCURRENCY,
-  MAX_WORKFLOW_TIMEOUT_MS,
-  WORKFLOW_RUN_SCHEMA_VERSION,
-} from "./limits.js";
+import { emptyWorkflowUsage, WORKFLOW_LEAF_STATUS_VALUES, WORKFLOW_RUN_STATUS_VALUES, WORKFLOW_TERMINAL_STATUS_VALUES } from "./contracts.js";
+import { MAX_WORKFLOW_AGENTS } from "./limits.js";
 
-const STATUSES = new Set<WorkflowStatus>(WORKFLOW_STATUS_VALUES);
-const TERMINAL_STATUSES = new Set<WorkflowTerminalStatus>(WORKFLOW_TERMINAL_STATUS_VALUES);
-const AGENT_STATUSES = new Set(WORKFLOW_AGENT_STATUS_VALUES);
-const UNSETTLED_AGENT_STATUSES = new Set(["queued", "running", "retrying"]);
-const CONCURRENT_AGENT_STATUSES = new Set(["running", "retrying"]);
+const RUN_STATUSES = new Set<WorkflowRunStatus>(WORKFLOW_RUN_STATUS_VALUES);
+const TERMINAL_RUN_STATUSES = new Set<WorkflowRunStatus>(WORKFLOW_TERMINAL_STATUS_VALUES);
+const LEAF_STATUSES = new Set<WorkflowLeafStatus>(WORKFLOW_LEAF_STATUS_VALUES);
+const TERMINAL_LEAF_STATUSES = new Set<WorkflowLeafStatus>(["completed", "failed", "interrupted", "skipped", "cached"]);
+const LEAF_TRANSITIONS: Record<WorkflowLeafStatus, ReadonlySet<WorkflowLeafStatus>> = {
+  queued: new Set(["running", "backoff", "failed", "interrupted", "skipped", "cached"]),
+  running: new Set(["backoff", "completed", "failed", "interrupted", "skipped"]),
+  backoff: new Set(["running", "failed", "interrupted", "skipped"]),
+  completed: new Set(), failed: new Set(), interrupted: new Set(), skipped: new Set(), cached: new Set(),
+};
 
-export class WorkflowInvariantError extends Error {
-  override name = "WorkflowInvariantError";
-}
+export class WorkflowInvariantError extends Error { override name = "WorkflowInvariantError" }
 
 export interface CreateWorkflowRunOptions {
-  id: string;
-  input: WorkflowInput;
+  runId: string;
+  rootRunId?: string;
+  parentRunId?: string;
+  resumeFromRunId?: string;
+  owner: WorkflowOwnerV1;
+  source: WorkflowSourceProvenanceV1;
+  metadata: WorkflowMeta;
+  args: unknown;
+  argsSha256: string;
+  executionFingerprint: string;
+  activationIdentity: string;
+  deadlineAt: number;
+  cleanupDeadlineAt: number;
+  budgetTotal?: number | null;
   createdAt?: number;
-  budget?: Partial<WorkflowBudget>;
 }
-
 export interface ReduceWorkflowOptions { now?: number }
 
-export function createWorkflowRunRecord(options: CreateWorkflowRunOptions): WorkflowRunRecord {
+export function createWorkflowRunRecord(options: CreateWorkflowRunOptions): WorkflowRunRecordV1 {
   const createdAt = options.createdAt ?? Date.now();
-  const budget: WorkflowBudget = {
-    maxAgents: options.budget?.maxAgents ?? MAX_WORKFLOW_AGENTS,
-    maxConcurrency: options.budget?.maxConcurrency ?? MAX_WORKFLOW_CONCURRENCY,
-    timeoutMs: options.budget?.timeoutMs ?? options.input.timeoutMs ?? MAX_WORKFLOW_TIMEOUT_MS,
-    maxOutputBytes: options.budget?.maxOutputBytes ?? MAX_OUTPUT_BYTES,
-  };
-  const record: WorkflowRunRecord = {
-    schemaVersion: WORKFLOW_RUN_SCHEMA_VERSION,
-    id: options.id,
-    input: structuredClone(options.input),
-    budget,
+  const record: WorkflowRunRecordV1 = {
+    schemaVersion: 1,
+    recordRevision: 0,
+    runId: options.runId,
+    rootRunId: options.rootRunId ?? options.runId,
+    ...(options.parentRunId ? { parentRunId: options.parentRunId } : {}),
+    ...(options.resumeFromRunId ? { resumeFromRunId: options.resumeFromRunId } : {}),
+    owner: structuredClone(options.owner),
+    source: structuredClone(options.source),
+    metadata: structuredClone(options.metadata),
+    args: cloneCanonicalJson(options.args),
+    argsSha256: options.argsSha256,
+    executionFingerprint: options.executionFingerprint,
+    activationIdentity: options.activationIdentity,
     status: "created",
     createdAt,
-    updatedAt: createdAt,
-    nextEventSequence: 1,
-    agents: [],
+    deadlineAt: options.deadlineAt,
+    cleanup: { status: "pending", deadlineAt: options.cleanupDeadlineAt },
+    attempts: [], leaves: [], failures: [], artifacts: [],
+    notification: { state: "pending", attempts: 0, updatedAt: createdAt },
     usage: emptyWorkflowUsage(),
-    failures: [],
-    references: [],
+    budget: { total: options.budgetTotal ?? null, spent: 0, reserved: 0, remaining: options.budgetTotal ?? null },
+    pinned: false,
+    journalSequence: 0,
   };
   assertWorkflowRunInvariants(record);
   return record;
 }
 
-/** Pure, exhaustive lifecycle reducer. Input records and events are never mutated. */
-export function reduceWorkflowEvent(record: WorkflowRunRecord, event: WorkflowEvent, options: ReduceWorkflowOptions = {}): WorkflowTransition {
+/** Pure canonical reducer. Persistence/UI/runtime are projections of its output. */
+export function reduceWorkflowEvent(record: WorkflowRunRecordV1, event: WorkflowRunEvent, options: ReduceWorkflowOptions = {}): WorkflowTransition {
   assertWorkflowRunInvariants(record);
   const now = options.now ?? Date.now();
-  finiteNonNegative(now, "now");
+  finite(now, "now");
   const previous = structuredClone(record);
   const next = structuredClone(record);
 
-  if (!isWorkflowTerminalStatus(next.status)) {
-    switch (event.type) {
-      case "RunStarted":
-        if (next.status === "created") {
-          next.status = "running";
-          next.startedAt = now;
+  switch (event.type) {
+    case "RunStarted":
+      if (next.status === "created") {
+        if (event.attempt.runId !== next.runId || event.attempt.status !== "running") throw invariant("invalid initial attempt");
+        if (next.attempts.some((item) => item.attemptId === event.attempt.attemptId)) throw invariant("duplicate attempt id");
+        next.attempts.push(structuredClone(event.attempt));
+        next.status = "running";
+        next.startedAt = event.attempt.startedAt;
+      }
+      break;
+    case "TerminalIntentAccepted":
+      if (!next.firstTerminalIntent && !isTerminalRunStatus(next.status)) {
+        next.firstTerminalIntent = structuredClone(event.intent);
+        next.status = event.intent.kind === "pause" ? "pausing" : event.intent.kind === "complete" ? "draining" : "stopping";
+      }
+      break;
+    case "RunStatusChanged":
+      applyRunStatus(next, event.status, now, event.error);
+      break;
+    case "LeafAccepted":
+      if (next.status !== "running") throw invariant("leaves may be accepted only while running");
+      if (next.leaves.length >= Math.min(next.metadata.maxAgents, MAX_WORKFLOW_AGENTS)) throw invariant("workflow agent cap exceeded");
+      if (next.leaves.some((leaf) => leaf.leafId === event.leaf.leafId || leaf.nodeId === event.leaf.nodeId || leaf.agentId === event.leaf.agentId)) {
+        throw invariant("duplicate leaf/node/agent id in workflow scope");
+      }
+      if (event.leaf.status !== "queued" || event.leaf.attempts.length !== 0) throw invariant("accepted leaf must be queued with no provider attempts");
+      next.leaves.push(structuredClone(event.leaf));
+      next.usage.leafAttempts += 1;
+      break;
+    case "LeafStatusChanged": {
+      const leaf = findLeaf(next, event.leafId);
+      if (!LEAF_TRANSITIONS[leaf.status].has(event.status)) {
+        if (leaf.status === event.status) break;
+        throw invariant(`invalid leaf transition ${leaf.status} -> ${event.status}`);
+      }
+      leaf.status = event.status;
+      if (event.status === "running") leaf.startedAt ??= event.at;
+      if (TERMINAL_LEAF_STATUSES.has(event.status)) leaf.finishedAt = event.at;
+      if (event.failure) {
+        leaf.failure = structuredClone(event.failure);
+        if (!next.failures.some((failure) => failure.nodeId === event.failure!.nodeId && failure.attemptId === event.failure!.attemptId)) {
+          next.failures.push(structuredClone(event.failure));
         }
-        break;
-      case "AgentQueued":
-        if (next.status === "running") queueAgent(next, event.agent);
-        break;
-      case "AgentStarted":
-        if (next.status === "running") startAgent(next, event.index, event.attempt, now);
-        break;
-      case "AgentRetrying":
-        if (next.status === "running") retryAgent(next, event.index, event.attempt, event.failure);
-        break;
-      case "AgentCompleted":
-        settleAgent(next, event.index, "completed", now, undefined, event.result);
-        break;
-      case "AgentFailed":
-        settleAgent(next, event.index, "failed", now, event.failure);
-        break;
-      case "AgentCancelled":
-        cancelAgent(next, event.index, now, event.reason);
-        break;
-      case "CompletionRequested":
-        requestTerminal(next, event.output
-          ? { kind: "success", requestedAt: now, output: event.output }
-          : { kind: "success", requestedAt: now });
-        break;
-      case "FailureRequested":
-        requestTerminal(next, { kind: "failure", requestedAt: now, reason: event.failure.message, failure: event.failure });
-        break;
-      case "CancellationRequested":
-        requestTerminal(next, { kind: "cancel", requestedAt: now, reason: event.reason });
-        break;
-      case "TimeoutElapsed":
-        requestTerminal(next, { kind: "timeout", requestedAt: now, reason: event.reason ?? "workflow timeout elapsed" });
-        break;
-      case "RunFinalized":
-        finalize(next, now);
-        break;
-      default:
-        assertNever(event);
+      }
+      if (event.result !== undefined) leaf.result = cloneCanonicalJson(event.result);
+      if (event.status === "cached") next.usage.cacheHits += 1;
+      break;
     }
+    case "ProviderAttemptSettled": {
+      const leaf = findLeaf(next, event.leafId);
+      const existing = next.leaves.flatMap((item) => item.attempts).find((attempt) => attempt.attemptId === event.attempt.attemptId);
+      if (existing) {
+        if (!isDeepStrictEqual(existing, event.attempt)) throw invariant("provider attempt accounted more than once");
+        break;
+      }
+      if (event.attempt.leafId !== leaf.leafId || event.attempt.status === "running") throw invariant("provider attempt settlement is invalid");
+      leaf.attempts.push(structuredClone(event.attempt));
+      next.usage.providerAttempts += 1;
+      if (event.attempt.usage) next.usage = addUsage(next.usage, event.attempt.usage);
+      break;
+    }
+    case "ArtifactRecorded":
+      if (next.artifacts.some((item) => item.artifactId === event.artifact.artifactId)) throw invariant("duplicate artifact id");
+      next.artifacts.push(structuredClone(event.artifact));
+      break;
+    case "OutputRecorded":
+      if (next.output && !isDeepStrictEqual(next.output, event.output)) throw invariant("workflow output is immutable once recorded");
+      next.output = structuredClone(event.output);
+      break;
+    case "CleanupChanged":
+      next.cleanup = structuredClone(event.cleanup);
+      if ((event.cleanup.status === "failed" || event.cleanup.status === "recovery_required") && isTerminalRunStatus(next.status)) {
+        next.status = event.cleanup.status === "failed" ? "failed" : "recovery_required";
+        next.error = event.cleanup.error;
+      }
+      break;
+    case "NotificationChanged":
+      next.notification = structuredClone(event.notification);
+      break;
+    case "BudgetChanged":
+      next.budget = structuredClone(event.budget);
+      break;
+    case "RetentionChanged":
+      next.pinned = event.pinned;
+      if (event.expiresAt === undefined) delete next.expiresAt;
+      else next.expiresAt = event.expiresAt;
+      break;
+    default:
+      assertNever(event);
   }
 
   const changed = !isDeepStrictEqual(previous, next);
-  if (changed) {
-    next.updatedAt = Math.max(previous.updatedAt, now);
-    next.nextEventSequence = previous.nextEventSequence + 1;
-  }
+  if (changed) next.recordRevision = previous.recordRevision + 1;
   assertWorkflowRunInvariants(next);
-  if (previous.terminalIntent && next.terminalIntent && !isDeepStrictEqual(previous.terminalIntent, next.terminalIntent)) {
-    throw new WorkflowInvariantError("first terminal intent must win");
-  }
+  if (previous.firstTerminalIntent && !isDeepStrictEqual(previous.firstTerminalIntent, next.firstTerminalIntent)) throw invariant("first terminal intent must win");
   return { previous, next, event: structuredClone(event), changed };
 }
+export const WorkflowRunReducer = reduceWorkflowEvent;
 
-export function isWorkflowTerminalStatus(status: WorkflowStatus): status is WorkflowTerminalStatus {
-  return TERMINAL_STATUSES.has(status as WorkflowTerminalStatus);
-}
-
-export function assertWorkflowRunInvariants(value: unknown): asserts value is WorkflowRunRecord {
-  if (!plainRecord(value)) throw invariant("run record must be a plain object");
-  if (value.schemaVersion !== WORKFLOW_RUN_SCHEMA_VERSION) throw invariant("unsupported run schemaVersion");
-  nonEmptyString(value.id, "id");
-  if (!STATUSES.has(value.status as WorkflowStatus)) throw invariant(`invalid status ${String(value.status)}`);
-  finiteNonNegative(value.createdAt, "createdAt");
-  finiteNonNegative(value.updatedAt, "updatedAt");
-  if (value.updatedAt < value.createdAt) throw invariant("updatedAt cannot precede createdAt");
-  positiveInteger(value.nextEventSequence, "nextEventSequence");
-  assertInput(value.input);
-  assertBudget(value.budget);
-  assertUsage(value.usage);
-  if (!Array.isArray(value.agents)) throw invariant("agents must be an array");
-  if (!Array.isArray(value.failures)) throw invariant("failures must be an array");
-  if (!Array.isArray(value.references)) throw invariant("references must be an array");
-  for (const [index, failure] of value.failures.entries()) assertFailure(failure, `failures[${index}]`);
-  for (const [index, reference] of value.references.entries()) assertReference(reference, `references[${index}]`);
-  if (value.metadata !== undefined) assertJsonAt(value.metadata, "metadata");
-  if (value.agents.length > (value.budget as WorkflowBudget).maxAgents) throw invariant("agent budget exceeded");
-
-  const indices = new Set<number>();
-  let active = 0;
-  let unsettled = 0;
-  for (const [position, rawAgent] of value.agents.entries()) {
-    assertAgent(rawAgent, position);
-    const agent = rawAgent as WorkflowAgentRecord;
-    if (indices.has(agent.index)) throw invariant(`duplicate agent index ${agent.index}`);
-    indices.add(agent.index);
-    if (CONCURRENT_AGENT_STATUSES.has(agent.status)) active += 1;
-    if (UNSETTLED_AGENT_STATUSES.has(agent.status)) unsettled += 1;
+function applyRunStatus(record: WorkflowRunRecordV1, status: WorkflowRunStatus, now: number, error?: WorkflowRunRecordV1["error"]): void {
+  if (record.status === status) return;
+  if (isTerminalRunStatus(record.status)) {
+    const cleanupUpgrade = (status === "failed" || status === "recovery_required") && (record.cleanup.status === "failed" || record.cleanup.status === "recovery_required");
+    if (!cleanupUpgrade) return;
   }
-  if (active > (value.budget as WorkflowBudget).maxConcurrency) throw invariant("agent concurrency budget exceeded");
-
-  const status = value.status as WorkflowStatus;
-  if (status === "created") {
-    if (value.startedAt !== undefined || value.finishedAt !== undefined || value.terminalIntent !== undefined || value.result !== undefined) {
-      throw invariant("created run contains lifecycle fields");
+  const allowed: Record<WorkflowRunStatus, readonly WorkflowRunStatus[]> = {
+    created: ["running", "failed", "cancelled", "interrupted", "recovery_required"],
+    running: ["pausing", "stopping", "draining", "completed", "failed", "cancelled", "interrupted", "recovery_required"],
+    pausing: ["paused", "failed", "interrupted", "recovery_required"],
+    paused: ["stopping", "cancelled", "interrupted", "recovery_required"],
+    stopping: ["draining", "failed", "cancelled", "interrupted", "recovery_required"],
+    draining: ["completed", "failed", "cancelled", "interrupted", "recovery_required"],
+    completed: ["failed", "recovery_required"], cancelled: ["failed", "recovery_required"], interrupted: ["failed", "recovery_required"],
+    failed: ["recovery_required"], recovery_required: [],
+  };
+  if (!allowed[record.status].includes(status)) throw invariant(`invalid run transition ${record.status} -> ${status}`);
+  if (isTerminalRunStatus(status)) {
+    const unsettled = record.leaves.filter((leaf) => !TERMINAL_LEAF_STATUSES.has(leaf.status));
+    if (unsettled.length > 0) throw invariant("terminal run requires every accepted leaf to be terminal/interrupted");
+    record.finishedAt = now;
+    const attempt = record.attempts.at(-1);
+    if (attempt && attempt.status === "running") {
+      attempt.status = status === "completed" ? "completed" : status === "cancelled" ? "cancelled" : status === "interrupted" ? "interrupted" : "failed";
+      attempt.finishedAt = now;
+      if (error) attempt.error = structuredClone(error);
     }
-  } else if (status === "running") {
-    finiteNonNegative(value.startedAt, "startedAt");
-    if (value.finishedAt !== undefined || value.terminalIntent !== undefined || value.result !== undefined) throw invariant("running run contains terminal fields");
-  } else if (status === "stopping") {
-    if (!plainRecord(value.terminalIntent)) throw invariant("stopping run requires terminalIntent");
-    assertTerminalIntent(value.terminalIntent);
-    if (value.finishedAt !== undefined || value.result !== undefined) throw invariant("stopping run is already finalized");
-  } else {
-    if (!plainRecord(value.terminalIntent)) throw invariant("terminal run requires terminalIntent");
-    assertTerminalIntent(value.terminalIntent);
-    finiteNonNegative(value.finishedAt, "finishedAt");
-    if (unsettled !== 0) throw invariant("terminal run cannot contain unsettled agents");
-    if (!plainRecord(value.result) || value.result.status !== status || value.result.runId !== value.id) throw invariant("terminal result does not match run");
-    if (value.result.finishedAt !== value.finishedAt || value.result.agents !== value.agents.length) throw invariant("terminal result summary does not match run");
-    if ((status === "completed") !== (value.terminalIntent.kind === "success")) throw invariant("terminal status contradicts first terminal intent");
-    if ((status === "cancelled") !== (value.terminalIntent.kind === "cancel")) throw invariant("terminal status contradicts first terminal intent");
   }
-}
-
-function queueAgent(record: WorkflowRunRecord, input: WorkflowAgentRecord): void {
-  if (record.agents.length >= record.budget.maxAgents) throw invariant("agent budget exceeded");
-  if (record.agents.some((agent) => agent.index === input.index)) throw invariant(`duplicate agent index ${input.index}`);
-  const agent = structuredClone(input);
-  assertAgent(agent, record.agents.length);
-  if (agent.status !== "queued") throw invariant("new agent must be queued");
-  record.agents.push(agent);
-}
-
-function startAgent(record: WorkflowRunRecord, index: number, attempt: number, now: number): void {
-  const agent = findAgent(record, index);
-  if (agent.status !== "queued" && agent.status !== "retrying") return;
-  if (!Number.isSafeInteger(attempt) || attempt < 1 || attempt > agent.maxRetries + 1) throw invariant("invalid agent attempt");
-  const running = record.agents.filter((item) => item.index !== index && CONCURRENT_AGENT_STATUSES.has(item.status)).length;
-  if (running >= record.budget.maxConcurrency) throw invariant("agent concurrency budget exceeded");
-  agent.status = "running";
-  agent.attempt = attempt;
-  agent.startedAt ??= now;
-}
-
-function retryAgent(record: WorkflowRunRecord, index: number, attempt: number, failure: WorkflowFailure): void {
-  const agent = findAgent(record, index);
-  if (agent.status !== "running") return;
-  if (!Number.isSafeInteger(attempt) || attempt <= agent.attempt || attempt > agent.maxRetries + 1) throw invariant("invalid retry attempt");
-  agent.status = "retrying";
-  agent.attempt = attempt;
-  agent.failure = structuredClone(failure);
-}
-
-function settleAgent(
-  record: WorkflowRunRecord,
-  index: number,
-  status: "completed" | "failed",
-  now: number,
-  failure?: WorkflowFailure,
-  result?: WorkflowAgentRecord["result"],
-): void {
-  const agent = findAgent(record, index);
-  if (!UNSETTLED_AGENT_STATUSES.has(agent.status)) return;
-  agent.status = status;
-  agent.finishedAt = now;
-  if (failure) {
-    agent.failure = structuredClone(failure);
-    record.failures.push(structuredClone(failure));
-  }
-  if (result) {
-    if (result.index !== index) throw invariant("agent result index mismatch");
-    agent.result = structuredClone(result);
-    record.usage = addUsage(record.usage, result.usage);
-    if (result.failure) record.failures.push(structuredClone(result.failure));
-  }
-}
-
-function cancelAgent(record: WorkflowRunRecord, index: number, now: number, reason: string): void {
-  const agent = findAgent(record, index);
-  if (!UNSETTLED_AGENT_STATUSES.has(agent.status)) return;
-  agent.status = "cancelled";
-  agent.finishedAt = now;
-  agent.failure = { kind: "cancelled", message: reason, agentIndex: index, ...(agent.label ? { label: agent.label } : {}) };
-}
-
-function requestTerminal(record: WorkflowRunRecord, intent: WorkflowTerminalIntent): void {
-  if (record.terminalIntent) return;
-  record.terminalIntent = structuredClone(intent);
-  record.status = "stopping";
-  if (intent.failure) record.failures.push(structuredClone(intent.failure));
-  if (intent.output) record.references.push(structuredClone(intent.output));
-}
-
-function finalize(record: WorkflowRunRecord, now: number): void {
-  if (record.status !== "stopping" || !record.terminalIntent) return;
-  if (record.agents.some((agent) => UNSETTLED_AGENT_STATUSES.has(agent.status))) return;
-  const intent = record.terminalIntent;
-  const status: WorkflowTerminalStatus = intent.kind === "success" ? "completed" : intent.kind === "cancel" ? "cancelled" : "failed";
   record.status = status;
-  record.finishedAt = now;
-  record.result = {
-    runId: record.id,
-    status,
-    ...(intent.output ? { output: intent.output } : {}),
-    usage: structuredClone(record.usage),
-    agents: record.agents.length,
-    failures: structuredClone(record.failures),
-    references: structuredClone(record.references),
-    ...(record.startedAt !== undefined ? { startedAt: record.startedAt } : {}),
-    finishedAt: now,
-  };
+  if (error) record.error = structuredClone(error);
 }
 
-function assertAgent(value: unknown, position: number): asserts value is WorkflowAgentRecord {
-  if (!plainRecord(value)) throw invariant(`agents[${position}] must be an object`);
-  nonNegativeInteger(value.index, `agents[${position}].index`);
-  if (!AGENT_STATUSES.has(value.status as WorkflowAgentRecord["status"])) throw invariant(`invalid agent status at ${position}`);
-  nonNegativeInteger(value.attempt, `agents[${position}].attempt`);
-  nonNegativeInteger(value.maxRetries, `agents[${position}].maxRetries`);
-  if (value.attempt > value.maxRetries + 1) throw invariant(`agent ${position} exceeded retry limit`);
-  finiteNonNegative(value.queuedAt, `agents[${position}].queuedAt`);
-  if (value.startedAt !== undefined) finiteNonNegative(value.startedAt, `agents[${position}].startedAt`);
-  if (value.finishedAt !== undefined) finiteNonNegative(value.finishedAt, `agents[${position}].finishedAt`);
-  if ((value.status === "running" || value.status === "retrying") && (value.startedAt === undefined || value.attempt < 1)) {
-    throw invariant(`active agent ${position} has no valid start`);
+export function assertWorkflowRunInvariants(value: unknown): asserts value is WorkflowRunRecordV1 {
+  if (!plain(value)) throw invariant("run aggregate must be a plain object");
+  if (value.schemaVersion !== 1) throw invariant("unsupported run schema");
+  integer(value.recordRevision, "recordRevision", 0);
+  uuid(value.runId, "runId"); uuid(value.rootRunId, "rootRunId");
+  if (value.parentRunId !== undefined) uuid(value.parentRunId, "parentRunId");
+  if (value.resumeFromRunId !== undefined) uuid(value.resumeFromRunId, "resumeFromRunId");
+  assertOwner(value.owner); assertSource(value.source); assertMetadata(value.metadata);
+  cloneCanonicalJson(value.args);
+  hash(value.argsSha256, "argsSha256"); hash(value.executionFingerprint, "executionFingerprint"); hash(value.activationIdentity, "activationIdentity");
+  if (!RUN_STATUSES.has(value.status as WorkflowRunStatus)) throw invariant("invalid run status");
+  finite(value.createdAt, "createdAt"); finite(value.deadlineAt, "deadlineAt");
+  if (value.startedAt !== undefined) finite(value.startedAt, "startedAt");
+  if (value.finishedAt !== undefined) finite(value.finishedAt, "finishedAt");
+  if (!Array.isArray(value.attempts) || !Array.isArray(value.leaves) || !Array.isArray(value.failures) || !Array.isArray(value.artifacts)) throw invariant("aggregate collections are invalid");
+  assertCleanup(value.cleanup); assertNotification(value.notification); assertBudget(value.budget);
+  if (!plain(value.usage)) throw invariant("usage is invalid");
+  for (const key of ["input", "output", "cacheRead", "cacheWrite", "contextTokens", "turns", "providerAttempts", "providerRetries", "structuredSubmissions", "leafAttempts", "cacheHits"]) finite(value.usage[key], `usage.${key}`);
+  if (value.usage.cost !== null) finite(value.usage.cost, "usage.cost");
+  if (!new Set(["reported", "estimated", "unavailable"]).has(value.usage.costState)) throw invariant("usage cost state invalid");
+  const leafIds = new Set<string>(); const nodeIds = new Set<string>(); const agentIds = new Set<string>(); const providerIds = new Set<string>();
+  for (const leaf of value.leaves as WorkflowLeafRecordV1[]) {
+    if (!plain(leaf) || !LEAF_STATUSES.has(leaf.status)) throw invariant("invalid leaf");
+    nonempty(leaf.leafId, "leafId"); nonempty(leaf.nodeId, "nodeId"); nonempty(leaf.agentId, "agentId");
+    if (leafIds.has(leaf.leafId) || nodeIds.has(leaf.nodeId) || agentIds.has(leaf.agentId)) throw invariant("duplicate leaf identity");
+    leafIds.add(leaf.leafId); nodeIds.add(leaf.nodeId); agentIds.add(leaf.agentId);
+    finite(leaf.acceptedAt, "leaf.acceptedAt"); finite(leaf.deadlineAt, "leaf.deadlineAt");
+    if (!Array.isArray(leaf.attempts) || !Array.isArray(leaf.artifactIds)) throw invariant("leaf collections invalid");
+    for (const attempt of leaf.attempts) {
+      nonempty(attempt.attemptId, "provider attempt id");
+      if (providerIds.has(attempt.attemptId)) throw invariant("duplicate provider attempt id");
+      providerIds.add(attempt.attemptId);
+    }
+    if (TERMINAL_LEAF_STATUSES.has(leaf.status) && leaf.finishedAt === undefined) throw invariant("terminal leaf missing finishedAt");
   }
-  if ((value.status === "completed" || value.status === "failed" || value.status === "cancelled") && value.finishedAt === undefined) {
-    throw invariant(`settled agent ${position} has no finishedAt`);
-  }
-  if (value.finishedAt !== undefined && value.startedAt !== undefined && value.finishedAt < value.startedAt) throw invariant(`agent ${position} finished before start`);
-  if (value.status === "completed" && !plainRecord(value.result)) throw invariant(`completed agent ${position} requires a result`);
-  if (value.status === "failed" && !plainRecord(value.failure)) throw invariant(`failed agent ${position} requires a failure`);
-  if (value.failure !== undefined) assertFailure(value.failure, `agents[${position}].failure`);
+  if (value.leaves.length > Math.min(value.metadata.maxAgents, MAX_WORKFLOW_AGENTS)) throw invariant("agent cap exceeded");
+  if (isTerminalRunStatus(value.status)) {
+    if (value.finishedAt === undefined) throw invariant("terminal run missing finishedAt");
+    if (value.leaves.some((leaf: WorkflowLeafRecordV1) => !TERMINAL_LEAF_STATUSES.has(leaf.status))) throw invariant("terminal run has unsettled leaves");
+  } else if (value.finishedAt !== undefined) throw invariant("nonterminal run has finishedAt");
+  if (value.status === "created" && (value.startedAt !== undefined || value.attempts.length > 0)) throw invariant("created run has attempts");
+  if (typeof value.pinned !== "boolean") throw invariant("pinned must be boolean");
+  integer(value.journalSequence, "journalSequence", 0);
 }
 
-function assertTerminalIntent(value: Record<string, unknown>): void {
-  if (!new Set(["success", "failure", "cancel", "timeout"]).has(value.kind as string)) throw invariant("invalid terminal intent");
-  finiteNonNegative(value.requestedAt, "terminalIntent.requestedAt");
-  if (value.reason !== undefined && typeof value.reason !== "string") throw invariant("terminalIntent.reason must be a string");
-  if (value.failure !== undefined) assertFailure(value.failure, "terminalIntent.failure");
-  if (value.output !== undefined) assertReference(value.output, "terminalIntent.output");
-  if (value.kind === "failure" && value.failure === undefined) throw invariant("failure terminal intent requires a failure");
+export function isWorkflowTerminalStatus(status: WorkflowRunStatus): status is WorkflowRunRecordV1["status"] {
+  return TERMINAL_RUN_STATUSES.has(status);
 }
+export const isTerminalRunStatus = isWorkflowTerminalStatus;
 
-function assertInput(value: unknown): void {
-  if (!plainRecord(value) || !plainRecord(value.source)) throw invariant("input.source must be an object");
-  const source = value.source;
-  if (source.kind === "inline") nonEmptyString(source.script, "input.source.script");
-  else if (source.kind === "path") nonEmptyString(source.path, "input.source.path");
-  else if (source.kind === "saved") nonEmptyString(source.name, "input.source.name");
-  else throw invariant("invalid workflow source kind");
-  if (value.args !== undefined) assertJsonAt(value.args, "input.args");
-  if (value.timeoutMs !== undefined) positiveInteger(value.timeoutMs, "input.timeoutMs");
-  if (value.background !== undefined && typeof value.background !== "boolean") throw invariant("input.background must be boolean");
+function findLeaf(record: WorkflowRunRecordV1, id: string): WorkflowLeafRecordV1 {
+  const leaf = record.leaves.find((item) => item.leafId === id);
+  if (!leaf) throw invariant(`unknown leaf ${id}`);
+  return leaf;
 }
-
-function assertBudget(value: unknown): asserts value is WorkflowBudget {
-  if (!plainRecord(value)) throw invariant("budget must be an object");
-  positiveInteger(value.maxAgents, "budget.maxAgents");
-  positiveInteger(value.maxConcurrency, "budget.maxConcurrency");
-  positiveInteger(value.timeoutMs, "budget.timeoutMs");
-  positiveInteger(value.maxOutputBytes, "budget.maxOutputBytes");
-  if (value.maxAgents > MAX_WORKFLOW_AGENTS) throw invariant("maxAgents exceeds fixed limit");
-  if (value.maxConcurrency > MAX_WORKFLOW_CONCURRENCY || value.maxConcurrency > value.maxAgents) throw invariant("maxConcurrency exceeds fixed limit");
-  if (value.timeoutMs > MAX_WORKFLOW_TIMEOUT_MS) throw invariant("timeoutMs exceeds fixed limit");
-  if (value.maxOutputBytes > MAX_OUTPUT_BYTES) throw invariant("maxOutputBytes exceeds fixed limit");
+function assertOwner(value: unknown): asserts value is WorkflowOwnerV1 {
+  if (!plain(value)) throw invariant("owner invalid");
+  nonempty(value.sessionId, "owner.sessionId"); nonempty(value.instanceId, "owner.instanceId"); integer(value.parentPid, "owner.parentPid", 1);
 }
-
-function assertFailure(value: unknown, path: string): asserts value is WorkflowFailure {
-  if (!plainRecord(value)) throw invariant(`${path} must be an object`);
-  if (!new Set(["validation", "agent", "timeout", "cancelled", "runtime", "persistence"]).has(value.kind as string)) throw invariant(`${path}.kind is invalid`);
-  nonEmptyString(value.message, `${path}.message`);
-  if (value.code !== undefined && typeof value.code !== "string") throw invariant(`${path}.code must be a string`);
-  if (value.agentIndex !== undefined) nonNegativeInteger(value.agentIndex, `${path}.agentIndex`);
-  if (value.label !== undefined && typeof value.label !== "string") throw invariant(`${path}.label must be a string`);
-  if (value.retryable !== undefined && typeof value.retryable !== "boolean") throw invariant(`${path}.retryable must be boolean`);
-  if (value.details !== undefined) assertJsonAt(value.details, `${path}.details`);
+function assertSource(value: unknown): asserts value is WorkflowSourceProvenanceV1 {
+  if (!plain(value) || !new Set(["inline", "path", "name"]).has(value.kind as string)) throw invariant("source invalid");
+  nonempty(value.copiedPath, "source.copiedPath"); nonempty(value.sourceDirectory, "source.sourceDirectory"); hash(value.sha256, "source.sha256"); nonempty(value.resolverIdentity, "source.resolverIdentity");
 }
-
-function assertReference(value: unknown, path: string): void {
-  if (!plainRecord(value)) throw invariant(`${path} must be an object`);
-  if (value.kind === "script") {
-    nonEmptyString(value.path, `${path}.path`);
-    nonEmptyString(value.sha256, `${path}.sha256`);
-  } else if (value.kind === "output") {
-    nonEmptyString(value.path, `${path}.path`);
-    if (value.encoding !== "tagged-json-v1") throw invariant(`${path}.encoding is invalid`);
-    nonNegativeInteger(value.bytes, `${path}.bytes`);
-    if (typeof value.truncated !== "boolean") throw invariant(`${path}.truncated must be boolean`);
-  } else if (value.kind === "agent") {
-    nonNegativeInteger(value.index, `${path}.index`);
-    if (value.transcriptPath !== undefined && typeof value.transcriptPath !== "string") throw invariant(`${path}.transcriptPath must be a string`);
-  } else throw invariant(`${path}.kind is invalid`);
+function assertMetadata(value: unknown): asserts value is WorkflowMeta {
+  if (!plain(value)) throw invariant("metadata invalid");
+  nonempty(value.name, "metadata.name"); nonempty(value.description, "metadata.description");
+  if (typeof value.resumable !== "boolean") throw invariant("metadata.resumable invalid");
+  integer(value.maxAgents, "metadata.maxAgents", 1);
+  if (!Array.isArray(value.capabilities)) throw invariant("metadata.capabilities invalid");
 }
-
-function assertJsonAt(value: unknown, path: string): void {
-  try { assertCanonicalJson(value); }
-  catch (error) { throw invariant(`${path} must be canonical JSON: ${(error as Error).message}`); }
+function assertCleanup(value: unknown): asserts value is WorkflowCleanupOutcomeV1 {
+  if (!plain(value) || !new Set(["pending", "running", "completed", "failed", "recovery_required"]).has(value.status as string)) throw invariant("cleanup invalid");
+  finite(value.deadlineAt, "cleanup.deadlineAt");
 }
-
-function assertUsage(value: unknown): asserts value is WorkflowUsage {
-  if (!plainRecord(value)) throw invariant("usage must be an object");
-  for (const key of ["input", "output", "cacheRead", "cacheWrite", "cost", "contextTokens", "turns"] as const) finiteNonNegative(value[key], `usage.${key}`);
+function assertNotification(value: unknown): void {
+  if (!plain(value) || !new Set(["pending", "delivered", "failed"]).has(value.state as string)) throw invariant("notification invalid");
+  integer(value.attempts, "notification.attempts", 0); finite(value.updatedAt, "notification.updatedAt");
 }
-
-function addUsage(a: WorkflowUsage, b: WorkflowUsage): WorkflowUsage {
+function assertBudget(value: unknown): asserts value is WorkflowBudgetSnapshot {
+  if (!plain(value)) throw invariant("budget invalid");
+  if (value.total !== null) integer(value.total, "budget.total", 1);
+  finite(value.spent, "budget.spent"); finite(value.reserved, "budget.reserved");
+  if (value.remaining !== null) finite(value.remaining, "budget.remaining");
+}
+function addUsage(a: WorkflowRunRecordV1["usage"], b: WorkflowRunRecordV1["usage"]): WorkflowRunRecordV1["usage"] {
   return {
-    input: a.input + b.input,
-    output: a.output + b.output,
-    cacheRead: a.cacheRead + b.cacheRead,
-    cacheWrite: a.cacheWrite + b.cacheWrite,
-    cost: a.cost + b.cost,
-    contextTokens: Math.max(a.contextTokens, b.contextTokens),
-    turns: a.turns + b.turns,
+    input: a.input + b.input, output: a.output + b.output, cacheRead: a.cacheRead + b.cacheRead, cacheWrite: a.cacheWrite + b.cacheWrite,
+    cost: a.cost === null && b.cost === null ? null : (a.cost ?? 0) + (b.cost ?? 0),
+    costState: a.costState === "reported" || b.costState === "reported" ? "reported" : a.costState === "estimated" || b.costState === "estimated" ? "estimated" : "unavailable",
+    contextTokens: Math.max(a.contextTokens, b.contextTokens), turns: a.turns + b.turns,
+    // Provider-attempt, leaf-attempt, and cache-hit counters are committed by
+    // their owning reducer events, never trusted from aggregate usage payloads.
+    providerAttempts: a.providerAttempts, providerRetries: a.providerRetries + b.providerRetries,
+    structuredSubmissions: a.structuredSubmissions + b.structuredSubmissions, leafAttempts: a.leafAttempts, cacheHits: a.cacheHits,
   };
 }
-
-function findAgent(record: WorkflowRunRecord, index: number): WorkflowAgentRecord {
-  const agent = record.agents.find((item) => item.index === index);
-  if (!agent) throw invariant(`unknown agent ${index}`);
-  return agent;
-}
-
-function plainRecord(value: unknown): value is Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
-function finiteNonNegative(value: unknown, path: string): asserts value is number {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) throw invariant(`${path} must be a non-negative finite number`);
-}
-function nonNegativeInteger(value: unknown, path: string): asserts value is number {
-  finiteNonNegative(value, path);
-  if (!Number.isSafeInteger(value)) throw invariant(`${path} must be a safe integer`);
-}
-function positiveInteger(value: unknown, path: string): asserts value is number {
-  nonNegativeInteger(value, path);
-  if (value <= 0) throw invariant(`${path} must be positive`);
-}
-function nonEmptyString(value: unknown, path: string): asserts value is string {
-  if (typeof value !== "string" || value.length === 0) throw invariant(`${path} must be a non-empty string`);
-}
+function plain(value: unknown): value is Record<string, any> { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }
+function nonempty(value: unknown, path: string): asserts value is string { if (typeof value !== "string" || !value) throw invariant(`${path} must be non-empty`); }
+function hash(value: unknown, path: string): void { if (typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value)) throw invariant(`${path} must be sha256`); }
+function uuid(value: unknown, path: string): void { if (typeof value !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) throw invariant(`${path} must be a UUID`); }
+function finite(value: unknown, path: string): asserts value is number { if (typeof value !== "number" || !Number.isFinite(value) || value < 0) throw invariant(`${path} must be a non-negative finite number`); }
+function integer(value: unknown, path: string, min: number): asserts value is number { finite(value, path); if (!Number.isSafeInteger(value) || value < min) throw invariant(`${path} must be an integer >= ${min}`); }
 function invariant(message: string): WorkflowInvariantError { return new WorkflowInvariantError(message); }
 function assertNever(value: never): never { throw invariant(`unhandled event ${JSON.stringify(value)}`); }

@@ -1,70 +1,84 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { WorkflowAgentRecord, WorkflowFailure } from "../core/contracts.js";
-import { emptyWorkflowUsage } from "../core/contracts.js";
+import type { WorkflowLeafRecordV1, WorkflowTerminalIntentV1 } from "../core/contracts.js";
 import { assertWorkflowRunInvariants, createWorkflowRunRecord, reduceWorkflowEvent, WorkflowInvariantError } from "../core/reducer.js";
 
-const failure: WorkflowFailure = { kind: "runtime", message: "boom" };
-const queued = (index: number): WorkflowAgentRecord => ({
-  index, label: `agent-${index}`, status: "queued", attempt: 0, maxRetries: 2, queuedAt: 2,
-});
-
-function startedRecord() {
-  const created = createWorkflowRunRecord({ id: "run-1", input: { source: { kind: "inline", script: "return 1" } }, createdAt: 1 });
-  return reduceWorkflowEvent(created, { type: "RunStarted" }, { now: 2 }).next;
+const runId = "11111111-1111-4111-8111-111111111111";
+const hash = "a".repeat(64);
+function created() {
+  return createWorkflowRunRecord({
+    runId,
+    owner: { sessionId: "s", instanceId: "i", parentPid: 1 },
+    source: { kind: "inline", copiedPath: `/runs/${runId}/script.js`, sourceDirectory: "/tmp", sha256: hash, resolverIdentity: `inline:${hash}` },
+    metadata: { name: "test", description: "test", resumable: false, maxAgents: 4, capabilities: ["read"] },
+    args: { value: 1 }, argsSha256: hash, executionFingerprint: hash, activationIdentity: hash,
+    deadlineAt: 1000, cleanupDeadlineAt: 1100, createdAt: 1,
+  });
+}
+function running() {
+  return reduceWorkflowEvent(created(), {
+    type: "RunStarted",
+    attempt: { attemptId: "attempt-1", runId, startedAt: 2, status: "running" },
+  }, { now: 2 }).next;
+}
+function leaf(): WorkflowLeafRecordV1 {
+  return {
+    leafId: "leaf-1", nodeId: "root/agent:scan", agentId: "scan", status: "queued", acceptedAt: 3, deadlineAt: 100,
+    effects: "none", cachePolicy: "off", executionFingerprint: hash, attempts: [], artifactIds: [],
+  };
 }
 
-test("reducer is pure and follows the explicit lifecycle", () => {
-  const running = startedRecord();
-  const before = structuredClone(running);
-  const queuedTransition = reduceWorkflowEvent(running, { type: "AgentQueued", agent: queued(0) }, { now: 3 });
-  assert.deepEqual(running, before);
-  assert.equal(queuedTransition.next.agents[0]?.status, "queued");
-  assert.equal(queuedTransition.next.nextEventSequence, running.nextEventSequence + 1);
-
-  const active = reduceWorkflowEvent(queuedTransition.next, { type: "AgentStarted", index: 0, attempt: 1 }, { now: 4 }).next;
-  assert.equal(active.agents[0]?.startedAt, 4);
-  const done = reduceWorkflowEvent(active, {
-    type: "AgentCompleted",
-    index: 0,
-    result: { index: 0, output: { ok: true }, usage: { ...emptyWorkflowUsage(), input: 2, contextTokens: 7 } },
-  }, { now: 5 }).next;
-  assert.equal(done.usage.input, 2);
-
-  const stopping = reduceWorkflowEvent(done, { type: "CompletionRequested" }, { now: 6 }).next;
-  assert.equal(stopping.status, "stopping");
-  const terminal = reduceWorkflowEvent(stopping, { type: "RunFinalized" }, { now: 7 }).next;
+test("run and leaf transitions are pure, revisioned, and terminalize every accepted leaf", () => {
+  const base = running();
+  const accepted = reduceWorkflowEvent(base, { type: "LeafAccepted", leaf: leaf() }, { now: 3 });
+  assert.equal(base.leaves.length, 0);
+  assert.equal(accepted.next.recordRevision, base.recordRevision + 1);
+  const active = reduceWorkflowEvent(accepted.next, { type: "LeafStatusChanged", leafId: "leaf-1", status: "running", at: 4 }, { now: 4 }).next;
+  const done = reduceWorkflowEvent(active, { type: "LeafStatusChanged", leafId: "leaf-1", status: "completed", at: 5, result: { answer: 42 } }, { now: 5 }).next;
+  const intent: WorkflowTerminalIntentV1 = { kind: "complete", requestedAt: 6 };
+  const draining = reduceWorkflowEvent(done, { type: "TerminalIntentAccepted", intent }, { now: 6 }).next;
+  const terminal = reduceWorkflowEvent(draining, { type: "RunStatusChanged", status: "completed" }, { now: 7 }).next;
   assert.equal(terminal.status, "completed");
-  assert.equal(terminal.result?.finishedAt, 7);
+  assert.equal(terminal.finishedAt, 7);
   assert.doesNotThrow(() => assertWorkflowRunInvariants(terminal));
 });
 
-test("first terminal intent wins all stop/timeout/completion races", () => {
-  const running = startedRecord();
-  const stopped = reduceWorkflowEvent(running, { type: "CancellationRequested", reason: "user" }, { now: 10 }).next;
-  const timedOut = reduceWorkflowEvent(stopped, { type: "TimeoutElapsed", reason: "late" }, { now: 11 }).next;
-  const completed = reduceWorkflowEvent(timedOut, { type: "CompletionRequested" }, { now: 12 }).next;
-  assert.equal(completed.terminalIntent?.kind, "cancel");
-  assert.equal(completed.terminalIntent?.reason, "user");
-  assert.equal(reduceWorkflowEvent(completed, { type: "RunFinalized" }, { now: 13 }).next.status, "cancelled");
-
-  const timeoutFirst = reduceWorkflowEvent(running, { type: "TimeoutElapsed" }, { now: 20 }).next;
-  const ignoredStop = reduceWorkflowEvent(timeoutFirst, { type: "CancellationRequested", reason: "late" }, { now: 21 }).next;
-  assert.equal(reduceWorkflowEvent(ignoredStop, { type: "RunFinalized" }, { now: 22 }).next.status, "failed");
+test("first terminal intent wins and terminal status is sticky", () => {
+  const base = running();
+  const cancel = reduceWorkflowEvent(base, { type: "TerminalIntentAccepted", intent: { kind: "cancel", requestedAt: 3, reason: "user" } }, { now: 3 }).next;
+  const late = reduceWorkflowEvent(cancel, { type: "TerminalIntentAccepted", intent: { kind: "fail", requestedAt: 4 } }, { now: 4 }).next;
+  assert.deepEqual(late.firstTerminalIntent, cancel.firstTerminalIntent);
+  const terminal = reduceWorkflowEvent(late, { type: "RunStatusChanged", status: "cancelled" }, { now: 5 }).next;
+  assert.equal(reduceWorkflowEvent(terminal, { type: "RunStatusChanged", status: "completed" }, { now: 6 }).next.status, "cancelled");
 });
 
-test("terminal state is sticky and malformed records/budget breaches fail centrally", () => {
-  const failed = reduceWorkflowEvent(startedRecord(), { type: "FailureRequested", failure }, { now: 3 }).next;
-  const terminal = reduceWorkflowEvent(failed, { type: "RunFinalized" }, { now: 4 }).next;
-  const late = reduceWorkflowEvent(terminal, { type: "RunStarted" }, { now: 5 });
-  assert.equal(late.changed, false);
-  assert.deepEqual(late.next.result, terminal.result);
+test("cleanup can upgrade terminal outcome without erasing original intent", () => {
+  const intent = reduceWorkflowEvent(running(), { type: "TerminalIntentAccepted", intent: { kind: "complete", requestedAt: 3 } }, { now: 3 }).next;
+  const complete = reduceWorkflowEvent(intent, { type: "RunStatusChanged", status: "completed" }, { now: 4 }).next;
+  const error = { kind: "infrastructure" as const, code: "CLEANUP", message: "capture failed" };
+  const upgraded = reduceWorkflowEvent(complete, { type: "CleanupChanged", cleanup: { status: "recovery_required", deadlineAt: 100, finishedAt: 5, error } }, { now: 5 }).next;
+  assert.equal(upgraded.status, "recovery_required");
+  assert.equal(upgraded.firstTerminalIntent?.kind, "complete");
+});
 
-  assert.throws(() => createWorkflowRunRecord({
-    id: "too-wide", input: { source: { kind: "inline", script: "1" } }, budget: { maxConcurrency: 9 },
-  }), WorkflowInvariantError);
+test("notification delivery cannot alter execution outcome", () => {
+  const base = running();
+  const changed = reduceWorkflowEvent(base, { type: "NotificationChanged", notification: { state: "failed", attempts: 1, updatedAt: 3, lastError: "offline" } }, { now: 3 }).next;
+  assert.equal(changed.status, "running");
+  assert.equal(changed.notification.state, "failed");
+});
 
-  const corrupt = structuredClone(terminal);
-  corrupt.status = "running";
-  assert.throws(() => assertWorkflowRunInvariants(corrupt), WorkflowInvariantError);
+test("provider attempts account at most once and duplicate identities fail", () => {
+  const accepted = reduceWorkflowEvent(running(), { type: "LeafAccepted", leaf: leaf() }, { now: 3 }).next;
+  const attempt = { attemptId: "provider-1", leafId: "leaf-1", startedAt: 4, settledAt: 5, status: "settled" as const, costState: "unavailable" as const };
+  const once = reduceWorkflowEvent(accepted, { type: "ProviderAttemptSettled", leafId: "leaf-1", attempt }, { now: 5 }).next;
+  const twice = reduceWorkflowEvent(once, { type: "ProviderAttemptSettled", leafId: "leaf-1", attempt }, { now: 6 }).next;
+  assert.equal(twice.leaves[0].attempts.length, 1);
+  assert.throws(() => reduceWorkflowEvent(accepted, { type: "LeafAccepted", leaf: { ...leaf(), leafId: "other", nodeId: "other" } }, { now: 3 }), /duplicate.*agent/i);
+});
+
+test("terminalization rejects unsettled leaves and future/invalid records", () => {
+  const accepted = reduceWorkflowEvent(running(), { type: "LeafAccepted", leaf: leaf() }, { now: 3 }).next;
+  assert.throws(() => reduceWorkflowEvent(accepted, { type: "RunStatusChanged", status: "failed" }, { now: 4 }), WorkflowInvariantError);
+  assert.throws(() => assertWorkflowRunInvariants({ ...created(), schemaVersion: 999 }), /unsupported/);
 });
