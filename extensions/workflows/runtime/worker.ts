@@ -155,7 +155,10 @@ function contract(code, message) {
 function serializeError(value, fallbackKind = "script") {
   const object = value && (typeof value === "object" || typeof value === "function") ? value : undefined;
   const name = typeof object?.name === "string" ? object.name : "";
-  const kind = name === "WorkflowContractError" ? "contract" : fallbackKind;
+  const rpcKind = object?.rpcKind;
+  const kind = rpcKind === "contract" || rpcKind === "script" || rpcKind === "infrastructure"
+    ? rpcKind
+    : name === "WorkflowContractError" ? "contract" : fallbackKind;
   return error(
     kind,
     typeof object?.code === "string" ? object.code : kind === "contract" ? "WORKFLOW_CONTRACT" : "WORKFLOW_SCRIPT",

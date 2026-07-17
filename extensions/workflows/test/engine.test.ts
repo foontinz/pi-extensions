@@ -34,6 +34,7 @@ function harness(root: string, executor: any = async (options: any) => ({ output
   const ctx = {
     cwd: root,
     model: { provider: "provider", id: "model" },
+    modelRegistry: { getAvailable: () => [{ provider: "provider", id: "model" }] },
     hasUI: false,
     isProjectTrusted: () => true,
     sessionManager: { getSessionId: () => "session", getSessionFile: () => path.join(root, "session.jsonl") },
@@ -78,6 +79,7 @@ test("child workflows resolve explicit relative references with independent dura
     assert.ok(childRecord);
     assert.equal(childRecord?.rootRunId, launch.runId);
     assert.equal((childRecord?.args as { value: number }).value, 42);
+    assert.equal(finished.usage.output, 0, "child had no leaf in this fixture");
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 
@@ -134,17 +136,18 @@ test("resumable skip and pause use stable controls without masquerading as leaf 
     const script = `${resumableMeta}\nreturn await agent("x", {id:"x", tools:["read"]})`;
     const skipped = await engine.launch({ script }, ctx, true);
     await waitFor(async () => (await engine.store.readRun(skipped.runId)).leaves[0]?.status === "running");
-    assert.equal(engine.skip(skipped.runId, "root/agent:x", ctx), true);
+    assert.equal(await engine.skip(skipped.runId, "root/agent:x", ctx), true);
     const skippedResult = await skipped.completion;
     assert.equal(skippedResult.status, "completed");
     assert.equal(skippedResult.leaves[0].status, "skipped");
 
     const paused = await engine.launch({ script }, ctx, true);
     await waitFor(async () => (await engine.store.readRun(paused.runId)).leaves[0]?.status === "running");
-    assert.equal(engine.pause(paused.runId, ctx), true);
+    assert.equal(await engine.pause(paused.runId, ctx), true);
     const pausedResult = await paused.completion;
     assert.equal(pausedResult.status, "paused");
     assert.equal(pausedResult.leaves[0].status, "interrupted");
+    assert.equal(pausedResult.attempts.at(-1)?.status, "interrupted");
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 
@@ -172,7 +175,7 @@ test("workspace effects capture verified artifacts before cleanup and apply in a
     assert.equal(lease.state, "cleaned");
     integration = await engine.artifacts.apply(finished.artifacts[0].artifactId, root);
     assert.equal(await fs.readFile(path.join(integration.root, "result.txt"), "utf8"), "captured\n");
-    await engine.artifacts.releaseApplied(integration); integration = undefined;
+    await engine.artifacts.releaseApplied(integration.integrationId); integration = undefined;
   } finally {
     if (integration) await fs.rm(integration.tempParent, { recursive: true, force: true });
     await fs.rm(root, { recursive: true, force: true });

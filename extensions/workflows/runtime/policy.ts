@@ -78,14 +78,16 @@ export interface BudgetReservation {
 
 /** Root-owned output-token budget with atomic synchronous reservations. */
 export class BudgetManager {
-  private committed = 0;
+  private committed: number;
   private sequence = 0;
   private readonly reservations = new Map<string, number>();
 
-  constructor(readonly total: number | null) {
+  constructor(readonly total: number | null, initialSpent = 0) {
     if (total !== null && (!Number.isSafeInteger(total) || total < 1)) {
       throw new WorkflowPolicyError("BUDGET_INVALID", "budgetTokens must be a positive safe integer");
     }
+    if (!Number.isSafeInteger(initialSpent) || initialSpent < 0) throw new WorkflowPolicyError("BUDGET_SPENT_INVALID", "initial spent budget must be a non-negative safe integer");
+    this.committed = initialSpent;
   }
 
   reserve(requested: number): BudgetReservation {

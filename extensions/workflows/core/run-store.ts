@@ -14,7 +14,7 @@ import {
   WORKFLOW_EVENT_SCHEMA_VERSION,
   WORKFLOW_RUN_SCHEMA_VERSION,
 } from "./limits.js";
-import { assertWorkflowRunInvariants } from "./reducer.js";
+import { assertWorkflowRunInvariants, reduceWorkflowEvent } from "./reducer.js";
 
 export interface WorkflowRunPaths {
   runDir: string;
@@ -84,21 +84,46 @@ export class WorkflowRunStore {
   }
 
   async readRun(runId: string): Promise<WorkflowRunRecordV1> {
-    const value = JSON.parse(await readBounded(this.paths(runId).run, 16 * 1024 * 1024)) as any;
-    if (typeof value?.schemaVersion === "number" && value.schemaVersion > WORKFLOW_RUN_SCHEMA_VERSION) {
-      throw new UnsupportedWorkflowSchemaError(`unsupported future workflow schema ${value.schemaVersion}`);
-    }
-    assertWorkflowRunInvariants(value);
-    return structuredClone(value);
+    return this.withRunWriter(runId, async () => this.loadRunAndReplay(runId));
   }
 
   async writeRun(record: WorkflowRunRecordV1): Promise<void> {
     assertWorkflowRunInvariants(record);
     await this.withRunWriter(record.runId, async () => {
       await requireRunDirectory(this.paths(record.runId).runDir);
-      const current = await this.readRun(record.runId);
-      if (record.recordRevision < current.recordRevision) throw new Error("refusing to replace run snapshot with an older revision");
+      const current = await this.loadRunAndReplay(record.runId);
+      if (record.recordRevision !== current.recordRevision + 1) throw new Error(`run snapshot CAS failed: expected revision ${current.recordRevision + 1}, got ${record.recordRevision}`);
       await atomicWrite(this.paths(record.runId).run, jsonLine(record));
+    });
+  }
+
+  async reduceAndCommit(runId: string, event: DurableWorkflowEvent["event"], timestamp = Date.now()): Promise<WorkflowRunRecordV1> {
+    return this.withRunWriter(runId, async () => {
+      const current = await this.loadRunAndReplay(runId);
+      const transition = reduceWorkflowEvent(current, event, { now: timestamp });
+      if (!transition.changed) return current;
+      const durable: DurableWorkflowEvent = { schemaVersion: WORKFLOW_EVENT_SCHEMA_VERSION, runId, sequence: transition.next.recordRevision, timestamp, event };
+      const snapshot = jsonLine(durable);
+      if (Buffer.byteLength(snapshot) > MAX_EVENT_RECORD_BYTES) throw new Error("workflow event exceeds record byte limit");
+      await assertAppendCapacity(this.paths(runId).events, snapshot, MAX_EVENT_FILE_BYTES, MAX_EVENT_RECORDS);
+      await appendDurable(this.paths(runId).events, snapshot);
+      await atomicWrite(this.paths(runId).run, jsonLine(transition.next));
+      return transition.next;
+    });
+  }
+
+  /** WAL append + atomic snapshot under one per-run writer and revision CAS. */
+  async commitEvent(expectedRevision: number, event: DurableWorkflowEvent, next: WorkflowRunRecordV1): Promise<void> {
+    assertWorkflowRunInvariants(next);
+    if (event.runId !== next.runId || event.sequence !== expectedRevision + 1 || next.recordRevision !== event.sequence) throw new Error("event/snapshot revision mismatch");
+    await this.withRunWriter(event.runId, async () => {
+      const current = await this.loadRunAndReplay(event.runId);
+      if (current.recordRevision !== expectedRevision) throw new Error(`run event CAS failed: expected revision ${expectedRevision}, found ${current.recordRevision}`);
+      const snapshot = jsonLine(event);
+      if (Buffer.byteLength(snapshot) > MAX_EVENT_RECORD_BYTES) throw new Error("workflow event exceeds record byte limit");
+      await assertAppendCapacity(this.paths(event.runId).events, snapshot, MAX_EVENT_FILE_BYTES, MAX_EVENT_RECORDS);
+      await appendDurable(this.paths(event.runId).events, snapshot);
+      await atomicWrite(this.paths(event.runId).run, jsonLine(next));
     });
   }
 
@@ -154,6 +179,25 @@ export class WorkflowRunStore {
     validateRunId(runId);
     try { return JSON.parse(await readBounded(path.join(this.root, ".tombstones", `${runId}.json`), 16_384)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+  }
+
+  private async loadRunAndReplay(runId: string): Promise<WorkflowRunRecordV1> {
+    const value = JSON.parse(await readBounded(this.paths(runId).run, 16 * 1024 * 1024)) as any;
+    if (typeof value?.schemaVersion === "number" && value.schemaVersion > WORKFLOW_RUN_SCHEMA_VERSION) {
+      throw new UnsupportedWorkflowSchemaError(`unsupported future workflow schema ${value.schemaVersion}`);
+    }
+    assertWorkflowRunInvariants(value);
+    let record = value as WorkflowRunRecordV1;
+    const events = await readJsonLines<DurableWorkflowEvent>(this.paths(runId).events, MAX_EVENT_FILE_BYTES);
+    for (const durable of events) {
+      if (durable.sequence <= record.recordRevision) continue;
+      if (durable.sequence !== record.recordRevision + 1) throw new Error(`workflow event sequence gap at ${durable.sequence}`);
+      const transition = reduceWorkflowEvent(record, durable.event, { now: durable.timestamp });
+      if (!transition.changed || transition.next.recordRevision !== durable.sequence) throw new Error(`workflow event ${durable.sequence} cannot replay deterministically`);
+      record = transition.next;
+    }
+    if (record.recordRevision !== value.recordRevision) await atomicWrite(this.paths(runId).run, jsonLine(record));
+    return structuredClone(record);
   }
 
   async scan(): Promise<RunScanEntry[]> {

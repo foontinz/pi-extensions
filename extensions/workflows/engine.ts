@@ -3,6 +3,7 @@ import { readFile, realpath, stat } from "node:fs/promises";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { runSubagentInProcess } from "../subagents/core/in-process-runner.js";
+import { createStructuredOutputCapability } from "../subagents/core/structured-output.js";
 import { emptyUsageStats, type SubagentResult } from "../subagents/core/types.js";
 import { cleanupWorktreeAsync, prepareWorktree } from "../subagents/workspace/create-worktree.js";
 import {
@@ -10,10 +11,8 @@ import {
   createWorkflowRunRecord,
   encodeWorkflowOutput,
   parseWorkflowMetadata,
-  reduceWorkflowEvent,
   validateWorkflowInput,
   WorkflowContractError,
-  type DurableWorkflowEvent,
   type JsonValue,
   type WorkflowAgentOptions,
   type WorkflowErrorV1,
@@ -33,7 +32,7 @@ import { BudgetManager, FairSemaphore, WorkflowPolicyError } from "./runtime/pol
 import { resolveAgentExecution, type AvailableTool, type RootExecutionDefaults } from "./runtime/resolution.js";
 import { CanonicalWorkflowWorker, type WorkerAgentRequest, type WorkerBudgetSnapshot, type WorkerChildRequest } from "./runtime/worker.js";
 import { WorkflowOwnerRegistry, type WorkflowOwnerIdentity } from "./runtime/owners.js";
-import { WorkflowJournal, claimWorkflowResume, type WorkflowReplayEntry } from "./resume/journal.js";
+import { WorkflowJournal, claimRunExecution, claimWorkflowResume, hasLiveRunExecutionClaim, type WorkflowReplayEntry } from "./resume/journal.js";
 import { WorkspaceArtifactStore } from "./workspace/artifact-store.js";
 
 export interface WorkflowLaunch {
@@ -58,6 +57,7 @@ interface RootState {
   settings: WorkflowSettings;
   defaults: RootExecutionDefaults;
   availableTools: AvailableTool[];
+  availableModels: Set<string>;
   controller: AbortController;
   agentsAccepted: number;
   maxAgents: number;
@@ -123,14 +123,21 @@ export class WorkflowEngine {
     const fingerprint = hashCanonical({ source: source.sha256, args: argsSha256, metadata: parsed.metadata, defaults, engine: 1 });
     const journal = new WorkflowJournal(this.store);
     let replay = new Map<string, WorkflowReplayEntry>();
+    let previousSpent = 0;
+    let previousUsage: WorkflowRunRecordV1["usage"] | undefined;
     let releaseResumeClaim: (() => Promise<void>) | undefined;
     if (input.resumeFromRunId) {
       const previous = await this.store.readRun(input.resumeFromRunId);
       if (previous.owner.sessionId !== owner.sessionId) throw new WorkflowContractError("RESUME_OWNER", "resume source belongs to another session owner");
       if (!previous.metadata.resumable) throw new WorkflowContractError("RESUME_NOT_DECLARED", "resume source does not declare resumable:true");
+      if (this.activeRoots.has(previous.runId) || await hasLiveRunExecutionClaim(this.store, previous.runId)) {
+        throw new WorkflowContractError("RESUME_SOURCE_ACTIVE", "pause and drain the active source run before resume/retry");
+      }
       if (previous.source.sha256 !== source.sha256 || previous.argsSha256 !== argsSha256 || previous.executionFingerprint !== fingerprint) {
         throw new WorkflowContractError("RESUME_FINGERPRINT", "resume requires exact copied source, canonical args, metadata, model, tools, prompts, and engine fingerprint");
       }
+      previousSpent = previous.budget.spent;
+      previousUsage = previous.usage;
       releaseResumeClaim = await claimWorkflowResume(this.store, input.resumeFromRunId);
       try {
         const records = await journal.recover(input.resumeFromRunId);
@@ -162,8 +169,13 @@ export class WorkflowEngine {
       deadlineAt,
       cleanupDeadlineAt: deadlineAt + settings.cleanupGraceMs,
       budgetTotal,
+      budgetSpent: previousSpent,
+      ...(previousUsage ? { initialUsage: previousUsage } : {}),
     });
     try { await this.store.createRun(record, source.source); }
+    catch (error) { await releaseResumeClaim?.(); throw error; }
+    let releaseExecutionClaim: (() => Promise<void>) | undefined;
+    try { releaseExecutionClaim = await claimRunExecution(this.store, runId, owner); }
     catch (error) { await releaseResumeClaim?.(); throw error; }
 
     const controller = new AbortController();
@@ -171,9 +183,11 @@ export class WorkflowEngine {
     const globalSemaphore = this.processSemaphore(settings.globalMaxConcurrency);
     const root: RootState = {
       runId, cwd: ctx.cwd, owner, deadlineAt,
-      budget: new BudgetManager(budgetTotal),
+      budget: new BudgetManager(budgetTotal, previousSpent),
       runSemaphore: new FairSemaphore(settings.runMaxConcurrency),
-      globalSemaphore, settings, defaults, availableTools, controller,
+      globalSemaphore, settings, defaults, availableTools,
+      availableModels: new Set(ctx.modelRegistry.getAvailable().map((candidate) => `${candidate.provider}/${candidate.id}`)),
+      controller,
       agentsAccepted: 0,
       maxAgents: parsed.metadata.maxAgents,
       approvedCapabilities: [...parsed.metadata.capabilities],
@@ -189,6 +203,7 @@ export class WorkflowEngine {
     catch (error) {
       this.activeRoots.delete(runId);
       this.owners.finish(runId);
+      await releaseExecutionClaim?.();
       await releaseResumeClaim?.();
       throw error;
     }
@@ -196,6 +211,7 @@ export class WorkflowEngine {
       this.owners.finish(runId);
       this.completions.delete(runId);
       this.activeRoots.delete(runId);
+      await releaseExecutionClaim?.();
       await releaseResumeClaim?.();
     });
     this.completions.set(runId, completion);
@@ -210,19 +226,34 @@ export class WorkflowEngine {
     this.owners.unbind(ctx);
   }
 
-  stop(runId: string, ctx: ExtensionContext, reason: string, scopeAll = false): boolean {
-    return this.owners.stop(runId, this.owners.bind(ctx), reason, scopeAll);
+  async stop(runId: string, ctx: ExtensionContext, reason: string, scopeAll = false): Promise<boolean> {
+    const root = this.activeRoots.get(runId);
+    const owner = this.owners.bind(ctx);
+    if (!root || (!scopeAll && root.owner.sessionId !== owner.sessionId)) return false;
+    await this.applyEvent(runId, { type: "TerminalIntentAccepted", intent: { kind: "cancel", requestedAt: Date.now(), reason } });
+    return this.owners.stop(runId, owner, reason, scopeAll);
   }
-  pause(runId: string, ctx: ExtensionContext): boolean {
+  async pause(runId: string, ctx: ExtensionContext): Promise<boolean> {
+    const root = this.activeRoots.get(runId);
+    const owner = this.owners.bind(ctx);
+    if (!root || root.owner.sessionId !== owner.sessionId) return false;
+    const record = await this.store.readRun(runId);
+    if (!record.metadata.resumable) throw new WorkflowContractError("PAUSE_NOT_RESUMABLE", "pause requires meta.resumable:true");
+    await this.applyEvent(runId, { type: "TerminalIntentAccepted", intent: { kind: "pause", requestedAt: Date.now(), reason: "pause requested" } });
     const error = new Error("pause requested");
     (error as NodeJS.ErrnoException).code = "WORKFLOW_PAUSE";
-    return this.owners.stop(runId, this.owners.bind(ctx), error, false);
+    return this.owners.stop(runId, owner, error, false);
   }
-  skip(runId: string, nodeId: string, ctx: ExtensionContext): boolean {
+  async skip(runId: string, nodeId: string, ctx: ExtensionContext): Promise<boolean> {
     const root = this.activeRoots.get(runId);
     if (!root || root.owner.sessionId !== this.owners.bind(ctx).sessionId) return false;
     const controller = root.leafControllers.get(nodeId);
     if (!controller) return false;
+    const record = await this.store.readRun(runId);
+    if (!record.metadata.resumable) throw new WorkflowContractError("SKIP_NOT_RESUMABLE", "skip requires meta.resumable:true");
+    const leaf = record.leaves.find((item) => item.nodeId === nodeId);
+    if (!leaf) return false;
+    await this.applyEvent(runId, { type: "LeafStatusChanged", leafId: leaf.leafId, status: "skipped", at: Date.now() });
     const error = new Error(`skip requested for ${nodeId}`);
     (error as NodeJS.ErrnoException).code = "WORKFLOW_SKIP";
     controller.abort(error);
@@ -235,7 +266,7 @@ export class WorkflowEngine {
       if (entry.state !== "ok") continue;
       let record = entry.record!;
       if (["completed", "failed", "cancelled", "interrupted", "recovery_required", "paused"].includes(record.status)) continue;
-      if (this.activeRoots.has(record.runId)) continue;
+      if (this.activeRoots.has(record.runId) || await hasLiveRunExecutionClaim(this.store, record.runId)) continue;
       for (const leaf of record.leaves) {
         if (["queued", "running", "backoff"].includes(leaf.status)) {
           record = await this.applyEvent(record.runId, { type: "LeafStatusChanged", leafId: leaf.leafId, status: "interrupted", at: Date.now() });
@@ -243,7 +274,7 @@ export class WorkflowEngine {
       }
       const uncertain = record.leaves.some((leaf) =>
         leaf.effects === "external" && leaf.status === "interrupted"
-        || leaf.effects === "workspace" && leaf.status === "interrupted" && leaf.artifactIds.length === 0,
+        || leaf.effects === "workspace" && Boolean(leaf.workspaceLeaseId) && leaf.artifactIds.length === 0,
       );
       const error: WorkflowErrorV1 = {
         kind: "recovery",
@@ -257,13 +288,9 @@ export class WorkflowEngine {
   }
 
   async applyEvent(runId: string, event: WorkflowRunEvent): Promise<WorkflowRunRecordV1> {
-    const current = await this.store.readRun(runId);
-    const transition = reduceWorkflowEvent(current, event);
-    if (!transition.changed) return current;
-    await this.store.appendEvent({ schemaVersion: 1, runId, sequence: transition.next.recordRevision, timestamp: Date.now(), event });
-    await this.store.writeRun(transition.next);
+    const next = await this.store.reduceAndCommit(runId, event);
     if (event.type === "NotificationChanged") await this.store.writeNotification(runId, event.notification);
-    return transition.next;
+    return next;
   }
 
   async resume(runId: string, ctx: ExtensionContext, onRecord?: (record: WorkflowRunRecordV1) => void, invalidateNodeId?: string): Promise<WorkflowLaunch> {
@@ -344,6 +371,7 @@ class RunCoordinator {
       if (this.fatal) throw this.fatal;
       await Promise.allSettled([...this.activeLeaves]);
       if (this.fatal) throw this.fatal;
+      if (this.root.controller.signal.aborted) throw abortError(this.root.controller.signal);
       const encoded = encodeWorkflowOutput(output);
       await this.engine.store.writeOutput(this.record.runId, encoded);
       const outputText = JSON.stringify(encoded);
@@ -358,6 +386,7 @@ class RunCoordinator {
       await this.transition({ type: "OutputRecorded", output: descriptor });
       await this.transition({ type: "TerminalIntentAccepted", intent: { kind: "complete", requestedAt: Date.now() } });
       await this.transition({ type: "CleanupChanged", cleanup: { status: "completed", deadlineAt: this.record.cleanup.deadlineAt, finishedAt: Date.now() } });
+      if (this.source.parsed.metadata.resumable) await this.appendJournal("terminal", this.scope, { status: "completed" });
       await this.transition({ type: "RunStatusChanged", status: "completed" });
       await this.transition({ type: "RetentionChanged", pinned: false, expiresAt: Date.now() + this.root.settings.retentionMs });
     } catch (error) {
@@ -379,6 +408,9 @@ class RunCoordinator {
           : { status: "completed", deadlineAt: this.record.cleanup.deadlineAt, finishedAt: Date.now() },
       }).catch(() => {});
       const finalStatus = recoveryRequired ? "recovery_required" : paused ? "paused" : cancellation ? "cancelled" : "failed";
+      if (this.source.parsed.metadata.resumable) {
+        await this.appendJournal("terminal", this.scope, { status: finalStatus, error: workflowError.message });
+      }
       await this.transition({ type: "RunStatusChanged", status: finalStatus, error: workflowError }).catch(async (transitionError) => {
         const recovery = serializeError(transitionError);
         await this.transition({ type: "RunStatusChanged", status: "recovery_required", error: recovery }).catch(() => {});
@@ -389,6 +421,11 @@ class RunCoordinator {
     } finally {
       linked.dispose();
     }
+    const durable = await this.engine.store.readRun(this.record.runId);
+    if (!["completed", "failed", "cancelled", "paused", "interrupted", "recovery_required"].includes(durable.status)) {
+      throw infrastructure("TERMINAL_PERSISTENCE", `workflow completion is not durable (status ${durable.status})`);
+    }
+    this.record = durable;
     if (this.depth > 0) {
       await this.transition({ type: "NotificationChanged", notification: { state: "delivered", attempts: 0, updatedAt: Date.now(), deliveredAt: Date.now() } }).catch(() => {});
     }
@@ -416,6 +453,9 @@ class RunCoordinator {
     }
     const phase = options.phase ?? this.phase;
     const resolved = resolveAgentExecution(this.root.cwd, options, this.root.defaults, this.root.availableTools, options.schema !== undefined);
+    const concreteModel = `${resolved.provider}/${resolved.model}`;
+    if (!this.root.availableModels.has(concreteModel)) throw new WorkflowContractError("MODEL_UNKNOWN", `unknown or unavailable concrete model: ${concreteModel}`);
+    if (options.schema) createStructuredOutputCapability({ schema: options.schema });
     enforceCapabilityDeclaration(this.source.parsed.metadata, resolved.effects);
     const acceptedAt = Date.now();
     const timeoutMs = options.timeoutMs ?? Math.max(1, this.root.deadlineAt - acceptedAt);
@@ -428,7 +468,7 @@ class RunCoordinator {
       status: "queued", acceptedAt, deadlineAt: deadline.deadlineAt,
       effects: resolved.effects, ...(resolved.artifactPolicy ? { artifactPolicy: resolved.artifactPolicy } : {}),
       cachePolicy: resolved.cachePolicy,
-      executionFingerprint: hashCanonical({ root: this.record.executionFingerprint, id: options.id, phase, resolved, schema: options.schema ?? null, inputManifest: options.inputManifest ?? null }),
+      executionFingerprint: hashCanonical({ root: this.record.executionFingerprint, id: options.id, task: request.task, phase, resolved, schema: options.schema ?? null, inputManifest: options.inputManifest ?? null }),
       attempts: [], artifactIds: [],
     };
     await this.transition({ type: "LeafAccepted", leaf });
@@ -469,8 +509,12 @@ class RunCoordinator {
     let leaseId: string | undefined;
     const runAndLeaf = linkSignals(this.root.controller.signal, leafSignal);
     const linked = deadline.signal(runAndLeaf.signal);
-    const reservation = this.root.budget.reserve(Math.max(1, Math.min(8192, this.root.budget.remaining() ?? 8192)));
+    const perLeafReservation = this.root.budget.total === null
+      ? Math.max(1, Math.ceil((this.source.parsed.metadata.estimatedOutputTokens ?? 8192) / this.source.parsed.metadata.maxAgents))
+      : Math.max(1, Math.ceil(this.root.budget.total / this.root.maxAgents));
+    const reservation = this.root.budget.reserve(perLeafReservation);
     try {
+      await this.transition({ type: "BudgetChanged", budget: this.root.budget.snapshot() });
       releaseRun = await this.root.runSemaphore.acquire(linked.signal);
       releaseGlobal = await this.root.globalSemaphore.acquire(linked.signal);
       deadline.throwIfElapsed();
@@ -525,7 +569,10 @@ class RunCoordinator {
       }
       return canonical;
     } catch (error) {
-      try { this.root.budget.refund(reservation); } catch { /* already committed */ }
+      try {
+        this.root.budget.refund(reservation);
+        await this.transition({ type: "BudgetChanged", budget: this.root.budget.snapshot() });
+      } catch { /* already committed or persistence is already fatal */ }
       if (leaseId) {
         try { await this.finishWorkspace(leaf, resolved, leaseId); }
         catch (cleanupError) {
@@ -593,8 +640,8 @@ class RunCoordinator {
       output: result.usage.output,
       cacheRead: result.usage.cacheRead,
       cacheWrite: result.usage.cacheWrite,
-      cost: result.usage.cost,
-      costState: "reported" as const,
+      cost: result.usage.cost > 0 ? result.usage.cost : null,
+      costState: result.usage.cost > 0 ? "reported" as const : "unavailable" as const,
       contextTokens: result.usage.contextTokens,
       turns: result.usage.turns,
       providerAttempts: 0,
@@ -644,6 +691,8 @@ class RunCoordinator {
     );
     await child.start();
     const finished = await child.execute();
+    await this.transition({ type: "UsageAdded", usage: finished.usage });
+    await this.transition({ type: "BudgetChanged", budget: this.root.budget.snapshot() });
     if (finished.status !== "completed" || !finished.output) throw new Error(finished.error?.message ?? `child workflow ${runId} failed`);
     const encoded = await this.engine.store.readOutput(runId);
     return decodeSimpleOutput(encoded.value);
@@ -668,10 +717,7 @@ class RunCoordinator {
         const attemptId = this.record.attempts.at(-1)?.attemptId ?? "unknown";
         await this.root.journal.append(this.record.runId, { sequence, attemptId, nodeId, type, payload });
         const event: WorkflowRunEvent = { type: "JournalAdvanced", sequence };
-        const transition = reduceWorkflowEvent(this.record, event);
-        await this.engine.store.appendEvent({ schemaVersion: 1, runId: this.record.runId, sequence: transition.next.recordRevision, timestamp: Date.now(), event });
-        await this.engine.store.writeRun(transition.next);
-        this.record = transition.next;
+        this.record = await this.engine.store.reduceAndCommit(this.record.runId, event);
         if (this.depth === 0) this.root.onRecord?.(this.snapshot());
         complete();
       } catch (error) { reject(error); throw error; }
@@ -684,12 +730,9 @@ class RunCoordinator {
     const result = new Promise<void>((resolve, fail) => { complete = resolve; reject = fail; });
     this.mutation = this.mutation.then(async () => {
       try {
-        const transition = reduceWorkflowEvent(this.record, event);
-        if (!transition.changed) { complete(); return; }
-        const durable: DurableWorkflowEvent = { schemaVersion: 1, runId: this.record.runId, sequence: transition.next.recordRevision, timestamp: Date.now(), event };
-        await this.engine.store.appendEvent(durable);
-        await this.engine.store.writeRun(transition.next);
-        this.record = transition.next;
+        const next = await this.engine.store.reduceAndCommit(this.record.runId, event);
+        if (next.recordRevision === this.record.recordRevision) { complete(); return; }
+        this.record = next;
         if (this.depth === 0) this.root.onRecord?.(this.snapshot());
         complete();
       } catch (error) { reject(error); throw error; }

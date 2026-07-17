@@ -85,7 +85,24 @@ export interface WorkspaceArtifact {
   manifest: WorkspaceArtifactManifest;
 }
 
+export interface IntegrationWorkspaceRecord {
+  version: 1;
+  integrationId: string;
+  artifactId: string;
+  ownerSessionId?: string;
+  state: "provisioning" | "applied" | "conflicted" | "cleanup_pending" | "cleaned" | "recovery_required";
+  root: string;
+  tempParent: string;
+  repositoryRoot: string;
+  targetRef: string;
+  conflicts: string[];
+  createdAt: string;
+  updatedAt: string;
+  reason?: string;
+}
+
 export interface AppliedWorkspace {
+  integrationId: string;
   artifactId: string;
   state: "applied" | "conflicted";
   root: string;

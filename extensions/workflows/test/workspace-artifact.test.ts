@@ -111,12 +111,12 @@ test("captures and reapplies staged, unstaged, untracked, binary, delete, rename
     assert.equal((await fs.stat(path.join(integration.root, "executable.sh"))).mode & 0o111, 0o111);
     assert.equal(await fs.readlink(path.join(integration.root, "result-link")), "unstaged.txt");
 
-    await value.store.releaseApplied(integration);
+    await value.store.releaseApplied(integration.integrationId);
     integration = undefined;
     await value.store.release(lease.id);
     assert.equal((await value.store.getLease(lease.id)).state, "cleaned");
   } finally {
-    if (integration) await value.store.releaseApplied(integration).catch(() => {});
+    if (integration) await value.store.releaseApplied(integration.integrationId).catch(() => {});
     await removeFixture(value);
   }
 });
@@ -142,6 +142,49 @@ test("tampered artifact prevents cleanup and leaves workspace recoverable", asyn
   }
 });
 
+test("release refuses to delete changes made after artifact capture", async () => {
+  const value = await fixture();
+  try {
+    const lease = await value.store.register(value.provisioned);
+    const file = path.join(value.provisioned.worktree!.root, "unstaged.txt");
+    await fs.writeFile(file, "captured version\n");
+    await value.store.capture(lease.id);
+    await fs.writeFile(file, "later important version\n");
+    await assert.rejects(value.store.release(lease.id), /changed after artifact capture/);
+    assert.equal((await value.store.getLease(lease.id)).state, "recovery_required");
+    assert.equal(await fs.readFile(file, "utf8"), "later important version\n");
+  } finally { await removeFixture(value); }
+});
+
+test("untracked nested repositories are retained as unsupported instead of silently captured", async () => {
+  const value = await fixture();
+  try {
+    const lease = await value.store.register(value.provisioned);
+    const nested = path.join(value.provisioned.worktree!.root, "nested");
+    await fs.mkdir(nested);
+    await git(nested, "init");
+    await fs.writeFile(path.join(nested, "important.txt"), "important\n");
+    await assert.rejects(value.store.capture(lease.id), /nested repository.*unsupported/i);
+    assert.equal((await value.store.getLease(lease.id)).state, "retained");
+    assert.equal(await fs.readFile(path.join(nested, "important.txt"), "utf8"), "important\n");
+  } finally { await removeFixture(value); }
+});
+
+test("integration release uses opaque durable IDs and owner checks", async () => {
+  const value = await fixture();
+  try {
+    const lease = await value.store.register(value.provisioned);
+    await fs.writeFile(path.join(value.provisioned.worktree!.root, "unstaged.txt"), "change\n");
+    const artifact = await value.store.capture(lease.id);
+    const integration = await value.store.apply(artifact.id, value.repo, "HEAD", "owner-a");
+    await assert.rejects(value.store.releaseApplied(integration.integrationId, "owner-b"), /another owner/);
+    assert.equal((await fs.stat(integration.root)).isDirectory(), true);
+    await value.store.releaseApplied(integration.integrationId, "owner-a");
+    await value.store.releaseApplied(integration.integrationId, "owner-a");
+    await assert.rejects(value.store.releaseApplied("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "owner-a"), /ENOENT|no such file/i);
+  } finally { await removeFixture(value); }
+});
+
 test("three-way apply retains a fresh integration worktree on conflict", async () => {
   const value = await fixture();
   let integration: Awaited<ReturnType<WorkspaceArtifactStore["apply"]>> | undefined;
@@ -160,7 +203,7 @@ test("three-way apply retains a fresh integration worktree on conflict", async (
     assert.match(await fs.readFile(path.join(integration.root, "conflict.txt"), "utf8"), /<<<<<<< ours/);
     assert.equal((await fs.stat(integration.root)).isDirectory(), true);
   } finally {
-    if (integration) await value.store.releaseApplied(integration).catch(() => {});
+    if (integration) await value.store.releaseApplied(integration.integrationId).catch(() => {});
     await removeFixture(value);
   }
 });

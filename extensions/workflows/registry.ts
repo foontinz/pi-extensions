@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { MAX_WORKFLOW_SCRIPT_BYTES } from "./core/limits.js";
 
 export type WorkflowSourceKind = "inline" | "path" | "builtin" | "user" | "project";
 
@@ -96,6 +97,7 @@ export class WorkflowResolver {
     }
     const stat = fs.statSync(real);
     if (!stat.isFile()) throw new WorkflowResolutionError("SOURCE_NOT_FILE", `workflow source is not a regular file: ${real}`);
+    if (stat.size > MAX_WORKFLOW_SCRIPT_BYTES) throw new WorkflowResolutionError("SOURCE_LIMIT", `workflow source exceeds ${MAX_WORKFLOW_SCRIPT_BYTES} bytes`);
     const source = fs.readFileSync(real, "utf8");
     return resolved(kind, source, path.dirname(real), real);
   }
@@ -117,6 +119,7 @@ export class WorkflowResolver {
     if (!isWithin(real, realRoot)) throw new WorkflowResolutionError("SOURCE_ESCAPE", `workflow ${qualifiedId} escapes its ${kind} registry root`);
     const stat = fs.statSync(real);
     if (!stat.isFile()) throw new WorkflowResolutionError("SOURCE_NOT_FILE", `workflow ${qualifiedId} is not a regular file`);
+    if (stat.size > MAX_WORKFLOW_SCRIPT_BYTES) throw new WorkflowResolutionError("SOURCE_LIMIT", `workflow ${qualifiedId} exceeds ${MAX_WORKFLOW_SCRIPT_BYTES} bytes`);
     const source = fs.readFileSync(real, "utf8");
     return { ...resolved(kind, source, path.dirname(real), real), qualifiedId };
   }

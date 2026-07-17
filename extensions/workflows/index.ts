@@ -110,7 +110,7 @@ export default function workflowsExtension(pi: ExtensionAPI) {
         };
       }
 
-      const onAbort = () => engine.stop(launch.runId, ctx, "foreground tool call aborted");
+      const onAbort = () => { void engine.stop(launch.runId, ctx, "foreground tool call aborted"); };
       signal?.addEventListener("abort", onAbort, { once: true });
       try {
         const record = await launch.completion;
@@ -195,16 +195,16 @@ export default function workflowsExtension(pi: ExtensionAPI) {
         return textResult(`Workflow ${params.runId} ${updated.pinned ? "pinned" : "unpinned"}.`, { runId: params.runId, pinned: updated.pinned });
       }
       if (params.action === "stop") {
-        const stopped = engine.stop(params.runId, ctx, params.reason?.trim() || "stopped by request");
+        const stopped = await engine.stop(params.runId, ctx, params.reason?.trim() || "stopped by request");
         return textResult(stopped ? `Stopping workflow ${params.runId}.` : `No active owner-scoped workflow ${params.runId}.`, { runId: params.runId, stopped });
       }
       if (params.action === "pause") {
-        const paused = engine.pause(params.runId, ctx);
+        const paused = await engine.pause(params.runId, ctx);
         return textResult(paused ? `Pausing workflow ${params.runId}.` : `No active owner-scoped workflow ${params.runId}.`, { runId: params.runId, paused });
       }
       if (params.action === "skip") {
         if (!params.nodeId) throw new Error("skip requires nodeId");
-        const skipped = engine.skip(params.runId, params.nodeId, ctx);
+        const skipped = await engine.skip(params.runId, params.nodeId, ctx);
         return textResult(skipped ? `Skipping ${params.nodeId}.` : `No active node ${params.nodeId} in workflow ${params.runId}.`, { runId: params.runId, nodeId: params.nodeId, skipped });
       }
       if (params.action === "retry" && !params.nodeId) throw new Error("retry requires nodeId");
@@ -220,7 +220,9 @@ export default function workflowsExtension(pi: ExtensionAPI) {
     description: "Verify and apply one captured workspace artifact into a fresh integration worktree; never mutates the caller's current tree.",
     parameters: Type.Object({ artifactId: Type.String(), repositoryRoot: Type.Optional(Type.String()), targetRef: Type.Optional(Type.String()) }),
     async execute(_id, params, _signal, _update, ctx) {
-      const applied = await engine.artifacts.apply(params.artifactId, path.resolve(ctx.cwd, params.repositoryRoot ?? "."), params.targetRef ?? "HEAD");
+      const owner = engine.owners.bind(ctx);
+      await assertOwnerArtifact(engine, params.artifactId, owner.sessionId);
+      const applied = await engine.artifacts.apply(params.artifactId, path.resolve(ctx.cwd, params.repositoryRoot ?? "."), params.targetRef ?? "HEAD", owner.sessionId);
       return textResult(`${applied.state === "applied" ? "Applied" : "Conflicted"} in integration worktree ${applied.root}${applied.conflicts.length ? `\nConflicts: ${applied.conflicts.join(", ")}` : ""}`, applied);
     },
   });
@@ -229,11 +231,14 @@ export default function workflowsExtension(pi: ExtensionAPI) {
     name: "workflow_release_workspace",
     label: "Release Workflow Workspace",
     description: "Idempotently release a retained source workspace lease or integration worktree after durable cleanup.",
-    parameters: Type.Object({ leaseId: Type.Optional(Type.String()), integration: Type.Optional(Type.Object({ artifactId: Type.String(), state: StringEnum(["applied", "conflicted"] as const), root: Type.String(), tempParent: Type.String(), repositoryRoot: Type.String(), conflicts: Type.Array(Type.String()) })) }),
-    async execute(_id, params) {
-      if ((params.leaseId ? 1 : 0) + (params.integration ? 1 : 0) !== 1) throw new Error("exactly one of leaseId or integration is required");
-      if (params.leaseId) await engine.artifacts.release(params.leaseId);
-      else await engine.artifacts.releaseApplied(params.integration!);
+    parameters: Type.Object({ leaseId: Type.Optional(Type.String()), integrationId: Type.Optional(Type.String()) }),
+    async execute(_id, params, _signal, _update, ctx) {
+      if ((params.leaseId ? 1 : 0) + (params.integrationId ? 1 : 0) !== 1) throw new Error("exactly one of leaseId or integrationId is required");
+      const owner = engine.owners.bind(ctx);
+      if (params.leaseId) {
+        await assertOwnerLease(engine, params.leaseId, owner.sessionId);
+        await engine.artifacts.release(params.leaseId);
+      } else await engine.artifacts.releaseApplied(params.integrationId!, owner.sessionId);
       return textResult("Workspace released.", { released: true });
     },
   });
@@ -257,6 +262,19 @@ export default function workflowsExtension(pi: ExtensionAPI) {
       ctx.ui.notify(lines.length ? lines.join("\n") : "No Workflow runs.", "info");
     },
   });
+}
+
+async function assertOwnerArtifact(engine: WorkflowEngine, artifactId: string, ownerSessionId: string): Promise<void> {
+  const owned = (await engine.store.scan()).some((entry) => entry.state === "ok"
+    && entry.record!.owner.sessionId === ownerSessionId
+    && entry.record!.artifacts.some((artifact) => artifact.artifactId === artifactId));
+  if (!owned) throw new Error("unknown owner-scoped workflow artifact");
+}
+async function assertOwnerLease(engine: WorkflowEngine, leaseId: string, ownerSessionId: string): Promise<void> {
+  const owned = (await engine.store.scan()).some((entry) => entry.state === "ok"
+    && entry.record!.owner.sessionId === ownerSessionId
+    && entry.record!.leaves.some((leaf) => leaf.workspaceLeaseId === leaseId));
+  if (!owned) throw new Error("unknown owner-scoped workspace lease");
 }
 
 async function deliverNotification(pi: ExtensionAPI, engine: WorkflowEngine, record: WorkflowRunRecordV1): Promise<void> {
@@ -369,7 +387,12 @@ function sourceLabel(params: { script?: string; scriptPath?: string; name?: stri
 function textResult(text: string, details: unknown) {
   const max = 50_000;
   const bounded = Buffer.byteLength(text, "utf8") <= max ? text : `${Buffer.from(text).subarray(0, max).toString("utf8")}\n[truncated]`;
-  return { content: [{ type: "text" as const, text: bounded }], details };
+  let boundedDetails = details;
+  try {
+    const encoded = JSON.stringify(details);
+    if (Buffer.byteLength(encoded, "utf8") > max) boundedDetails = { truncated: true, preview: bounded };
+  } catch { boundedDetails = { truncated: true, preview: bounded }; }
+  return { content: [{ type: "text" as const, text: bounded }], details: boundedDetails };
 }
 function encodeCursor(offset: number): string { return Buffer.from(JSON.stringify({ offset })).toString("base64url"); }
 function decodeCursor(cursor?: string): number { if (!cursor) return 0; try { const value = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")); return Number.isSafeInteger(value.offset) && value.offset >= 0 ? value.offset : 0; } catch { throw new Error("invalid workflow status cursor"); } }

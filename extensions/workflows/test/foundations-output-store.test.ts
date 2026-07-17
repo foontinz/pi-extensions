@@ -54,12 +54,22 @@ test("run store durably creates canonical layout, provenance, snapshots, streams
     assert.deepEqual(await store.readRun(runId), record);
     assert.equal(await readFile(paths.script, "utf8"), source);
 
-    const events: DurableWorkflowEvent[] = Array.from({ length: 20 }, (_, index) => ({
-      schemaVersion: 1, runId, sequence: index + 1, timestamp: 101 + index,
-      event: { type: "RunStarted", attempt: { attemptId: `a-${index}`, runId, startedAt: 101 + index, status: "running" } },
-    }));
-    await Promise.all(events.map((event) => store.appendEvent(event)));
-    assert.deepEqual((await store.readEvents(runId)).map((event) => event.sequence), events.map((event) => event.sequence));
+    await store.reduceAndCommit(runId, {
+      type: "RunStarted", attempt: { attemptId: "attempt", runId, startedAt: 101, status: "running" },
+    }, 101);
+    await Promise.all(Array.from({ length: 20 }, (_, index) => store.reduceAndCommit(runId, {
+      type: "RetentionChanged", pinned: index % 2 === 0, expiresAt: 1_000 + index,
+    }, 102 + index)));
+    const durableEvents: DurableWorkflowEvent[] = await store.readEvents(runId);
+    assert.deepEqual(durableEvents.map((event) => event.sequence), Array.from({ length: 21 }, (_, index) => index + 1));
+    assert.equal((await store.readRun(runId)).recordRevision, 21);
+    await store.appendEvent({
+      schemaVersion: 1, runId, sequence: 22, timestamp: 200,
+      event: { type: "RetentionChanged", pinned: true, expiresAt: 2_000 },
+    });
+    const replayed = await store.readRun(runId);
+    assert.equal(replayed.recordRevision, 22);
+    assert.equal(replayed.pinned, true);
 
     await Promise.all(Array.from({ length: 20 }, (_, index) => store.appendJournal(runId, { index })));
     assert.deepEqual((await store.readJournal(runId)).map((entry) => (entry as any).index), Array.from({ length: 20 }, (_, index) => index));

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { open, readFile, rm, stat } from "node:fs/promises";
+import type { WorkflowOwnerV1 } from "../core/contracts.js";
 import type { JsonValue } from "../core/canonical-json.js";
 import { cloneCanonicalJson } from "../core/canonical-json.js";
 import { MAX_JOURNAL_BYTES, MAX_JOURNAL_RECORD_BYTES } from "../core/limits.js";
@@ -79,13 +80,60 @@ export class WorkflowJournal {
 }
 
 export async function claimWorkflowResume(store: WorkflowRunStore, runId: string): Promise<() => Promise<void>> {
-  const lock = `${store.paths(runId).runDir}/resume.lock`;
-  let handle;
-  try { handle = await open(lock, "wx", 0o600); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`workflow ${runId} already has an active resume claim`); throw error; }
-  await handle.writeFile(`${process.pid}\n`); await handle.sync(); await handle.close();
-  let released = false;
-  return async () => { if (released) return; released = true; await rm(lock, { force: true }); };
+  return claimProcessLock(`${store.paths(runId).runDir}/resume.lock`, { pid: process.pid, instanceId: randomUUID(), createdAt: Date.now() }, `workflow ${runId} already has an active resume claim`);
+}
+
+export async function claimRunExecution(store: WorkflowRunStore, runId: string, owner: WorkflowOwnerV1): Promise<() => Promise<void>> {
+  return claimProcessLock(`${store.paths(runId).runDir}/executor.lock`, {
+    pid: process.pid, instanceId: owner.instanceId, sessionId: owner.sessionId, createdAt: Date.now(),
+  }, `workflow ${runId} already has a live executor`);
+}
+
+export async function hasLiveRunExecutionClaim(store: WorkflowRunStore, runId: string): Promise<boolean> {
+  const lock = `${store.paths(runId).runDir}/executor.lock`;
+  try {
+    const value = JSON.parse(await readFile(lock, "utf8")) as { pid?: unknown };
+    return typeof value.pid === "number" && processIsLive(value.pid);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    return true; // malformed/permission-denied claims fail closed
+  }
+}
+
+async function claimProcessLock(
+  lock: string,
+  owner: { pid: number; instanceId: string; sessionId?: string; createdAt: number },
+  busyMessage: string,
+): Promise<() => Promise<void>> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let handle;
+    try {
+      handle = await open(lock, "wx", 0o600);
+      await handle.writeFile(`${JSON.stringify(owner)}\n`); await handle.sync(); await handle.close();
+      let released = false;
+      return async () => {
+        if (released) return;
+        released = true;
+        try {
+          const current = JSON.parse(await readFile(lock, "utf8")) as { instanceId?: string };
+          if (current.instanceId === owner.instanceId) await rm(lock, { force: true });
+        } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      };
+    } catch (error) {
+      await handle?.close().catch(() => {});
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      let existing: { pid?: unknown } | undefined;
+      try { existing = JSON.parse(await readFile(lock, "utf8")); } catch { throw new Error(busyMessage); }
+      if (!existing || typeof existing.pid !== "number" || processIsLive(existing.pid)) throw new Error(busyMessage);
+      await rm(lock, { force: true });
+    }
+  }
+  throw new Error(busyMessage);
+}
+function processIsLive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid < 1) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
 }
 
 function validateRecord(record: WorkflowJournalRecordV1, expectedSequence: number): void {

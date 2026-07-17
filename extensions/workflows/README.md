@@ -89,15 +89,19 @@ journal.jsonl       # resumable only
 
 Snapshots use flushed temp-file replacement plus parent-directory flush where supported. Event/journal streams are append-only and bounded. Runtime controllers/workers/promises never enter persisted records. Output uses a bounded tagged encoding for cycles, aliases, BigInt, undefined, non-finite numbers, Date, Error, Map/Set, and binary values.
 
-The reducer is the sole lifecycle owner. First terminal intent wins, terminal state is sticky, every accepted leaf settles/interupts, cleanup can upgrade to failure/recovery without erasing intent, and notification delivery never changes execution outcome.
+The reducer is the sole lifecycle owner. First terminal intent wins, terminal state is sticky, every accepted leaf settles/interrupts, cleanup can upgrade to failure/recovery without erasing intent, and notification delivery never changes execution outcome.
 
 ## Resume and controls
 
-`resumable:true` enables checksummed journaling, exact source/args/execution-fingerprint validation, concurrent resume claims, torn-tail repair, pure-node cache replay, stable node controls, pause, skip, and conservative retry invalidation. Changed source, args, model, prompts, tools, schema, or engine fingerprint refuses resume. Effectful uncertain work becomes `recovery_required`; it is never rerun automatically.
+`resumable:true` enables checksummed journaling, exact source/args/execution-fingerprint validation, reclaimable concurrent resume claims, torn-tail repair, root-scope pure-node cache replay, stable node controls, pause, skip, and conservative retry invalidation. Changed source, args, model, prompts, tools, schema, or engine fingerprint refuses resume. Effectful uncertain work becomes `recovery_required`; it is never rerun automatically. `workspace-artifact` cache requests currently fail closed until verified fresh-worktree restoration is available.
 
 ## Activation and trust
 
 Default activation is `ask`. Headless ask fails closed. `autonomous` and `explicit-only` are explicit settings. Approval binds source hash, concrete model, available tools, capabilities, maximum agents, and budget. Project workflows require active Pi project trust and canonical containment; symlink/traversal escape is rejected.
+
+## Accounting boundary
+
+Budgets and aggregate usage are durable and unknown cost is displayed as unavailable, never as zero. Pi's current nested-session API does not expose every raw provider retry/attempt with independent usage, so the engine does not fabricate provider-attempt counts; those counters remain zero until the SDK provides that boundary.
 
 ## Security boundary
 

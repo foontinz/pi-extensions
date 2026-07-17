@@ -6,7 +6,7 @@ import * as path from "node:path";
 import test from "node:test";
 import { createWorkflowRunRecord } from "../core/reducer.js";
 import { WorkflowRunStore } from "../core/run-store.js";
-import { claimWorkflowResume, WorkflowJournal } from "../resume/journal.js";
+import { claimRunExecution, claimWorkflowResume, hasLiveRunExecutionClaim, WorkflowJournal } from "../resume/journal.js";
 
 const runId = "33333333-3333-4333-8333-333333333333";
 const hash = "a".repeat(64);
@@ -56,5 +56,19 @@ test("resume claims reject concurrent claimants and release idempotently", async
     await release(); await release();
     const releaseAgain = await claimWorkflowResume(value.store, runId);
     await releaseAgain();
+    await fs.writeFile(path.join(value.store.paths(runId).runDir, "resume.lock"), JSON.stringify({ pid: 999_999_999, instanceId: "dead" }));
+    const reclaimed = await claimWorkflowResume(value.store, runId);
+    await reclaimed();
+  } finally { await fs.rm(value.root, { recursive: true, force: true }); }
+});
+
+test("executor claims protect live runs from cross-process reconciliation", async () => {
+  const value = await fixture();
+  try {
+    const release = await claimRunExecution(value.store, runId, { sessionId: "s", instanceId: "instance", parentPid: process.pid });
+    assert.equal(await hasLiveRunExecutionClaim(value.store, runId), true);
+    await assert.rejects(claimRunExecution(value.store, runId, { sessionId: "other", instanceId: "other", parentPid: process.pid }), /live executor/);
+    await release();
+    assert.equal(await hasLiveRunExecutionClaim(value.store, runId), false);
   } finally { await fs.rm(value.root, { recursive: true, force: true }); }
 });

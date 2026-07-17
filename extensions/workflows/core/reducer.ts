@@ -12,6 +12,7 @@ import type {
   WorkflowRunRecordV1,
   WorkflowRunStatus,
   WorkflowSourceProvenanceV1,
+  WorkflowUsage,
   WorkflowTransition,
 } from "./contracts.js";
 import { emptyWorkflowUsage, WORKFLOW_LEAF_STATUS_VALUES, WORKFLOW_RUN_STATUS_VALUES, WORKFLOW_TERMINAL_STATUS_VALUES } from "./contracts.js";
@@ -45,6 +46,8 @@ export interface CreateWorkflowRunOptions {
   deadlineAt: number;
   cleanupDeadlineAt: number;
   budgetTotal?: number | null;
+  budgetSpent?: number;
+  initialUsage?: WorkflowUsage;
   createdAt?: number;
 }
 export interface ReduceWorkflowOptions { now?: number }
@@ -71,8 +74,13 @@ export function createWorkflowRunRecord(options: CreateWorkflowRunOptions): Work
     cleanup: { status: "pending", deadlineAt: options.cleanupDeadlineAt },
     attempts: [], leaves: [], failures: [], artifacts: [],
     notification: { state: "pending", attempts: 0, updatedAt: createdAt },
-    usage: emptyWorkflowUsage(),
-    budget: { total: options.budgetTotal ?? null, spent: 0, reserved: 0, remaining: options.budgetTotal ?? null },
+    usage: options.initialUsage ? structuredClone(options.initialUsage) : emptyWorkflowUsage(),
+    budget: {
+      total: options.budgetTotal ?? null,
+      spent: options.budgetSpent ?? 0,
+      reserved: 0,
+      remaining: options.budgetTotal === null || options.budgetTotal === undefined ? null : Math.max(0, options.budgetTotal - (options.budgetSpent ?? 0)),
+    },
     pinned: false,
     journalSequence: 0,
   };
@@ -218,6 +226,14 @@ function applyRunStatus(record: WorkflowRunRecordV1, status: WorkflowRunStatus, 
     failed: ["recovery_required"], recovery_required: [],
   };
   if (!allowed[record.status].includes(status)) throw invariant(`invalid run transition ${record.status} -> ${status}`);
+  if (status === "paused") {
+    const attempt = record.attempts.at(-1);
+    if (attempt?.status === "running") {
+      attempt.status = "interrupted";
+      attempt.finishedAt = now;
+      if (error) attempt.error = structuredClone(error);
+    }
+  }
   if (isTerminalRunStatus(status)) {
     const unsettled = record.leaves.filter((leaf) => !TERMINAL_LEAF_STATUSES.has(leaf.status));
     if (unsettled.length > 0) throw invariant("terminal run requires every accepted leaf to be terminal/interrupted");

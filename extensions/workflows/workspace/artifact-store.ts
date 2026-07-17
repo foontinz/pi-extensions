@@ -8,6 +8,7 @@ import type {
   ArtifactFileRecord,
   ArtifactStatusEntry,
   BaselineRecord,
+  IntegrationWorkspaceRecord,
   ProvisionedWorktreeResult,
   WorkspaceArtifact,
   WorkspaceArtifactManifest,
@@ -209,7 +210,7 @@ export class WorkspaceArtifactStore {
   }
 
   /** Apply into a newly-created detached integration worktree. Conflicted worktrees are always retained. */
-  async apply(id: string, repositoryRoot: string, base = "HEAD"): Promise<AppliedWorkspace> {
+  async apply(id: string, repositoryRoot: string, base = "HEAD", ownerSessionId?: string): Promise<AppliedWorkspace> {
     const artifact = await this.verifyArtifact(id);
     const repo = await fs.realpath(repositoryRoot);
     if ((await this.repositoryId(repo)) !== artifact.manifest.repositoryId) throw new Error("artifact belongs to a different repository");
@@ -228,8 +229,16 @@ export class WorkspaceArtifactStore {
     const importedParent = await this.gitText(repo, ["rev-parse", `${artifact.manifest.snapshotCommit}^`]);
     if (importedParent !== artifact.manifest.baselineCommit) throw new Error("artifact snapshot is not based on the recorded baseline");
 
+    const integrationId = opaqueId();
     const tempParent = await fs.mkdtemp(path.join(os.tmpdir(), "pi-workflow-integration-"));
     const worktreeRoot = path.join(tempParent, "worktree");
+    const now = new Date().toISOString();
+    let integration: IntegrationWorkspaceRecord = {
+      version: 1, integrationId, artifactId: id, ...(ownerSessionId ? { ownerSessionId } : {}),
+      state: "provisioning", root: worktreeRoot, tempParent, repositoryRoot: repo, targetRef: base,
+      conflicts: [], createdAt: now, updatedAt: now,
+    };
+    await this.writeIntegration(integration);
     let added = false;
     try {
       await this.git(repo, ["worktree", "add", "--detach", "--quiet", worktreeRoot, base]);
@@ -244,28 +253,67 @@ export class WorkspaceArtifactStore {
       }
 
       if (artifact.manifest.files["full.patch"].bytes === 0) {
-        return { artifactId: id, state: "applied", root: worktreeRoot, tempParent, repositoryRoot: repo, conflicts: [] };
+        integration = await this.updateIntegration(integration, "applied");
+        return appliedProjection(integration);
       }
       const result = await this.git(worktreeRoot, ["apply", "--3way", "--binary", path.join(artifact.directory, "full.patch")], true);
-      if (result.ok) return { artifactId: id, state: "applied", root: worktreeRoot, tempParent, repositoryRoot: repo, conflicts: [] };
+      if (result.ok) {
+        integration = await this.updateIntegration(integration, "applied");
+        return appliedProjection(integration);
+      }
       const conflicts = splitNul((await this.git(worktreeRoot, ["diff", "--name-only", "--diff-filter=U", "-z"])).stdout)
         .map((item) => validateRelativePath(item));
       if (conflicts.length > 0) {
-        return { artifactId: id, state: "conflicted", root: worktreeRoot, tempParent, repositoryRoot: repo, conflicts };
+        integration = await this.updateIntegration(integration, "conflicted", { conflicts });
+        return appliedProjection(integration);
       }
       throw new Error(`git apply failed: ${result.stderr.toString("utf8").trim()}`);
     } catch (error) {
       // Conflicts return above. Other failed integrations have no useful state and are safely removed.
-      if (added) await this.git(repo, ["worktree", "remove", "--force", worktreeRoot], true).catch(() => ({ ok: false as const, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }));
+      if (added) {
+        const removed = await this.git(repo, ["worktree", "remove", "--force", worktreeRoot], true).catch(() => ({ ok: false as const, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }));
+        if (!removed.ok) {
+          await this.updateIntegration(integration, "recovery_required", { reason: `apply cleanup failed: ${removed.stderr.toString("utf8").trim()}` }).catch(() => {});
+          throw error;
+        }
+      }
       await fs.rm(tempParent, { recursive: true, force: true }).catch(() => {});
+      await this.updateIntegration(integration, "cleaned", { reason: `apply failed: ${errorMessage(error)}` }).catch(() => {});
       throw error;
     }
   }
 
-  /** Idempotent cleanup for a successful integration worktree returned by apply(). */
-  async releaseApplied(applied: AppliedWorkspace): Promise<void> {
-    if (await exists(applied.root)) await this.git(applied.repositoryRoot, ["worktree", "remove", "--force", applied.root], true);
-    await fs.rm(applied.tempParent, { recursive: true, force: true });
+  async getIntegration(id: string): Promise<IntegrationWorkspaceRecord> {
+    this.assertId(id);
+    return this.readJson<IntegrationWorkspaceRecord>(path.join(this.integrationDir(id), "record.json"));
+  }
+
+  /** Idempotent owner-checked cleanup resolved only from a durable opaque ID. */
+  async releaseApplied(integrationId: string, ownerSessionId?: string): Promise<void> {
+    this.assertId(integrationId);
+    await this.withIntegrationLock(integrationId, async () => {
+      let record = await this.getIntegration(integrationId);
+      if (ownerSessionId && record.ownerSessionId !== ownerSessionId) throw new Error("integration workspace belongs to another owner");
+      if (record.state === "cleaned") return;
+      const expectedRoot = path.join(record.tempParent, "worktree");
+      if (path.resolve(record.root) !== path.resolve(expectedRoot) || !path.basename(record.tempParent).startsWith("pi-workflow-integration-")) {
+        throw new Error("integration workspace paths failed confinement validation");
+      }
+      record = await this.updateIntegration(record, "cleanup_pending");
+      let listed = (await this.git(record.repositoryRoot, ["worktree", "list", "--porcelain", "-z"])).stdout.toString("utf8");
+      if (await exists(record.root) || listed.includes(record.root)) {
+        const removed = await this.git(record.repositoryRoot, ["worktree", "remove", "--force", record.root], true);
+        if (!removed.ok) await this.git(record.repositoryRoot, ["worktree", "prune", "--expire", "now"], true);
+        listed = (await this.git(record.repositoryRoot, ["worktree", "list", "--porcelain", "-z"])).stdout.toString("utf8");
+        if (listed.includes(record.root)) {
+          const reason = `integration cleanup left a registered worktree: ${record.root}`;
+          await this.updateIntegration(record, "recovery_required", { reason });
+          throw new Error(reason);
+        }
+      }
+      await fs.rm(record.tempParent, { recursive: true, force: true });
+      await this.updateIntegration(record, "cleaned", { reason: undefined });
+    });
   }
 
   private async captureLocked(initial: WorkspaceLeaseRecord): Promise<WorkspaceArtifact> {
@@ -279,6 +327,11 @@ export class WorkspaceArtifactStore {
 
     const unresolved = await this.git(record.workspaceRoot, ["ls-files", "-u", "-z"]);
     const porcelain = await this.git(record.workspaceRoot, ["status", "--porcelain=v2", "-z", "--untracked-files=all"]);
+    const nestedRepository = await findUntrackedNestedRepository(record.workspaceRoot, porcelain.stdout);
+    if (nestedRepository) {
+      await this.transition(record, "retained", { reason: `nested repository unsupported: ${nestedRepository}` });
+      throw new Error(`workspace retained: nested repository is unsupported (${nestedRepository})`);
+    }
     if (unresolved.stdout.length > 0) {
       await this.transition(record, "retained", { reason: "unresolved index entries" });
       throw new Error("workspace retained: unresolved index entries cannot be captured safely");
@@ -399,12 +452,21 @@ export class WorkspaceArtifactStore {
   }
 
   private async cleanupOwnedWorktree(record: WorkspaceLeaseRecord, allowUnverified = false): Promise<void> {
+    if (!await exists(record.workspaceRoot)) {
+      const listed = (await this.git(record.repositoryRoot, ["worktree", "list", "--porcelain", "-z"])).stdout.toString("utf8");
+      if (listed.includes(record.workspaceRoot)) throw new Error("workspace is absent but its Git registration remains");
+      await fs.rm(record.tempParent, { recursive: true, force: true });
+      return;
+    }
     await this.validateOwnedWorktree(record);
     const status = await this.git(record.workspaceRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
     if (status.stdout.length > 0 && !allowUnverified && !record.artifactId) {
       throw new Error("refusing to delete changed workspace without a verified artifact");
     }
-    if (record.artifactId && !allowUnverified) await this.verifyArtifact(record.artifactId);
+    if (record.artifactId && !allowUnverified) {
+      const artifact = await this.verifyArtifact(record.artifactId);
+      await this.verifyWorkspaceMatchesArtifact(record, artifact);
+    }
     await this.git(record.repositoryRoot, ["worktree", "unlock", record.workspaceRoot], true);
     const removed = await this.git(record.repositoryRoot, ["worktree", "remove", "--force", record.workspaceRoot], true);
     if (!removed.ok) throw new Error(`git worktree removal failed: ${removed.stderr.toString("utf8").trim()}`);
@@ -413,8 +475,22 @@ export class WorkspaceArtifactStore {
     if (listed.includes(record.workspaceRoot)) throw new Error("worktree registration remains after cleanup");
   }
 
+  private async verifyWorkspaceMatchesArtifact(record: WorkspaceLeaseRecord, artifact: WorkspaceArtifact): Promise<void> {
+    if (!record.baseline) throw new Error("baseline missing while verifying workspace cleanup");
+    const snapshot = await this.createSnapshot(record.workspaceRoot, record.baseline.commit, this.leaseDir(record.id), `cleanup-${randomBytes(4).toString("hex")}`);
+    try {
+      if (snapshot.tree !== artifact.manifest.snapshotTree) {
+        throw new Error("workspace changed after artifact capture; refusing cleanup and retaining for recovery");
+      }
+    } finally { await fs.rm(snapshot.indexPath, { force: true }).catch(() => {}); }
+  }
+
   private async deleteBaselineRef(record: WorkspaceLeaseRecord): Promise<void> {
-    if (record.baseline) await this.git(record.repositoryRoot, ["update-ref", "-d", record.baseline.ref], true);
+    if (!record.baseline) return;
+    const deleted = await this.git(record.repositoryRoot, ["update-ref", "-d", record.baseline.ref], true);
+    if (!deleted.ok) throw new Error(`failed to delete baseline ref ${record.baseline.ref}: ${deleted.stderr.toString("utf8").trim()}`);
+    const remaining = await this.git(record.repositoryRoot, ["show-ref", "--verify", "--quiet", record.baseline.ref], true);
+    if (remaining.ok) throw new Error(`baseline ref remains after cleanup: ${record.baseline.ref}`);
   }
 
   private async repositoryId(repo: string): Promise<string> {
@@ -440,6 +516,7 @@ export class WorkspaceArtifactStore {
     await fs.mkdir(path.join(this.root, "leases"), { recursive: true, mode: 0o700 });
     await fs.mkdir(path.join(this.root, "artifacts"), { recursive: true, mode: 0o700 });
     await fs.mkdir(path.join(this.root, "staging"), { recursive: true, mode: 0o700 });
+    await fs.mkdir(path.join(this.root, "integrations"), { recursive: true, mode: 0o700 });
     await fs.mkdir(path.join(this.root, "locks"), { recursive: true, mode: 0o700 });
   }
 
@@ -452,6 +529,22 @@ export class WorkspaceArtifactStore {
 
   private async writeLease(record: WorkspaceLeaseRecord): Promise<void> {
     await this.atomicJson(path.join(this.leaseDir(record.id), "record.json"), record);
+  }
+
+  private async writeIntegration(record: IntegrationWorkspaceRecord): Promise<void> {
+    const directory = this.integrationDir(record.integrationId);
+    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+    await this.atomicJson(path.join(directory, "record.json"), record);
+  }
+  private async updateIntegration(
+    record: IntegrationWorkspaceRecord,
+    state: IntegrationWorkspaceRecord["state"],
+    changes: Partial<IntegrationWorkspaceRecord> = {},
+  ): Promise<IntegrationWorkspaceRecord> {
+    const next = { ...record, ...changes, state, updatedAt: new Date().toISOString() };
+    if (changes.reason === undefined) delete next.reason;
+    await this.writeIntegration(next);
+    return next;
   }
 
   private async atomicJson(file: string, value: unknown): Promise<void> {
@@ -509,26 +602,40 @@ export class WorkspaceArtifactStore {
   private async withLeaseLock<T>(id: string, action: () => Promise<T>): Promise<T> {
     this.assertId(id);
     await this.initialize();
-    const lock = path.join(this.root, "locks", `${id}.lock`);
-    let handle: fs.FileHandle;
-    try {
-      handle = await fs.open(lock, "wx", 0o600);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`lease ${id} is busy`);
-      throw error;
+    const release = await this.acquireStoreLock(path.join(this.root, "locks", `${id}.lock`), `lease ${id} is busy`);
+    try { return await action(); } finally { await release(); }
+  }
+
+  private async withIntegrationLock<T>(id: string, action: () => Promise<T>): Promise<T> {
+    await this.initialize();
+    const release = await this.acquireStoreLock(path.join(this.root, "locks", `integration-${id}.lock`), `integration ${id} is busy`);
+    try { return await action(); } finally { await release(); }
+  }
+
+  private async acquireStoreLock(lock: string, busyMessage: string): Promise<() => Promise<void>> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let handle: fs.FileHandle | undefined;
+      try {
+        handle = await fs.open(lock, "wx", 0o600);
+        await handle.writeFile(`${JSON.stringify({ pid: process.pid, createdAt: Date.now() })}\n`);
+        await handle.sync();
+        await handle.close();
+        return async () => { await fs.rm(lock, { force: true }); };
+      } catch (error) {
+        await handle?.close().catch(() => {});
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        let pid: number | undefined;
+        try { pid = (JSON.parse(await fs.readFile(lock, "utf8")) as { pid?: number }).pid; } catch { throw new Error(busyMessage); }
+        if (pid && processIsLive(pid)) throw new Error(busyMessage);
+        await fs.rm(lock, { force: true });
+      }
     }
-    try {
-      await handle.writeFile(`${process.pid}\n`);
-      await handle.sync();
-      return await action();
-    } finally {
-      await handle.close();
-      await fs.rm(lock, { force: true });
-    }
+    throw new Error(busyMessage);
   }
 
   private leaseDir(id: string): string { return path.join(this.root, "leases", id); }
   private artifactDir(id: string): string { return path.join(this.root, "artifacts", id); }
+  private integrationDir(id: string): string { return path.join(this.root, "integrations", id); }
   private assertId(id: string): void { if (!ID_PATTERN.test(id)) throw new Error("invalid opaque workspace id"); }
 
   private async gitText(cwd: string, args: string[], env?: NodeJS.ProcessEnv, input?: Buffer): Promise<string> {
@@ -571,6 +678,18 @@ export class WorkspaceArtifactStore {
   }
 }
 
+function appliedProjection(record: IntegrationWorkspaceRecord): AppliedWorkspace {
+  if (record.state !== "applied" && record.state !== "conflicted") throw new Error(`integration ${record.integrationId} is not ready`);
+  return {
+    integrationId: record.integrationId,
+    artifactId: record.artifactId,
+    state: record.state,
+    root: record.root,
+    tempParent: record.tempParent,
+    repositoryRoot: record.repositoryRoot,
+    conflicts: [...record.conflicts],
+  };
+}
 function opaqueId(): string { return randomBytes(24).toString("base64url"); }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function splitNul(data: Buffer): string[] { return data.toString("utf8").split("\0").filter(Boolean); }
@@ -589,6 +708,10 @@ function validateRelativePath(input: string): string {
     throw new Error(`unsafe artifact path: ${JSON.stringify(input)}`);
   }
   return input;
+}
+function processIsLive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
 }
 function boundedInteger(value: number, min: number, max: number, name: string): number {
   if (!Number.isSafeInteger(value) || value < min || value > max) throw new Error(`${name} must be an integer between ${min} and ${max}`);
@@ -627,6 +750,18 @@ function parsePorcelainV1(data: Buffer): ArtifactStatusEntry[] {
     } else result.push({ status, path: currentPath });
   }
   return result;
+}
+
+async function findUntrackedNestedRepository(workspaceRoot: string, porcelain: Buffer): Promise<string | undefined> {
+  for (const field of splitNul(porcelain)) {
+    if (!field.startsWith("? ")) continue;
+    const relative = validateRelativePath(field.slice(2).replace(/\/$/, ""));
+    const candidate = confinedPath(workspaceRoot, relative);
+    try {
+      if ((await fs.stat(candidate)).isDirectory() && await exists(path.join(candidate, ".git"))) return relative;
+    } catch { /* disappeared between status and inspection; snapshot will handle it */ }
+  }
+  return undefined;
 }
 
 function hasDirtySubmodule(porcelain: Buffer): boolean {

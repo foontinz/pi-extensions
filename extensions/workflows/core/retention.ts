@@ -36,6 +36,7 @@ function retentionReason(record: WorkflowRunRecordV1, referenced: Set<string>, n
   if (record.notification.state !== "delivered") return "pending notification";
   if (record.cleanup.status !== "completed") return `cleanup ${record.cleanup.status}`;
   if (record.artifacts.some((artifact) => artifact.state === "pending" || artifact.state === "recovery_required")) return "owned artifact";
+  if (record.artifacts.some((artifact) => artifact.kind === "workspace" && artifact.state === "verified")) return "unapplied workspace artifact";
   if (referenced.has(record.runId)) return "retained lineage reference";
   if (record.expiresAt === undefined || record.expiresAt > now) return "not expired";
   return undefined;
