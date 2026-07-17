@@ -134,25 +134,6 @@ export class BudgetManager {
   }
 }
 
-interface CooldownState { until: number; attempts: number }
-
-/** Provider/model-keyed 429 cooldown shared by all Workflow roots in-process. */
-export class ProviderCooldowns {
-  private readonly states = new Map<string, CooldownState>();
-
-  nextDelay(key: string, retryAfterMs?: number, now = Date.now(), random = Math.random): number {
-    const previous = this.states.get(key) ?? { until: now, attempts: 0 };
-    const exponentialCap = Math.min(30_000, 500 * 2 ** Math.min(previous.attempts, 10));
-    const fallback = Math.floor(random() * Math.max(1, exponentialCap));
-    const delay = Math.max(0, retryAfterMs ?? fallback, previous.until - now);
-    this.states.set(key, { until: now + delay, attempts: previous.attempts + 1 });
-    return delay;
-  }
-
-  success(key: string): void { this.states.delete(key); }
-  remaining(key: string, now = Date.now()): number { return Math.max(0, (this.states.get(key)?.until ?? now) - now); }
-}
-
 function normalizeUsage(value: number): number {
   return Number.isFinite(value) && value > 0 ? Math.ceil(value) : 0;
 }

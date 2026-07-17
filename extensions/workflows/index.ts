@@ -318,7 +318,7 @@ function projectSnapshot(record: WorkflowRunRecordV1): WorkflowSnapshot {
   const agents = record.leaves.map((leaf, index): WorkflowAgentView => ({
     index, label: leaf.label ?? leaf.agentId, ...(leaf.phase ? { phase: leaf.phase } : {}),
     status: leaf.status === "backoff" ? "retrying" : leaf.status === "interrupted" || leaf.status === "skipped" ? "cancelled" : leaf.status === "cached" ? "completed" : leaf.status,
-    attempt: Math.max(1, leaf.attempts.length), maxRetries: 0,
+    attempt: 1, maxRetries: 0,
     ...(leaf.startedAt ? { startedAt: leaf.startedAt } : {}), ...(leaf.finishedAt ? { finishedAt: leaf.finishedAt } : {}),
     ...(leaf.failure ? { reason: leaf.failure.reason } : {}),
   }));

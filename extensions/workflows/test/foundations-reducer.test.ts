@@ -24,7 +24,7 @@ function running() {
 function leaf(): WorkflowLeafRecordV1 {
   return {
     leafId: "leaf-1", nodeId: "root/agent:scan", agentId: "scan", status: "queued", acceptedAt: 3, deadlineAt: 100,
-    effects: "none", cachePolicy: "off", executionFingerprint: hash, attempts: [], artifactIds: [],
+    effects: "none", cachePolicy: "off", executionFingerprint: hash, artifactIds: [],
   };
 }
 
@@ -68,12 +68,8 @@ test("notification delivery cannot alter execution outcome", () => {
   assert.equal(changed.notification.state, "failed");
 });
 
-test("provider attempts account at most once and duplicate identities fail", () => {
+test("leaf identities remain unique", () => {
   const accepted = reduceWorkflowEvent(running(), { type: "LeafAccepted", leaf: leaf() }, { now: 3 }).next;
-  const attempt = { attemptId: "provider-1", leafId: "leaf-1", startedAt: 4, settledAt: 5, status: "settled" as const, costState: "unavailable" as const };
-  const once = reduceWorkflowEvent(accepted, { type: "ProviderAttemptSettled", leafId: "leaf-1", attempt }, { now: 5 }).next;
-  const twice = reduceWorkflowEvent(once, { type: "ProviderAttemptSettled", leafId: "leaf-1", attempt }, { now: 6 }).next;
-  assert.equal(twice.leaves[0].attempts.length, 1);
   assert.throws(() => reduceWorkflowEvent(accepted, { type: "LeafAccepted", leaf: { ...leaf(), leafId: "other", nodeId: "other" } }, { now: 3 }), /duplicate.*agent/i);
 });
 

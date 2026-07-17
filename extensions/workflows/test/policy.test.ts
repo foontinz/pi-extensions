@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { BudgetManager, FairSemaphore, ProviderCooldowns } from "../runtime/policy.js";
+import { BudgetManager, FairSemaphore } from "../runtime/policy.js";
 
 test("fair semaphore is FIFO, cancellation-aware, and release-idempotent", async () => {
   const semaphore = new FairSemaphore(1);
@@ -41,12 +41,3 @@ test("unbounded budget still tracks reservations and spend", () => {
   assert.deepEqual(budget.snapshot(), { total: null, spent: 12, reserved: 0, remaining: null });
 });
 
-test("provider cooldown honors retry-after and shared keyed deadlines", () => {
-  const cooldowns = new ProviderCooldowns();
-  assert.equal(cooldowns.nextDelay("p/m", 2_000, 10_000, () => 0), 2_000);
-  assert.equal(cooldowns.remaining("p/m", 10_500), 1_500);
-  // Existing later deadline wins over a shorter retry-after.
-  assert.equal(cooldowns.nextDelay("p/m", 100, 10_500, () => 0), 1_500);
-  cooldowns.success("p/m");
-  assert.equal(cooldowns.remaining("p/m", 10_500), 0);
-});

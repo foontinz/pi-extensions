@@ -101,7 +101,7 @@ Default activation is `ask`. Headless ask fails closed. `autonomous` and `explic
 
 ## Accounting boundary
 
-Budgets and aggregate usage are durable and unknown cost is displayed as unavailable, never as zero. Pi's current nested-session API does not expose every raw provider retry/attempt with independent usage, so the engine does not fabricate provider-attempt counts; those counters remain zero until the SDK provides that boundary.
+Budgets and aggregate leaf usage are durable, committed at most once, and unknown cost is displayed as unavailable rather than zero. Raw provider requests, retries, 429 details, and per-request usage are intentionally out of scope; the engine does not fabricate them.
 
 ## Security boundary
 

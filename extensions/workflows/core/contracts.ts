@@ -90,8 +90,6 @@ export interface WorkflowUsage {
   costState: WorkflowCostState;
   contextTokens: number;
   turns: number;
-  providerAttempts: number;
-  providerRetries: number;
   structuredSubmissions: number;
   leafAttempts: number;
   cacheHits: number;
@@ -145,15 +143,6 @@ export interface WorkflowAttemptRecordV1 {
   status: "running" | "completed" | "failed" | "cancelled" | "interrupted";
   error?: WorkflowErrorV1;
 }
-export interface WorkflowProviderAttemptV1 {
-  attemptId: string;
-  leafId: string;
-  startedAt: number;
-  settledAt?: number;
-  status: "running" | "settled" | "unreconciled";
-  usage?: WorkflowUsage;
-  costState: WorkflowCostState;
-}
 export interface WorkflowLeafRecordV1 {
   leafId: string;
   nodeId: string;
@@ -169,7 +158,6 @@ export interface WorkflowLeafRecordV1 {
   artifactPolicy?: WorkflowArtifactPolicy;
   cachePolicy: WorkflowCachePolicy;
   executionFingerprint: string;
-  attempts: WorkflowProviderAttemptV1[];
   result?: JsonValue;
   failure?: WorkflowLeafFailure;
   transcriptPath?: string;
@@ -250,7 +238,6 @@ export type WorkflowRunEvent =
   | { type: "LeafAccepted"; leaf: WorkflowLeafRecordV1 }
   | { type: "LeafStatusChanged"; leafId: string; status: WorkflowLeafStatus; at: number; failure?: WorkflowLeafFailure; result?: JsonValue }
   | { type: "LeafReferencesChanged"; leafId: string; transcriptPath?: string; workspaceLeaseId?: string; artifactIds?: string[] }
-  | { type: "ProviderAttemptSettled"; leafId: string; attempt: WorkflowProviderAttemptV1 }
   | { type: "UsageAdded"; usage: WorkflowUsage }
   | { type: "ArtifactRecorded"; artifact: WorkflowArtifactRecordV1 }
   | { type: "OutputRecorded"; output: WorkflowOutputDescriptorV1 }
@@ -297,6 +284,6 @@ export type AgentRecord = WorkflowLeafRecordV1;
 export function emptyWorkflowUsage(): WorkflowUsage {
   return {
     input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: null, costState: "unavailable", contextTokens: 0, turns: 0,
-    providerAttempts: 0, providerRetries: 0, structuredSubmissions: 0, leafAttempts: 0, cacheHits: 0,
+    structuredSubmissions: 0, leafAttempts: 0, cacheHits: 0,
   };
 }

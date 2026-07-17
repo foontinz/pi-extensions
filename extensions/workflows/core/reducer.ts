@@ -121,7 +121,7 @@ export function reduceWorkflowEvent(record: WorkflowRunRecordV1, event: Workflow
       if (next.leaves.some((leaf) => leaf.leafId === event.leaf.leafId || leaf.nodeId === event.leaf.nodeId || leaf.agentId === event.leaf.agentId)) {
         throw invariant("duplicate leaf/node/agent id in workflow scope");
       }
-      if (event.leaf.status !== "queued" || event.leaf.attempts.length !== 0) throw invariant("accepted leaf must be queued with no provider attempts");
+      if (event.leaf.status !== "queued") throw invariant("accepted leaf must be queued");
       next.leaves.push(structuredClone(event.leaf));
       next.usage.leafAttempts += 1;
       break;
@@ -149,19 +149,6 @@ export function reduceWorkflowEvent(record: WorkflowRunRecordV1, event: Workflow
       if (event.transcriptPath !== undefined) leaf.transcriptPath = event.transcriptPath;
       if (event.workspaceLeaseId !== undefined) leaf.workspaceLeaseId = event.workspaceLeaseId;
       if (event.artifactIds !== undefined) leaf.artifactIds = [...event.artifactIds];
-      break;
-    }
-    case "ProviderAttemptSettled": {
-      const leaf = findLeaf(next, event.leafId);
-      const existing = next.leaves.flatMap((item) => item.attempts).find((attempt) => attempt.attemptId === event.attempt.attemptId);
-      if (existing) {
-        if (!isDeepStrictEqual(existing, event.attempt)) throw invariant("provider attempt accounted more than once");
-        break;
-      }
-      if (event.attempt.leafId !== leaf.leafId || event.attempt.status === "running") throw invariant("provider attempt settlement is invalid");
-      leaf.attempts.push(structuredClone(event.attempt));
-      next.usage.providerAttempts += 1;
-      if (event.attempt.usage) next.usage = addUsage(next.usage, event.attempt.usage);
       break;
     }
     case "UsageAdded":
@@ -266,22 +253,17 @@ export function assertWorkflowRunInvariants(value: unknown): asserts value is Wo
   if (!Array.isArray(value.attempts) || !Array.isArray(value.leaves) || !Array.isArray(value.failures) || !Array.isArray(value.artifacts)) throw invariant("aggregate collections are invalid");
   assertCleanup(value.cleanup); assertNotification(value.notification); assertBudget(value.budget);
   if (!plain(value.usage)) throw invariant("usage is invalid");
-  for (const key of ["input", "output", "cacheRead", "cacheWrite", "contextTokens", "turns", "providerAttempts", "providerRetries", "structuredSubmissions", "leafAttempts", "cacheHits"]) finite(value.usage[key], `usage.${key}`);
+  for (const key of ["input", "output", "cacheRead", "cacheWrite", "contextTokens", "turns", "structuredSubmissions", "leafAttempts", "cacheHits"]) finite(value.usage[key], `usage.${key}`);
   if (value.usage.cost !== null) finite(value.usage.cost, "usage.cost");
   if (!new Set(["reported", "estimated", "unavailable"]).has(value.usage.costState)) throw invariant("usage cost state invalid");
-  const leafIds = new Set<string>(); const nodeIds = new Set<string>(); const agentIds = new Set<string>(); const providerIds = new Set<string>();
+  const leafIds = new Set<string>(); const nodeIds = new Set<string>(); const agentIds = new Set<string>();
   for (const leaf of value.leaves as WorkflowLeafRecordV1[]) {
     if (!plain(leaf) || !LEAF_STATUSES.has(leaf.status)) throw invariant("invalid leaf");
     nonempty(leaf.leafId, "leafId"); nonempty(leaf.nodeId, "nodeId"); nonempty(leaf.agentId, "agentId");
     if (leafIds.has(leaf.leafId) || nodeIds.has(leaf.nodeId) || agentIds.has(leaf.agentId)) throw invariant("duplicate leaf identity");
     leafIds.add(leaf.leafId); nodeIds.add(leaf.nodeId); agentIds.add(leaf.agentId);
     finite(leaf.acceptedAt, "leaf.acceptedAt"); finite(leaf.deadlineAt, "leaf.deadlineAt");
-    if (!Array.isArray(leaf.attempts) || !Array.isArray(leaf.artifactIds)) throw invariant("leaf collections invalid");
-    for (const attempt of leaf.attempts) {
-      nonempty(attempt.attemptId, "provider attempt id");
-      if (providerIds.has(attempt.attemptId)) throw invariant("duplicate provider attempt id");
-      providerIds.add(attempt.attemptId);
-    }
+    if (!Array.isArray(leaf.artifactIds)) throw invariant("leaf artifacts invalid");
     if (TERMINAL_LEAF_STATUSES.has(leaf.status) && leaf.finishedAt === undefined) throw invariant("terminal leaf missing finishedAt");
   }
   if (value.leaves.length > Math.min(value.metadata.maxAgents, MAX_WORKFLOW_AGENTS)) throw invariant("agent cap exceeded");
@@ -339,9 +321,8 @@ function addUsage(a: WorkflowRunRecordV1["usage"], b: WorkflowRunRecordV1["usage
     cost: a.cost === null && b.cost === null ? null : (a.cost ?? 0) + (b.cost ?? 0),
     costState: a.costState === "reported" || b.costState === "reported" ? "reported" : a.costState === "estimated" || b.costState === "estimated" ? "estimated" : "unavailable",
     contextTokens: Math.max(a.contextTokens, b.contextTokens), turns: a.turns + b.turns,
-    // Provider-attempt, leaf-attempt, and cache-hit counters are committed by
-    // their owning reducer events, never trusted from aggregate usage payloads.
-    providerAttempts: a.providerAttempts, providerRetries: a.providerRetries + b.providerRetries,
+    // Leaf-attempt and cache-hit counters are committed by their owning
+    // reducer events, never trusted from aggregate usage payloads.
     structuredSubmissions: a.structuredSubmissions + b.structuredSubmissions, leafAttempts: a.leafAttempts, cacheHits: a.cacheHits,
   };
 }

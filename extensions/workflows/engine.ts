@@ -469,7 +469,7 @@ class RunCoordinator {
       effects: resolved.effects, ...(resolved.artifactPolicy ? { artifactPolicy: resolved.artifactPolicy } : {}),
       cachePolicy: resolved.cachePolicy,
       executionFingerprint: hashCanonical({ root: this.record.executionFingerprint, id: options.id, task: request.task, phase, resolved, schema: options.schema ?? null, inputManifest: options.inputManifest ?? null }),
-      attempts: [], artifactIds: [],
+      artifactIds: [],
     };
     await this.transition({ type: "LeafAccepted", leaf });
     if (this.source.parsed.metadata.resumable) {
@@ -644,8 +644,6 @@ class RunCoordinator {
       costState: result.usage.cost > 0 ? "reported" as const : "unavailable" as const,
       contextTokens: result.usage.contextTokens,
       turns: result.usage.turns,
-      providerAttempts: 0,
-      providerRetries: 0,
       structuredSubmissions: result.structuredOutputOutcome?.submissions ?? 0,
       leafAttempts: 0,
       cacheHits: 0,
