@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 
 export type WorkflowSourceKind = "inline" | "path" | "builtin" | "user" | "project";
 
@@ -131,7 +131,7 @@ function resolved(kind: WorkflowSourceKind, source: string, sourceDirectory: str
 function findProjectWorkflowRoot(cwd: string): string | null {
   let current = path.resolve(cwd);
   while (true) {
-    const candidate = path.join(current, ".pi", "workflows");
+    const candidate = path.join(current, CONFIG_DIR_NAME, "workflows");
     try { if (fs.statSync(candidate).isDirectory()) return candidate; } catch {}
     const parent = path.dirname(current);
     if (parent === current) return null;
