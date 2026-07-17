@@ -316,6 +316,81 @@ test("wall-clock deadline catches synchronous session creation and prompt work",
   assert.equal(promptResult.output, "late output");
 });
 
+test("schema mode always enables StructuredOutput, corrects in one session, ignores text, and appends its prompt last", async () => {
+  let observedTools: string[] | undefined;
+  let observedAppend: string[] = [];
+  let promptCalls = 0;
+  let structuredTool: any;
+  const session = fakeSession({
+    prompt: async () => {
+      promptCalls += 1;
+      const invalid = await structuredTool.execute("one", { value: { answer: "bad" } }, undefined, undefined, {});
+      assert.equal(invalid.terminate, false);
+      const valid = await structuredTool.execute("two", { value: { answer: 42 } }, undefined, undefined, {});
+      assert.equal(valid.terminate, true);
+    },
+    messages: [{ role: "assistant", content: [{ type: "text", text: "{\"answer\":999}" }] }],
+  });
+
+  const result = await runSubagentInProcess(
+    {
+      task: "return answer",
+      cwd: process.cwd(),
+      tools: [],
+      appendSystemPrompt: ["caller append"],
+      schema: {
+        type: "object",
+        properties: { answer: { type: "integer" } },
+        required: ["answer"],
+        additionalProperties: false,
+      },
+    },
+    async (options) => {
+      observedTools = options?.tools;
+      observedAppend = options?.resourceLoader?.getAppendSystemPrompt() ?? [];
+      structuredTool = options?.customTools?.find((tool) => tool.name === "StructuredOutput");
+      return { session } as CreateAgentSessionResult;
+    },
+  );
+
+  assert.equal(promptCalls, 1, "correction stays in the same child session");
+  assert.ok(observedTools?.includes("StructuredOutput"), "effective empty allowlist must retain StructuredOutput");
+  assert.equal(observedAppend[0], "caller append");
+  assert.match(observedAppend.at(-1) ?? "", /MANDATORY FINAL RETURN INSTRUCTION/);
+  assert.equal(result.output, "", "assistant text is not a return channel in schema mode");
+  assert.deepEqual(result.structuredOutput, { answer: 42 });
+  assert.deepEqual(result.structuredOutputOutcome, {
+    status: "accepted",
+    value: { answer: 42 },
+    submissions: 2,
+  });
+});
+
+test("schema mode returns typed missing outcome when no tool submission is made", async () => {
+  const session = fakeSession({
+    messages: [{ role: "assistant", content: [{ type: "text", text: "I forgot the tool" }] }],
+  });
+  const result = await runSubagentInProcess(
+    { task: "return", cwd: process.cwd(), schema: { type: "object" } },
+    async () => ({ session } as CreateAgentSessionResult),
+  );
+  assert.equal(result.output, "");
+  assert.equal(result.error?.reason, "error");
+  assert.deepEqual(result.structuredOutputOutcome, { status: "missing", submissions: 0, diagnostics: [] });
+});
+
+test("without a schema JSON-looking assistant text remains exact text", async () => {
+  const exact = "  {\"answer\":42}\n";
+  const session = fakeSession({ messages: [{ role: "assistant", content: [{ type: "text", text: exact }] }] });
+  const result = await runSubagentInProcess(
+    { task: "return", cwd: process.cwd() },
+    async () => ({ session } as CreateAgentSessionResult),
+  );
+  assert.equal(result.output, exact);
+  assert.equal(result.structuredOutput, undefined);
+  assert.equal(result.structuredOutputOutcome, undefined);
+});
+
 test("explicit thinking level is forwarded to createAgentSession", async () => {
   let observedThinking: unknown;
   const session = fakeSession({

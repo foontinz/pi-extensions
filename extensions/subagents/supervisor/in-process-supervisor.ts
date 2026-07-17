@@ -19,6 +19,13 @@ import {
 import { getSharedMcpGateway } from "../mcp/gateway.js";
 import { createMcpProxyTool } from "../mcp/proxy-tool.js";
 import { createBareResourceLoader, getSharedModelRuntime, resolveModelPattern } from "../core/in-process-runner.js";
+import {
+  createStructuredOutputCapability,
+  STRUCTURED_OUTPUT_TOOL_NAME,
+  type StructuredOutputCapability,
+  type StructuredOutputOutcome,
+  type StructuredOutputSchema,
+} from "../core/structured-output.js";
 
 export interface InProcessStartOptions {
   cwd: string;
@@ -30,6 +37,8 @@ export interface InProcessStartOptions {
   mcp?: boolean;
   model?: string;
   thinking?: string;
+  /** Enable the mandatory StructuredOutput return channel. */
+  schema?: StructuredOutputSchema;
   /**
    * Combined append prompt (agent + user + JSON addendum). Appended to pi's default
    * coding system prompt, matching the subprocess `--append-system-prompt` behavior.
@@ -49,6 +58,7 @@ export interface InProcessStartOptions {
 export interface InProcessOutcome {
   aborted: boolean;
   error?: string;
+  structuredOutputOutcome?: StructuredOutputOutcome;
 }
 
 export interface InProcessHandle {
@@ -74,6 +84,7 @@ export function startInProcessAgent(options: InProcessStartOptions): InProcessHa
   let automaticCompletionRetryUsed = false;
   let pendingOutcome: InProcessOutcome | undefined;
   let session: AgentSession | undefined;
+  let structuredOutput: StructuredOutputCapability | undefined;
   let disposedSession: AgentSession | undefined;
   let unsubscribe: (() => void) | undefined;
   let startupSignalAttached = false;
@@ -160,8 +171,16 @@ export function startInProcessAgent(options: InProcessStartOptions): InProcessHa
       if (forceAborted) return;
       const model = resolveModelPattern(options.model, modelRuntime);
       handle.modelResolved = !options.model || model !== undefined;
+      structuredOutput = options.schema
+        ? createStructuredOutputCapability({ schema: options.schema })
+        : undefined;
       const customTools: ToolDefinition[] = [];
       let toolAllowlist = options.tools.length > 0 ? [...options.tools] : undefined;
+      if (structuredOutput) {
+        customTools.push(structuredOutput.tool);
+        if (!toolAllowlist) toolAllowlist = [STRUCTURED_OUTPUT_TOOL_NAME];
+        else if (!toolAllowlist.includes(STRUCTURED_OUTPUT_TOOL_NAME)) toolAllowlist.push(STRUCTURED_OUTPUT_TOOL_NAME);
+      }
       if (options.mcp) {
         customTools.push(createMcpProxyTool(getSharedMcpGateway(options.cwd, getAgentDir())) as ToolDefinition);
         if (toolAllowlist && !toolAllowlist.includes("mcp")) toolAllowlist = [...toolAllowlist, "mcp"];
@@ -172,7 +191,10 @@ export function startInProcessAgent(options: InProcessStartOptions): InProcessHa
         modelRuntime,
         model: model as never,
         thinkingLevel: options.thinking as never,
-        resourceLoader: createBareResourceLoader(undefined, options.appendSystemPrompt ? [options.appendSystemPrompt] : []),
+        resourceLoader: createBareResourceLoader(undefined, [
+          ...(options.appendSystemPrompt ? [options.appendSystemPrompt] : []),
+          ...(structuredOutput ? [structuredOutput.finalReturnPrompt] : []),
+        ]),
         tools: toolAllowlist,
         noTools: toolAllowlist && toolAllowlist.length === 0 ? "all" : undefined,
         customTools: customTools.length > 0 ? customTools : undefined,
@@ -204,13 +226,26 @@ export function startInProcessAgent(options: InProcessStartOptions): InProcessHa
 
       try {
         await session.prompt(options.task);
-        finish({ aborted });
+        if (structuredOutput) {
+          const structuredOutputOutcome = structuredOutput.outcome();
+          finish({
+            aborted,
+            structuredOutputOutcome,
+            error: structuredOutputOutcome.status === "accepted"
+              ? undefined
+              : structuredOutputOutcome.status === "exhausted"
+                ? `structured output exhausted: ${structuredOutputOutcome.reason}`
+                : "structured output missing: the child did not submit a valid value",
+          });
+        } else {
+          finish({ aborted });
+        }
       } finally {
         disposeSession();
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      finish({ aborted, error: message });
+      finish({ aborted, error: message, structuredOutputOutcome: structuredOutput?.outcome() });
       disposeSession();
     }
   })();

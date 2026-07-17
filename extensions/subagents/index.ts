@@ -42,6 +42,7 @@ import {
 } from "./core/job-store.js";
 import { DEFAULT_RUN_RETENTION_MS, pruneOldRuns } from "./core/run-archive.js";
 import { reduceJobEvent } from "./core/state-machine.js";
+import type { StructuredOutputOutcome, StructuredOutputSchema } from "./core/structured-output.js";
 import { disposeSharedMcpGateway } from "./mcp/gateway.js";
 import { startInProcessAgent, type InProcessHandle, type InProcessOutcome } from "./supervisor/in-process-supervisor.js";
 import { getLogWindow as buildLogWindow, getLogsSince as buildLogsSince, type LogWindow } from "./output/log-window.js";
@@ -150,6 +151,8 @@ interface AgentJob {
   task: string;
   effectiveTools: string[];
   mcp?: boolean;
+  schemaMode?: boolean;
+  structuredOutputOutcome?: StructuredOutputOutcome;
   cwd: string;
   sourceCwd: string;
   worktree?: WorktreeInfo;
@@ -243,6 +246,9 @@ const RunAgentParams = Type.Object({
       maxItems: 64,
     }),
   ),
+  schema: Type.Optional(Type.Record(Type.String(), Type.Unknown(), {
+    description: "Optional JSON Schema Draft 2020-12 object schema. The child must return through StructuredOutput; assistant text is ignored.",
+  })),
   cwd: Type.Optional(Type.String({ description: "Optional working directory for the subagent. Relative paths resolve from current cwd." })),
   worktree: Type.Optional(
     Type.Boolean({
@@ -724,6 +730,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       "When started inside a git repo, the child runs in a temporary detached worktree by default; .pi/worktree.json controls copied files and post-copy setup scripts. Pass worktree:false to run in-place or worktree:true to require isolation. Pass keepWorktree:'onFailure' or 'always' to retain temp worktrees for inspection.",
       `By default, subagents receive only active read-only tools (${DEFAULT_SUBAGENT_TOOLS.join("/")}); omit tools for portable read-only delegation because some sessions do not expose grep/find/ls as separate tools. Pass tools explicitly to grant write, execute, network, or other higher-risk capabilities. Recursive subagent tools are denied in children by default.`,
       "Can run a named user-owned markdown agent or an ad-hoc subagent with optional systemPrompt/tools and an explicit model override only when requested.",
+      "Pass schema for a validated JSON Schema Draft 2020-12 object returned through the mandatory StructuredOutput tool; invalid submissions are corrected in the same child session.",
     ].join(" "),
     promptSnippet: "Start a non-blocking background Pi subagent job and return a job id.",
     promptGuidelines: [
@@ -736,6 +743,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       `Omit tools for the portable safe read-only default (${DEFAULT_SUBAGENT_TOOLS.join(", ")} when active); do not explicitly pass grep/find/ls unless they are active in the parent session. Pass tools explicitly only when the subagent needs additional capabilities, for example read+bash when shell access is acceptable. Do not grant recursive subagent tools to child agents.`,
       "Do not set the model parameter unless the user explicitly requests a specific model/provider; omit it to use the child Pi default and avoid provider/API-key mismatches.",
       "Subagents do not inherit the parent conversation; include all necessary context in the task, systemPrompt, named agent, files, or repo context.",
+      "When a strict object result is required, pass schema; StructuredOutput remains enabled even with tools:[], accepts at most five submissions, and assistant text is ignored in schema mode.",
       "Each subagent persists its full session transcript (JSONL) under the Transcript directory shown in the start result and finish callback; read/grep it to inspect progress or what the agent actually did. Don't poll — the final result arrives via callback.",
     ],
     parameters: RunAgentParams,
@@ -1272,6 +1280,7 @@ async function startAgentJob(
     task: params.task,
     effectiveTools,
     mcp: params.mcp,
+    schemaMode: params.schema !== undefined,
     repoKey,
     cwd,
     sourceCwd,
@@ -1319,7 +1328,14 @@ async function startAgentJob(
   }
   if (worktreePrep.warning) addLog(job, "error", worktreePrep.warning, "worktree");
 
-  launchInProcessJob(job, { combinedPrompt, model, thinking, signal, onInitialRecordPersisted });
+  launchInProcessJob(job, {
+    combinedPrompt,
+    model,
+    thinking,
+    schema: params.schema as StructuredOutputSchema | undefined,
+    signal,
+    onInitialRecordPersisted,
+  });
   return job;
 }
 
@@ -1330,6 +1346,7 @@ function launchInProcessJob(job: AgentJob, opts: {
   combinedPrompt: string;
   model?: string;
   thinking?: string;
+  schema?: StructuredOutputSchema;
   signal?: AbortSignal;
   onInitialRecordPersisted?: () => void;
 }): void {
@@ -1352,6 +1369,7 @@ function launchInProcessJob(job: AgentJob, opts: {
       mcp: job.mcp,
       model: opts.model,
       thinking: opts.thinking,
+      schema: opts.schema,
       appendSystemPrompt: opts.combinedPrompt || undefined,
       signal: opts.signal,
       // Persist the full transcript into an isolated per-job dir (read/grep-able).
@@ -1375,6 +1393,7 @@ function launchInProcessJob(job: AgentJob, opts: {
 
 function finalizeInProcessJob(job: AgentJob, outcome: InProcessOutcome): void {
   if (job.finishedAt) return;
+  job.structuredOutputOutcome = outcome.structuredOutputOutcome;
   if (outcome.error) {
     finalizeJob(job, "failed", undefined, undefined, outcome.error);
     return;
@@ -1676,6 +1695,7 @@ function durableSubagentResult(result: SubagentResult | undefined): SubagentResu
     output,
     // Avoid persisting a full parsed duplicate when the text output was capped.
     structuredOutput: truncated ? undefined : result.structuredOutput,
+    structuredOutputOutcome: truncated ? undefined : result.structuredOutputOutcome,
     usage: { ...result.usage },
     error: result.error ? { ...result.error } : undefined,
     truncated,
@@ -1687,6 +1707,7 @@ function cloneSubagentResult(result: SubagentResult | undefined): SubagentResult
   return {
     output: result.output,
     structuredOutput: result.structuredOutput,
+    structuredOutputOutcome: result.structuredOutputOutcome,
     usage: { ...result.usage },
     error: result.error ? { ...result.error } : undefined,
     truncated: result.truncated,
@@ -2340,8 +2361,11 @@ function buildSubagentResult(job: AgentJob): SubagentResult {
   const terminalReason = job.terminal?.reason ?? terminalReasonForStatus(job.status);
   const message = job.errorMessage || job.terminal?.error || job.terminal?.message || defaultTerminalMessage(job);
   return {
-    output,
-    structuredOutput: parseJsonOutput(output),
+    output: job.schemaMode ? "" : output,
+    structuredOutput: job.schemaMode
+      ? job.structuredOutputOutcome?.status === "accepted" ? job.structuredOutputOutcome.value : undefined
+      : parseJsonOutput(output),
+    structuredOutputOutcome: job.structuredOutputOutcome,
     usage: { ...job.usage },
     error: job.status === "completed" && !job.errorMessage ? undefined : { reason: terminalReason, message },
   };

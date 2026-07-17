@@ -1,3 +1,5 @@
+import type { StructuredOutputOutcome } from "./structured-output.js";
+
 export const JOB_RECORD_SCHEMA_VERSION = 3 as const;
 /** Older durable schema versions that `hydrateJobRecord` can migrate forward from. */
 export const MIGRATABLE_JOB_RECORD_SCHEMA_VERSIONS = [2] as const;
@@ -69,6 +71,8 @@ export interface UsageStats {
 export interface SubagentResult {
   output: string;
   structuredOutput?: unknown;
+  /** Present when a schema requested the StructuredOutput return channel. */
+  structuredOutputOutcome?: StructuredOutputOutcome;
   usage: UsageStats;
   error?: { reason: TerminalReason; message: string };
   truncated?: boolean;

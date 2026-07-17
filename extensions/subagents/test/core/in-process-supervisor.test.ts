@@ -117,6 +117,48 @@ test("detaching the startup signal lets the acknowledged job outlive its parent 
   assert.equal(disposeCalls, 1);
 });
 
+test("run_agent supervisor shares the StructuredOutput channel with an empty allowlist", async () => {
+  let observedTools: string[] | undefined;
+  let observedAppend: string[] = [];
+  let structuredTool: any;
+  const session = fakeSession({
+    prompt: async () => {
+      const invalid = await structuredTool.execute("invalid", { value: [] }, undefined, undefined, {});
+      assert.equal(invalid.terminate, false);
+      const valid = await structuredTool.execute("valid", { value: { answer: 7 } }, undefined, undefined, {});
+      assert.equal(valid.terminate, true);
+    },
+  });
+  __inProcessSupervisorTest.setCreateAgentSession(async (options) => {
+    observedTools = options?.tools;
+    observedAppend = options?.resourceLoader?.getAppendSystemPrompt() ?? [];
+    structuredTool = options?.customTools?.find((tool) => tool.name === "StructuredOutput");
+    return { session } as any;
+  });
+
+  const outcomes: InProcessOutcome[] = [];
+  startInProcessAgent({
+    cwd: process.cwd(),
+    task: "structured",
+    tools: [],
+    appendSystemPrompt: "named and caller prompt",
+    schema: { type: "object", properties: { answer: { type: "integer" } }, required: ["answer"] },
+    onEvent: () => {},
+    onDone: (outcome) => outcomes.push(outcome),
+  });
+  await tick();
+  await tick();
+
+  assert.ok(observedTools?.includes("StructuredOutput"));
+  assert.equal(observedAppend[0], "named and caller prompt");
+  assert.match(observedAppend.at(-1) ?? "", /MANDATORY FINAL RETURN INSTRUCTION/);
+  assert.deepEqual(outcomes, [{
+    aborted: false,
+    structuredOutputOutcome: { status: "accepted", value: { answer: 7 }, submissions: 2 },
+    error: undefined,
+  }]);
+});
+
 test("completion callback failures are retried without duplicating disposal", async () => {
   let completionCalls = 0;
   let disposeCalls = 0;

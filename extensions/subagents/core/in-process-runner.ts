@@ -16,7 +16,15 @@ import {
 import { getSharedMcpGateway } from "../mcp/gateway.js";
 import { createMcpProxyTool } from "../mcp/proxy-tool.js";
 import { formatToolCall, previewToolResult } from "../output/message-format.js";
+import {
+  createStructuredOutputCapability,
+  STRUCTURED_OUTPUT_TOOL_NAME,
+  type StructuredOutputCapability,
+  type StructuredOutputSchema,
+} from "./structured-output.js";
 import { emptyUsageStats, type SubagentResult, type TerminalReason, type UsageStats } from "./types.js";
+
+export type { StructuredOutputOptions, StructuredOutputOutcome, StructuredOutputSchema } from "./structured-output.js";
 
 // Shared, process-wide runtime so fanned-out agents don't each rebuild auth/model
 // state (decision E). Creation is async in Pi 0.80.8+, so concurrent callers
@@ -112,6 +120,8 @@ export interface InProcessSubagentOptions {
   appendSystemPrompt?: readonly string[];
   thinkingLevel?: SubagentThinkingLevel;
   timeoutMs?: number;
+  /** Enable the mandatory StructuredOutput tool return channel for this schema. */
+  schema?: StructuredOutputSchema;
   /**
    * Give the agent a shared `mcp` gateway tool that forwards to the process-wide
    * MCP connection pool (servers connected once, reused across agents).
@@ -168,8 +178,22 @@ export async function runSubagentInProcess(
     }
   };
 
+  let structuredOutput: StructuredOutputCapability | undefined;
+  try {
+    if (options.schema) structuredOutput = createStructuredOutputCapability({ schema: options.schema });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { output: "", usage: emptyUsageStats(), error: { reason: "error", message } };
+  }
+
   const customTools: ToolDefinition[] = [];
   let toolAllowlist = options.tools ? [...options.tools] : undefined;
+  if (structuredOutput) {
+    customTools.push(structuredOutput.tool);
+    // Schema mode is usable even with an explicitly empty built-in allowlist.
+    if (!toolAllowlist) toolAllowlist = [STRUCTURED_OUTPUT_TOOL_NAME];
+    else if (!toolAllowlist.includes(STRUCTURED_OUTPUT_TOOL_NAME)) toolAllowlist.push(STRUCTURED_OUTPUT_TOOL_NAME);
+  }
   if (options.mcp) {
     const gateway = getSharedMcpGateway(options.cwd, getAgentDir());
     customTools.push(createMcpProxyTool(gateway) as ToolDefinition);
@@ -238,7 +262,7 @@ export async function runSubagentInProcess(
     // the event loop, so also enforce the recorded wall-clock deadline directly.
     if (!cancellation && deadline !== undefined && performance.now() >= deadline) cancel(timeoutCancellation());
   };
-  const partialResult = (target: Session): Pick<SubagentResult, "output" | "usage"> => {
+  const partialResult = (target: Session): Pick<SubagentResult, "output" | "structuredOutput" | "structuredOutputOutcome" | "usage"> => {
     let entries: unknown[] = [];
     try {
       entries = sessionManager.getEntries();
@@ -264,7 +288,14 @@ export async function runSubagentInProcess(
     if (messages) {
       try { usage.turns = countAssistantTurns(messages); } catch {}
     }
-    return { output, usage };
+    if (!structuredOutput) return { output, usage };
+    const structuredOutputOutcome = structuredOutput.outcome();
+    return {
+      output: "",
+      structuredOutput: structuredOutputOutcome.status === "accepted" ? structuredOutputOutcome.value : undefined,
+      structuredOutputOutcome,
+      usage,
+    };
   };
 
   // Both cancellation sources start before createSession, so startup is part of
@@ -305,7 +336,12 @@ export async function runSubagentInProcess(
         cwd: options.cwd,
         agentDir: getAgentDir(),
         modelRuntime,
-        resourceLoader: createBareResourceLoader(options.systemPrompt, options.appendSystemPrompt),
+        resourceLoader: createBareResourceLoader(
+          options.systemPrompt,
+          structuredOutput
+            ? [...(options.appendSystemPrompt ?? []), structuredOutput.finalReturnPrompt]
+            : options.appendSystemPrompt,
+        ),
         thinkingLevel: options.thinkingLevel,
         tools: toolAllowlist,
         noTools: toolAllowlist && toolAllowlist.length === 0 ? "all" : undefined,
@@ -428,18 +464,57 @@ export async function runSubagentInProcess(
       const entries = sessionManager.getEntries();
       const usage = usageFromSession(session, entries);
       const messages = ((session as { messages?: unknown[] }).messages ?? []) as unknown[];
-      const output = extractLastAssistantText(messages);
+      const output = structuredOutput ? "" : extractLastAssistantText(messages);
       const turns = countAssistantTurns(messages);
       // Surface a model-side terminal error (stopReason "error"/"aborted") that would
       // otherwise be reported as a silent empty-string success.
       const failure = detectAssistantFailure(messages);
       if (failure) {
-        return { output, usage: { ...usage, turns }, sessionFile: persistedTranscript(), error: failure };
+        if (!structuredOutput) return { output, usage: { ...usage, turns }, sessionFile: persistedTranscript(), error: failure };
+        const structuredOutputOutcome = structuredOutput.outcome();
+        return {
+          output: "",
+          structuredOutput: structuredOutputOutcome.status === "accepted" ? structuredOutputOutcome.value : undefined,
+          structuredOutputOutcome,
+          usage: { ...usage, turns },
+          sessionFile: persistedTranscript(),
+          error: failure,
+        };
       }
-      return { output, structuredOutput: parseJsonOutput(output), usage: { ...usage, turns }, sessionFile: persistedTranscript() };
+      if (structuredOutput) {
+        const structuredOutputOutcome = structuredOutput.outcome();
+        if (structuredOutputOutcome.status !== "accepted") {
+          const message = structuredOutputOutcome.status === "exhausted"
+            ? `structured output exhausted: ${structuredOutputOutcome.reason}`
+            : "structured output missing: the child did not submit a valid value";
+          return {
+            output: "",
+            structuredOutputOutcome,
+            usage: { ...usage, turns },
+            sessionFile: persistedTranscript(),
+            error: { reason: "error", message },
+          };
+        }
+        return {
+          output: "",
+          structuredOutput: structuredOutputOutcome.value,
+          structuredOutputOutcome,
+          usage: { ...usage, turns },
+          sessionFile: persistedTranscript(),
+        };
+      }
+      return { output, usage: { ...usage, turns }, sessionFile: persistedTranscript() };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      return { output: "", usage: emptyUsageStats(), sessionFile: persistedTranscript(), error: { reason: "error", message } };
+      const structuredOutputOutcome = structuredOutput?.outcome();
+      return {
+        output: "",
+        structuredOutput: structuredOutputOutcome?.status === "accepted" ? structuredOutputOutcome.value : undefined,
+        structuredOutputOutcome,
+        usage: emptyUsageStats(),
+        sessionFile: persistedTranscript(),
+        error: { reason: "error", message },
+      };
     }
   } finally {
     if (timeout) clearTimeout(timeout);
@@ -571,16 +646,6 @@ function countAssistantTurns(messages: readonly unknown[]): number {
     if ((message as { role?: unknown }).role === "assistant") turns += 1;
   }
   return Math.max(turns, 1);
-}
-
-function parseJsonOutput(output: string): unknown | undefined {
-  const trimmed = output.trim();
-  if (!trimmed) return undefined;
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-    return undefined;
-  }
 }
 
 export const __inProcessRunnerTest = {

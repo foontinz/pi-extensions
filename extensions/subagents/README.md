@@ -47,10 +47,16 @@ run_agent({
   "tools": ["read", "bash"]
 })
 
-// Final subagent output is always requested as JSON. If you need a specific
-// shape, state it in the task; otherwise the child uses {"output": string}.
+// Without schema, final output retains the legacy assistant-text behavior.
+// Pass a Draft 2020-12 object schema for a validated StructuredOutput return.
 run_agent({
-  "task": "Return JSON with the top three suspect files"
+  "task": "Return the top three suspect files",
+  "schema": {
+    "type": "object",
+    "properties": { "files": { "type": "array", "items": { "type": "string" }, "maxItems": 3 } },
+    "required": ["files"],
+    "additionalProperties": false
+  }
 })
 
 // Disable worktree isolation for read-only/recon work that needs live uncommitted files.
@@ -66,9 +72,9 @@ run_agent({
 })
 
 // 3. The final result is sent back to the parent Pi session when the job finishes.
-// Terminal job details include `result: { output, usage, error?, truncated? }`
-// alongside the legacy `finalOutput` preview fields. `output` is the final
-// assistant text, which subagents are instructed to make valid JSON.
+// Terminal job details include `result: { output, structuredOutput?,
+// structuredOutputOutcome?, usage, error?, truncated? }` alongside the legacy
+// `finalOutput` preview fields. In schema mode assistant text is ignored.
 // If you need to wait for results, end the turn rather than blocking with sleep/polling;
 // Pi will wake you up when subagent callbacks arrive.
 

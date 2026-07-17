@@ -99,32 +99,48 @@ test("agent returns null on failure and records it", async () => {
   assert.match(runner.failuresList[0].reason, /boom/);
 });
 
-test("schema retry succeeds on second attempt", async () => {
-  let n = 0;
-  const runner = makeRunner(async () => (++n === 1 ? ok("not json") : ok('{"answer":42}', { answer: 42 })));
-  const result = await runner.run(`return await agent("q", { schema: { required: ["answer"] } });`);
-  assert.deepEqual(result, { answer: 42 });
-  assert.equal(n, 2);
-});
-
-test("schema correction attempts remain visibly retrying", async () => {
+test("schema result uses the typed same-session StructuredOutput outcome", async () => {
   const controller = new AbortController();
   let calls = 0;
-  const statuses: string[] = [];
+  let forwardedSchema: unknown;
   const runner = new WorkflowRunner(
     "/tmp",
     undefined,
     controller.signal,
     () => {},
-    async () => (++calls === 1 ? ok("invalid") : ok('{"answer":42}', { answer: 42 })),
-    (snapshot) => {
-      const status = snapshot.agents[0]?.status;
-      if (status) statuses.push(status);
+    async (options) => {
+      calls += 1;
+      forwardedSchema = options.schema;
+      return {
+        ...ok("ignored assistant text"),
+        structuredOutput: { answer: 42 },
+        structuredOutputOutcome: { status: "accepted", value: { answer: 42 }, submissions: 2 },
+      };
     },
   );
-  await runner.run(`return await agent("q", { schema: { required: ["answer"] } });`);
-  assert.ok(statuses.includes("retrying"));
-  assert.equal(runner.snapshot().agents[0].status, "completed");
+  const result = await runner.run(`return await agent("q", { schema: { required: ["answer"] }, retries: 9 });`);
+  assert.deepEqual(result, { answer: 42 });
+  assert.deepEqual(forwardedSchema, { required: ["answer"] });
+  assert.equal(calls, 1, "schema correction must not start replacement child sessions");
+});
+
+test("schema missing/exhausted outcomes fail deterministically", async () => {
+  const outcomes: SubagentResult["structuredOutputOutcome"][] = [
+    { status: "missing", submissions: 1, diagnostics: ["invalid"] },
+    { status: "exhausted", reason: "max-submissions", submissions: 5, diagnostics: ["invalid"] },
+  ];
+  for (const outcome of outcomes) {
+    const runner = makeRunner(async () => ({ ...ok("ignored"), structuredOutputOutcome: outcome }));
+    const result = await runner.run(`return await agent("q", { schema: { type: "object" } });`);
+    assert.equal(result, null);
+    assert.match(runner.failuresList[0]!.reason, /structured output (missing|exhausted)/);
+  }
+});
+
+test("without a schema agent returns exact text even when it looks like JSON", async () => {
+  const exact = "  {\"answer\":42}\n";
+  const runner = makeRunner(async () => ok(exact, { answer: 42 }));
+  assert.equal(await runner.run(`return await agent("q");`), exact);
 });
 
 test("ordinary executor errors are not retried", async () => {

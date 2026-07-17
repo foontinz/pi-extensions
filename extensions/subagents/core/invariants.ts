@@ -69,8 +69,11 @@ const WORKTREE_SCRIPT_KEYS = new Set(["command", "cwd", "optional", "timeoutMs",
 const TERMINAL_KEYS = new Set(["phase", "reason", "finishedAt", "exitCode", "signal", "message", "error"]);
 const PENDING_TERMINAL_KEYS = new Set(["reason", "requestedAt", "observedAt", "exitCode", "signal", "message", "error"]);
 const OBSERVABILITY_KEYS = new Set(["finalOutput", "result", "latestAssistantText", "logs", "messageCount", "lastLogAt"]);
-const SUBAGENT_RESULT_KEYS = new Set(["output", "structuredOutput", "usage", "error", "truncated"]);
+const SUBAGENT_RESULT_KEYS = new Set(["output", "structuredOutput", "structuredOutputOutcome", "usage", "error", "truncated"]);
 const SUBAGENT_RESULT_ERROR_KEYS = new Set(["reason", "message"]);
+const STRUCTURED_ACCEPTED_KEYS = new Set(["status", "value", "submissions"]);
+const STRUCTURED_MISSING_KEYS = new Set(["status", "submissions", "diagnostics"]);
+const STRUCTURED_EXHAUSTED_KEYS = new Set(["status", "reason", "submissions", "diagnostics"]);
 const OBSERVABILITY_LOG_KEYS = new Set(["seq", "timestamp", "level", "text", "eventType"]);
 const OBSERVABILITY_LOG_LEVELS = new Set(DURABLE_LOG_LEVEL_VALUES);
 
@@ -258,6 +261,34 @@ function assertSubagentResult(value: unknown, path: string): asserts value is Su
   }
   if (value.truncated !== undefined && typeof value.truncated !== "boolean") throw invariant(`${path}.truncated must be boolean`);
   if (value.structuredOutput !== undefined) assertJsonCompatible(value.structuredOutput, `${path}.structuredOutput`);
+  if (value.structuredOutputOutcome !== undefined) assertStructuredOutputOutcome(value.structuredOutputOutcome, `${path}.structuredOutputOutcome`);
+}
+
+function assertStructuredOutputOutcome(value: unknown, path: string): void {
+  if (!isRecord(value)) throw invariant(`${path} must be an object`);
+  const keys = value.status === "accepted"
+    ? STRUCTURED_ACCEPTED_KEYS
+    : value.status === "missing"
+      ? STRUCTURED_MISSING_KEYS
+      : value.status === "exhausted"
+        ? STRUCTURED_EXHAUSTED_KEYS
+        : undefined;
+  if (!keys) throw invariant(`invalid ${path}.status ${String(value.status)}`);
+  assertAllowedKeys(value, keys, path);
+  if (!Number.isInteger(value.submissions) || (value.submissions as number) < 0 || (value.submissions as number) > 5) {
+    throw invariant(`${path}.submissions must be an integer from 0 to 5`);
+  }
+  if (value.status === "accepted") {
+    if (!isRecord(value.value)) throw invariant(`${path}.value must be an object`);
+    assertJsonCompatible(value.value, `${path}.value`);
+    return;
+  }
+  if (!Array.isArray(value.diagnostics) || value.diagnostics.length > 5 || value.diagnostics.some((entry) => typeof entry !== "string")) {
+    throw invariant(`${path}.diagnostics must be an array of at most 5 strings`);
+  }
+  if (value.status === "exhausted" && value.reason !== "max-submissions" && value.reason !== "duplicate-valid") {
+    throw invariant(`invalid ${path}.reason ${String(value.reason)}`);
+  }
 }
 
 function assertUsageStatsAt(value: unknown, path: string): void {

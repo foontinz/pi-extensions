@@ -9,6 +9,7 @@ import {
   runSubagentInProcess,
   type SubagentThinkingLevel,
 } from "../subagents/core/in-process-runner.js";
+import type { StructuredOutputSchema } from "../subagents/core/structured-output.js";
 import { DEFAULT_RUN_RETENTION_MS, pruneOldRuns } from "../subagents/core/run-archive.js";
 import { addUsage, emptyUsageStats, type SubagentResult, type UsageStats } from "../subagents/core/types.js";
 import { createWorktree, WorktreeStartupCleanupError } from "../subagents/workspace/create-worktree.js";
@@ -19,10 +20,7 @@ import { renderWorkflowCall, renderWorkflowResult } from "./ui/tool-render.js";
 
 export type AgentExecutor = (options: InProcessSubagentOptions) => Promise<SubagentResult>;
 
-interface AgentSchema {
-  required?: string[];
-  description?: string;
-}
+export type AgentSchema = StructuredOutputSchema;
 
 interface AgentOptions {
   label?: string;
@@ -210,7 +208,7 @@ export default function workflowsExtension(pi: ExtensionAPI) {
       "Workflow agents inherit the root session's selected thinking level; pass opts.thinking ('off' through 'max') to override it per agent.",
       "Reviews and verification are often time-consuming; give them generous overall timeoutMs and per-agent opts.timeoutMs instead of short deadlines.",
       "Hooks (async): agent(task, opts) -> result; parallel(items, fn); pipeline(items, fns); workflow(script). Sync: phase(name); log(...); args(); failures().",
-      "agent() returns null on failure (recorded in failures()). Pass opts.schema.required for JSON-shape validation + retry.",
+      "agent() returns exact assistant text without a schema, and null on failure (recorded in failures()). Pass a JSON Schema Draft 2020-12 object as opts.schema to require the StructuredOutput tool; invalid submissions are corrected in the same child session (maximum five).",
       "Pass opts.worktree:true to run a write-heavy agent in its own git worktree (requires a git repo, auto torn down); opts.cwd sets a lightweight shared-tree subdir.",
       "Pass opts.mcp:true to give an agent a shared `mcp` gateway tool (MCP servers are connected once per process and reused across agents).",
       "Return a value from the script to set the workflow output. Pass background:false to wait for the result inline.",
@@ -1034,7 +1032,10 @@ export class WorkflowRunner {
     if (++this.launchedCount > MAX_AGENTS) throw new Error(`workflow agent cap exceeded (${MAX_AGENTS})`);
     const index = this.launchedCount - 1;
     const label = opts.label ?? `#${index}`;
-    const maxRetries = Math.max(0, opts.retries ?? 2);
+    // Schema correction happens through StructuredOutput inside one child
+    // session. The legacy retries option is retained for script compatibility
+    // but never starts replacement child sessions.
+    const maxRetries = 0;
     const baseCwd = opts.cwd ? path.resolve(this.cwd, opts.cwd) : this.cwd;
 
     const view: WorkflowAgentView = {
@@ -1087,45 +1088,43 @@ export class WorkflowRunner {
       view.status = "running";
       view.startedAt = Date.now();
       this.emit(`agent ${label} started`);
-      let lastReason = "no result";
-      let prompt = task;
       // Persist each agent's full transcript into <logDir>/agents/ so it can be
       // read/grepped after the fact. Filenames are timestamp-prefixed; the
       // events.log mapping line below ties an agent label/index to its file.
       const sessionDir = this.logDir ? path.join(this.logDir, "agents") : undefined;
       const sessionId = this.logDir ? `${this.runId || "run"}-a${index}` : undefined;
-      for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        // Keep the retry glyph/state visible throughout corrective attempts.
-        view.status = attempt === 0 ? "running" : "retrying";
-        const result = await this.runWith429Backoff(prompt, opts, effectiveCwd, view, sessionDir, sessionId);
-        this.usage = addUsage(this.usage, result.usage);
-        if (result.sessionFile) this.writeLog(`agent ${label} (#${index}) transcript: agents/${path.basename(result.sessionFile)}`);
-        // A workflow-level abort (external cancel or the overall timeout) cancels
-        // in-flight agents via the shared signal. Surface it as a rejection so the
-        // run fails loudly instead of resolving with silent nulls. A *per-agent*
-        // timeout (signal not aborted) is a recorded failure, not a workflow abort.
-        this.throwIfAborted();
-        if (result.error) {
-          // opts.retries is exclusively for schema correction. Ordinary executor
-          // failures get the separate 429 backoff policy, but are never rerun here.
-          lastReason = result.error.message;
-          break;
+      const result = await this.runWith429Backoff(task, opts, effectiveCwd, view, sessionDir, sessionId);
+      this.usage = addUsage(this.usage, result.usage);
+      if (result.sessionFile) this.writeLog(`agent ${label} (#${index}) transcript: agents/${path.basename(result.sessionFile)}`);
+      // A workflow-level abort (external cancel or the overall timeout) cancels
+      // in-flight agents via the shared signal. Surface it as a rejection so the
+      // run fails loudly instead of resolving with silent nulls. A *per-agent*
+      // timeout (signal not aborted) is a recorded failure, not a workflow abort.
+      this.throwIfAborted();
+
+      let lastReason: string | undefined;
+      let value: unknown = result.output;
+      if (result.error) {
+        lastReason = result.error.message;
+      } else if (opts.schema) {
+        const outcome = result.structuredOutputOutcome;
+        if (outcome?.status === "accepted") value = outcome.value;
+        else if (outcome?.status === "exhausted") lastReason = `structured output exhausted: ${outcome.reason}`;
+        else if (outcome?.status === "missing") lastReason = "structured output missing: the child did not submit a valid value";
+        else {
+          // Compatibility for injected executors: real in-process schema runs
+          // always return a typed outcome.
+          value = result.structuredOutput;
+          lastReason = validateSchema(value, opts.schema);
         }
-        const value = result.structuredOutput ?? result.output;
-        const schemaError = validateSchema(value, opts.schema);
-        if (!schemaError) {
-          succeeded = true;
-          view.status = "completed";
-          view.finishedAt = Date.now();
-          this.emit(`agent ${label} completed`);
-          return value;
-        }
-        lastReason = schemaError;
-        if (attempt >= maxRetries) break;
-        prompt = `${task}\n\nYour previous response was rejected: ${schemaError}. Return only valid JSON matching the required shape.`;
-        view.status = "retrying";
-        view.attempt = attempt + 1;
-        this.emit(`agent ${label} retry ${attempt + 1}/${maxRetries}: ${schemaError}`);
+      }
+
+      if (!lastReason) {
+        succeeded = true;
+        view.status = "completed";
+        view.finishedAt = Date.now();
+        this.emit(`agent ${label} completed`);
+        return value;
       }
       const failureReason = this.recordFailure(index, opts.label, lastReason);
       view.status = "failed";
@@ -1186,6 +1185,7 @@ export class WorkflowRunner {
         thinkingLevel: opts.thinking ?? this.defaultThinkingLevel,
         timeoutMs: opts.timeoutMs,
         mcp: opts.mcp,
+        schema: opts.schema,
         signal: this.runSignal,
         sessionDir,
         sessionId,
@@ -1294,7 +1294,10 @@ function validateSchema(value: unknown, schema?: AgentSchema): string | undefine
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     return `expected a JSON object${schema.description ? ` (${schema.description})` : ""}`;
   }
-  const missing = (schema.required ?? []).filter((key) => !(key in (value as Record<string, unknown>)));
+  const required = Array.isArray(schema.required)
+    ? schema.required.filter((key): key is string => typeof key === "string")
+    : [];
+  const missing = required.filter((key) => !(key in (value as Record<string, unknown>)));
   if (missing.length > 0) return `missing required keys: ${missing.join(", ")}`;
   return undefined;
 }

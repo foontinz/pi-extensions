@@ -56,7 +56,7 @@ With `background:false` it waits and returns the envelope:
 
 | hook | sync? | description |
 |------|-------|-------------|
-| `agent(task, opts?)` | async | Run one in-process subagent; resolves to its parsed JSON output when the child returned JSON, otherwise the child's **final assistant text** (the last assistant message that carries text, even if the run ends on a tool call). Returns `null` on failure (recorded in `failures()`); a model-side terminal error (`stopReason` error/aborted) is treated as a failure, not a silent empty success. |
+| `agent(task, opts?)` | async | Run one in-process subagent. Without `schema`, resolves to the child's **exact final assistant text**, including JSON-looking text. With `schema`, resolves to the object accepted through the mandatory `StructuredOutput` tool. Returns `null` on failure (recorded in `failures()`); a model-side terminal error (`stopReason` error/aborted) is treated as a failure, not a silent empty success. |
 | `parallel(items, fn)` | async | `Promise.all` fan-out over `items`. |
 | `pipeline(items, fns)` | async | Per item, thread the value through `fns` in order. |
 | `workflow(script)` | async | Run a nested workflow script in the same runner. |
@@ -78,8 +78,8 @@ With `background:false` it waits and returns the envelope:
   cwd?: string;              // run the agent in this dir (resolved against workflow cwd)
   worktree?: boolean;        // run in a dedicated git worktree (default false; requires a git repo)
   mcp?: boolean;             // inject a shared `mcp` gateway tool (process-wide MCP connection pool)
-  schema?: { required?: string[]; description?: string };  // JSON validate + retry
-  retries?: number;          // schema-validation retries, default 2
+  schema?: Record<string, unknown>; // JSON Schema Draft 2020-12; object root only
+  retries?: number;          // deprecated; correction stays in one child session (max 5 submissions)
 }
 ```
 
