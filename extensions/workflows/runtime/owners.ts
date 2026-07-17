@@ -50,10 +50,10 @@ export class WorkflowOwnerRegistry {
 
   finish(runId: string): void { this.runs.delete(runId); }
 
-  stop(runId: string, requestingOwner: WorkflowOwnerIdentity, reason: string, scopeAll = false): boolean {
+  stop(runId: string, requestingOwner: WorkflowOwnerIdentity, reason: unknown, scopeAll = false): boolean {
     const runtime = this.runs.get(runId);
     if (!runtime || (!scopeAll && runtime.owner.sessionId !== requestingOwner.sessionId)) return false;
-    runtime.controller.abort(new Error(reason));
+    runtime.controller.abort(reason instanceof Error ? reason : new Error(String(reason)));
     return true;
   }
 

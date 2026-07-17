@@ -1,219 +1,104 @@
-# workflows
+# Pi Workflows
 
-Always-available `Workflow` tool that orchestrates multiple **in-process**
-subagents (via the SDK `createAgentSession`, no `pi` subprocess / tmux). Depends on
-the `subagents` extension's in-process runner.
+Production local workflow orchestration with durable ownership, canonical metadata, bounded execution, recoverable artifacts, and one clean-break DSL.
 
-## When to use it
+## Public tools
 
-Use a `Workflow` when a task has several substantial, genuinely independent
-parts and parallel execution clearly saves time or context. Prefer direct tools
-for focused changes, quick investigations, tightly coupled edits, sequential
-debugging, and routine verification. Strong fits:
+- `Workflow` — launch exactly one inline/path/qualified-name source.
+- `workflow_status` — owner-scoped durable detail/list query; `scope:"all"` is explicit.
+- `workflow_output` — bounded read of tagged `output.json`.
+- `workflow_control` — `stop`, `pause`, `resume`, `skip`, `retry`, `pin`, `unpin`.
+- `workflow_apply` — verify/apply a workspace artifact into a fresh integration worktree.
+- `workflow_release_workspace` — idempotently release retained source/integration workspaces.
 
-- Parallel code review or repo-wide search + summarize
-- Batch refactors / migrations / codemods across many files
-- Generating tests or docs for many modules at once
-- Comparing multiple approaches in parallel
-- Multi-step pipelines (a planning `phase()` then `parallel()` agents)
+Commands:
 
-Parallel subagents can be faster than sequential work, and each gets its own
-context window. Prefer one coherent workflow over successive audit workflows.
-Routine phase checks should normally use focused direct tests; add an independent
-audit when risk, breadth, or the user warrants it. Inspect retained output before
-replacing a failed or timed-out workflow so completed work is not duplicated.
+- `/workflow run <builtin|user|project:id>` — explicit activation.
+- `/workflows` — owner-scoped history summary.
 
-## Tool: `Workflow`
+## Source and metadata
 
-Parameters (provide exactly one script source):
-- `script` — inline JavaScript orchestration script (top-level `await` supported). Persisted
-  to `<agentDir>/workflows/runs/` and the path is returned for edit + re-invoke.
-- `scriptPath` — path to a workflow script file (resolved against the session cwd).
-- `name` — a saved workflow under `<cwd>/.pi/workflows/<name>.js` or `<agentDir>/workflows/<name>.js`.
-- `args` — arbitrary JSON value exposed to the script via `args()`.
-- `timeoutMs` — overall workflow stall watchdog (default 30 min).
-- `background` — run in background and notify on completion (default `true`).
+Exactly one of `script`, `scriptPath`, or `name` is required. Names are always qualified:
 
-With `background:true` (default) the tool returns immediately with
-`{ runId, status: "running", scriptPath }` and delivers a `workflow-notification`
-custom message when the run finishes (see [Completion notifications](#completion-notifications)).
-Stop a running background run with the `stop_workflow` tool (see
-[Stopping a run](#stopping-a-run)).
-With `background:false` it waits and returns the envelope:
+```text
+builtin:code-review
+user:my-review
+project:my-review
+```
 
-```jsonc
-{
-  "runId": <string>,
-  "scriptPath": <string>,
-  "output": <script return value>,
-  "usage": { "input", "output", "cacheRead", "cacheWrite", "cost", "contextTokens", "turns" },
-  "agents": <number launched>,
-  "failures": [{ "index", "label?", "reason" }]
+Every source begins with a pure AST-literal export:
+
+```js
+export const meta = {
+  name: "review",
+  description: "Review changed code",
+  resumable: false,
+  maxAgents: 12,
+  capabilities: ["read"],
+  phases: [{ id: "review", title: "Review" }]
 }
 ```
 
-## Script hooks
+The parser rejects dynamic values, calls, identifiers, spreads, computed keys, methods/accessors, template literals, sparse arrays, duplicate/prototype-sensitive keys, TypeScript, missing required fields, duplicate phase IDs, and unknown metadata keys. The declaration is blanked without changing line/column offsets. The copied, hashed `script.js` in the run directory is executed—not the mutable original path.
 
-| hook | sync? | description |
-|------|-------|-------------|
-| `agent(task, opts?)` | async | Run one in-process subagent. Without `schema`, resolves to the child's **exact final assistant text**, including JSON-looking text. With `schema`, resolves to the object accepted through the mandatory `StructuredOutput` tool. Returns `null` on failure (recorded in `failures()`); a model-side terminal error (`stopReason` error/aborted) is treated as a failure, not a silent empty success. |
-| `parallel(items, fn)` | async | `Promise.all` fan-out over `items`. |
-| `pipeline(items, fns)` | async | Per item, thread the value through `fns` in order. |
-| `workflow(script)` | async | Run a nested workflow script in the same runner. |
-| `phase(name)` | sync | Emit a progress phase marker. |
-| `log(...values)` | sync | Emit a progress log line. |
-| `args()` | sync | The `args` input value. |
-| `failures()` | sync | Snapshot of recorded agent failures. |
+## Canonical hooks
 
-### `agent` options
-
-```ts
-{
-  label?: string;
-  tools?: string[];          // default: ["read","bash"]
-  systemPrompt?: string;
-  thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-                              // default: inherit the root session's selected level
-  timeoutMs?: number;        // per-agent
-  cwd?: string;              // run the agent in this dir (resolved against workflow cwd)
-  worktree?: boolean;        // run in a dedicated git worktree (default false; requires a git repo)
-  mcp?: boolean;             // inject a shared `mcp` gateway tool (process-wide MCP connection pool)
-  schema?: Record<string, unknown>; // JSON Schema Draft 2020-12; object root only
-  retries?: number;          // deprecated; correction stays in one child session (max 5 submissions)
-}
+```js
+agent(prompt, { id, ...options })
+parallel([() => agent(...), () => agent(...)])
+pipeline(items, stage1, stage2, ...)
+workflow({ name: "user:child" }, childArgs)
+workflow({ scriptPath: "./child.workflow.js" }, childArgs)
+phase(id)
+log(message)
+failures()
+args
+budget
 ```
 
-Reviews and verification are often time-consuming. Give them generous per-agent
-`timeoutMs` and overall workflow `timeoutMs` values rather than short deadlines.
+There are no old helper overloads. `parallel(items, fn)`, array-stage `pipeline`, raw nested workflow source, callable `args()`, and agent calls without IDs fail.
 
-## Live view (TUI)
+Operational leaf failures return `null` and appear in `failures()`. Script, contract, infrastructure, cancellation, pause, and recovery outcomes remain distinct.
 
-While a run is active — including background runs — a borderless dashboard is
-shown `belowEditor`, keyed per `runId` (no footer status line):
+## Effects
 
-```
-◆  ⠸ RUNNING  │  WORKFLOW  PHASE 2/2  synthesize       RUN 1/4 · ↑12k ↓4.1k · $0.083 · 0:42
-   ├─ ✓ crawl-docs    done                                                     0:12
-   ├─ ✗ fetch-legacy  timeout                                                  0:25
-   ├─ ⠸ summarize     → read extensions/workflows/index.ts                     0:03
-   └─ ↻ verify        retry 1/2 · correcting output                            0:05
-```
+- `effects:"none"` — enforced read-only tools only; no bash, MCP, or unknown custom tools.
+- `effects:"workspace", workspace:"isolated"` — dedicated Git worktree; verified artifact capture by default or explicit recorded discard.
+- `effects:"external"` — MCP/network/custom effects; non-cacheable.
 
-- The header shows run state, current phase, completed/launched count, rolled-up
-  token usage, cost, failures/rate limits, and elapsed time.
-- Every running agent row shows its **latest real activity**: its task while
-  queued/starting, streaming assistant text, current tool call/output, provider
-  retry, or compaction. The activity is updated in place without adding transcript
-  noise or triggering a render for every token.
-- Agent rows use glyphs: `✓` done · `✗` failed · `↻` retrying · spinner running ·
-  `·` queued. Running/retrying/failed agents are prioritized; the rest collapse
-  into a `… N more` line. Phase appears only once in the workflow header so each
-  row can prioritize its agent activity.
-- The view disappears a few seconds after the run finishes. Rendering is driven by
-  `WorkflowRunner.snapshot()` / `WorkflowSnapshot`; see `ui/dashboard.ts`. In RPC
-  mode the component factory is ignored (no widget is shown).
+Workspace capture records a baseline, full-index binary patch, Git object bundle, tracked/staged/unstaged/untracked changes, deletes, renames, modes and symlinks. Hash verification completes before cleanup. Dirty submodules and unresolved indexes retain the workspace for recovery. Apply never mutates the caller's working tree.
 
-## Stopping a run
+## Structured output
 
-A background run can be cancelled while in flight with the **`stop_workflow`** tool:
-`stop_workflow({ runId })` stops one run; omit `runId` (or pass `"all"`) to stop every
-running workflow. Optional `reason` is recorded on the run.
+`agent(..., { schema })` uses strict Ajv Draft 2020-12 validation and the mandatory `StructuredOutput({value})` tool in one child session. It supports local refs and standard formats, rejects remote/custom/async schemas, performs no coercion/defaulting/removal, allows at most five submissions, and ignores assistant text. Without a schema, JSON-looking text remains exact text.
 
-Stopping aborts the shared `AbortSignal`, which cancels in-flight subagents. The run
-ends as **cancelled** (not failed): the dashboard header switches to `CANCELLED`,
-in-flight rows switch to `⊘`, and the completion notice includes the stop reason. A
-turn abort (Esc) on a foreground run is treated the same way; the overall `timeoutMs`
-still ends the run as `failed`.
+## Durability
 
-## Completion notifications
+Each run uses a full UUID and owns:
 
-Background runs announce completion by injecting a `workflow-notification`
-**custom message** (via `pi.sendMessage`, not `sendUserMessage`). The full result
-(`formatSummary`) is always kept in LLM context; a registered message renderer
-controls only how the entry looks in the transcript, collapsing it like the
-`tool-view` extension:
-
-```
-✓ Workflow 97e85be8 completed · 5 agents · ↑3.5k ↓376
+```text
+run.json
+script.js
+output.json
+events.jsonl
+notification.json
+agents/*.jsonl
+artifacts/*
+journal.jsonl       # resumable only
 ```
 
-- **It reuses `tool-view`'s persisted flag** (`~/.pi/agent/tool-view.json` `mode`):
-  `minimized` / `medium` → the one-line summary above; `verbose` → the full body.
-  Toggle it with `/toolview` (no separate setting). When the flag file is absent
-  it defaults to collapsed.
-- Expanding the entry in the TUI always reveals the full body regardless of mode.
-- Failures render with a red `✗` and the error message.
+Snapshots use flushed temp-file replacement plus parent-directory flush where supported. Event/journal streams are append-only and bounded. Runtime controllers/workers/promises never enter persisted records. Output uses a bounded tagged encoding for cycles, aliases, BigInt, undefined, non-finite numbers, Date, Error, Map/Set, and binary values.
 
-The **`Workflow` tool call/result** itself is collapsed by the same flag too
-(the tool is custom, so `tool-view` cannot manage it directly — the extension
-registers its own `renderCall`/`renderResult`). Collapsed, a background start
-shows `▸ Workflow <id> started · background` and a foreground finish shows
-`✓ Workflow <id> done · N agents · ↑in ↓out`; `verbose`/expanded shows the full
-ack or summary. Errors are always shown.
+The reducer is the sole lifecycle owner. First terminal intent wins, terminal state is sticky, every accepted leaf settles/interupts, cleanup can upgrade to failure/recovery without erasing intent, and notification delivery never changes execution outcome.
 
-## Non-functional behavior
+## Resume and controls
 
-- **Concurrency:** capped at 8 simultaneous in-process agents (FIFO queue).
-- **Agent cap:** 100 agents per workflow run.
-- **Rate limits:** provider 429 / rate-limit errors are retried with exponential
-  backoff + jitter (up to 5 attempts).
-- **Usage rollup:** token usage is aggregated across all agents into `usage`.
-- **Abort:** the tool's abort signal, the stall watchdog, and session shutdown all
-  abort in-flight agents.
-- **Shared runtime:** all agents reuse one process-wide async `ModelRuntime`
-  (validated under concurrency) instead of rebuilding model/auth state per agent.
-- **Background delivery:** background runs notify the parent session with an idle-aware
-  custom `sendMessage` (`followUp` when idle, else `steer`).
+`resumable:true` enables checksummed journaling, exact source/args/execution-fingerprint validation, concurrent resume claims, torn-tail repair, pure-node cache replay, stable node controls, pause, skip, and conservative retry invalidation. Changed source, args, model, prompts, tools, schema, or engine fingerprint refuses resume. Effectful uncertain work becomes `recovery_required`; it is never rerun automatically.
 
-## Worktree isolation
+## Activation and trust
 
-`agent(task, { worktree: true })` provisions a dedicated detached git worktree from
-the resolved cwd (honoring `.pi/worktree.json` copy/postCopy config), runs the agent
-there, and tears it down when the agent finishes. Use it for **parallel write-heavy**
-agents that must not share a working tree; read-mostly fan-out is fine on the shared
-cwd (pi serializes same-file writes via `withFileMutationQueue`). Worktree creation
-across the whole process is bounded by a shared slot semaphore
-(`PI_SUBAGENTS_MAX_WORKTREE_CREATIONS`, default 4). The provisioning logic is shared
-with `run_agent` via `subagents/workspace/create-worktree.ts`.
+Default activation is `ask`. Headless ask fails closed. `autonomous` and `explicit-only` are explicit settings. Approval binds source hash, concrete model, available tools, capabilities, maximum agents, and budget. Project workflows require active Pi project trust and canonical containment; symlink/traversal escape is rejected.
 
-The flag mirrors `run_agent`'s `worktree`, with two intentional differences: here it
-defaults to **`false`** (fan-out shares one working tree) and there is **no `auto`
-mode** — pass `worktree: true` explicitly to opt in. **It requires the workflow cwd
-to be inside a git repository**; in a non-git working dir use the default shared cwd.
-If `worktree: true` is used outside a git repo the agent throws a clear, actionable
-error (surfaced to the user, including on the collapsed failure notice) rather than
-failing obscurely.
+## Security boundary
 
-## Shared MCP gateway
-
-`agent(task, { mcp: true })` gives the agent an `mcp` tool that forwards to a
-**process-wide** MCP connection pool (`subagents/mcp/`). Each configured MCP server
-(from `mcp.json` / `.pi/mcp.json` / `.mcp.json`) is connected **once per process** and
-reused across every subagent / workflow agent, so a fan-out does not reconnect an MCP
-adapter per child. The tool supports: no args → list servers; `{ server }` → list its
-tools; `{ search }` → find tools; `{ describe }` → show a tool's parameters;
-`{ tool, args }` → call a tool (`args` is a JSON string). Connections are torn down on
-session shutdown. Only stdio (`command`) and HTTP (`url`, optional `bearer`) servers are
-supported; interactive-only concerns (OAuth login, elicitation UI) are out of scope.
-
-## Run artifacts (read/grep, no extra tool)
-
-Every run gets an **isolated directory** at `<agentDir>/workflows/runs/<runId>/`, returned
-in the background ack and the completion notification (`runDir`). Instead of a dedicated
-status tool, the agent inspects a run on demand with the existing `read` / `grep` tools:
-
-- `events.log` — a timestamped **timeline** of the run: `phase:` markers, `agent X
-  started/completed/failed`, retries, rate-limit backoff, and an `agent … transcript:
-  agents/<file>` mapping line tying each agent to its transcript.
-- `agents/*.jsonl` — each agent's **full native session transcript** (user turn,
-  assistant text, tool calls, thinking, outputs), persisted incrementally via
-  `SessionManager.create` (filenames are `<timestamp>_<runId>-a<index>.jsonl`).
-
-This is on-demand only — don't poll; completion still arrives via the notification.
-Artifacts are **pruned on session start** after 3 days
-(`DEFAULT_RUN_RETENTION_MS`, shared with `subagents/core/run-archive.ts`).
-
-## Out of scope (v1)
-
-- VM **sandboxing** (the script is trusted, model-authored on explicit opt-in).
-- Resume / journals / `resumeFromRunId` and the longest-unchanged-prefix cache.
+The script runs in a worker with `codeGeneration:{strings:false, wasm:false}`. The worker is a liveness/cancellation boundary only. `node:vm` is **not** a confidentiality or integrity sandbox. Leaves explicitly granted workspace/external effects execute locally with those declared capabilities.

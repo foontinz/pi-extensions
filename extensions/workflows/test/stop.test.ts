@@ -2,45 +2,31 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import workflowsExtension from "../index.js";
 
-interface CapturedTool {
-  name: string;
-  execute: (id: string, params: any, signal: any, onUpdate: any, ctx: any) => Promise<any>;
-}
-
+interface CapturedTool { name: string; execute: (...args: any[]) => Promise<any> }
 function loadExtension() {
   const tools = new Map<string, CapturedTool>();
   const commands: string[] = [];
   const fakePi: any = {
-    on: () => {},
-    registerMessageRenderer: () => {},
-    registerTool: (t: CapturedTool) => tools.set(t.name, t),
-    registerCommand: (name: string) => commands.push(name),
-    sendMessage: () => {},
-    sendUserMessage: () => {},
+    on: () => {}, registerMessageRenderer: () => {}, registerTool: (tool: CapturedTool) => tools.set(tool.name, tool),
+    registerCommand: (name: string) => commands.push(name), sendMessage: () => {},
+    getThinkingLevel: () => "high", getAllTools: () => [],
   };
   workflowsExtension(fakePi);
   return { tools, commands };
 }
+const ctx = { hasUI: false, cwd: "/tmp", model: { provider: "p", id: "m" }, isProjectTrusted: () => false, sessionManager: { getSessionId: () => "s", getSessionFile: () => undefined } } as any;
+const textOf = (result: any) => result.content.map((part: any) => part.text).join("\n");
 
-const ctx = { hasUI: false, cwd: "/tmp" } as any;
-const textOf = (r: any): string => r.content.map((c: any) => c.text).join("\n");
-
-test("registers the stop_workflow tool and no slash command", () => {
+test("registers canonical durable workflow surfaces and no legacy stop tool", () => {
   const { tools, commands } = loadExtension();
-  assert.ok(tools.has("stop_workflow"), "stop_workflow tool registered");
-  assert.deepEqual(commands, [], "workflows register no slash commands");
+  for (const name of ["Workflow", "workflow_status", "workflow_output", "workflow_control", "workflow_apply", "workflow_release_workspace"]) assert.ok(tools.has(name), name);
+  assert.equal(tools.has("stop_workflow"), false);
+  assert.deepEqual(commands.sort(), ["workflow", "workflows"]);
 });
 
-test("stop_workflow reports when there is nothing to stop", async () => {
+test("workflow_control reports unknown owner-scoped active runs", async () => {
   const { tools } = loadExtension();
-  const stop = tools.get("stop_workflow")!;
-
-  const all = await stop.execute("c", {}, undefined, undefined, ctx);
-  assert.match(textOf(all), /No running workflows\./);
-  assert.equal(all.details.stopped, 0);
-
-  const one = await stop.execute("c", { runId: "deadbeef" }, undefined, undefined, ctx);
-  assert.match(textOf(one), /No running workflow deadbeef\./);
-  assert.equal(one.details.stopped, 0);
+  const result = await tools.get("workflow_control")!.execute("id", { action: "stop", runId: "11111111-1111-4111-8111-111111111111" }, undefined, undefined, ctx);
+  assert.match(textOf(result), /No active owner-scoped workflow/);
+  assert.equal(result.details.stopped, false);
 });
-

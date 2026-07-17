@@ -249,12 +249,15 @@ export type WorkflowRunEvent =
   | { type: "RunStatusChanged"; status: WorkflowRunStatus; error?: WorkflowErrorV1 }
   | { type: "LeafAccepted"; leaf: WorkflowLeafRecordV1 }
   | { type: "LeafStatusChanged"; leafId: string; status: WorkflowLeafStatus; at: number; failure?: WorkflowLeafFailure; result?: JsonValue }
+  | { type: "LeafReferencesChanged"; leafId: string; transcriptPath?: string; workspaceLeaseId?: string; artifactIds?: string[] }
   | { type: "ProviderAttemptSettled"; leafId: string; attempt: WorkflowProviderAttemptV1 }
+  | { type: "UsageAdded"; usage: WorkflowUsage }
   | { type: "ArtifactRecorded"; artifact: WorkflowArtifactRecordV1 }
   | { type: "OutputRecorded"; output: WorkflowOutputDescriptorV1 }
   | { type: "CleanupChanged"; cleanup: WorkflowCleanupOutcomeV1 }
   | { type: "NotificationChanged"; notification: WorkflowNotificationRecordV1 }
   | { type: "BudgetChanged"; budget: WorkflowBudgetSnapshot }
+  | { type: "JournalAdvanced"; sequence: number }
   | { type: "RetentionChanged"; pinned: boolean; expiresAt?: number };
 
 export interface DurableWorkflowEvent {

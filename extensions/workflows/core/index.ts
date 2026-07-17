@@ -5,4 +5,5 @@ export * from "./limits.js";
 export * from "./metadata.js";
 export * from "./output-encoder.js";
 export * from "./reducer.js";
+export * from "./retention.js";
 export * from "./run-store.js";

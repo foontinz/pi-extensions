@@ -407,6 +407,20 @@ test("explicit thinking level is forwarded to createAgentSession", async () => {
   assert.equal(result.output, "done");
 });
 
+test("explicit concrete model resolves exactly and unknown models fail closed", async () => {
+  __inProcessRunnerTest.setModelRuntime(async () => ({ getModels: () => [{ provider: "p", id: "exact" }] }) as never);
+  let observedModel: any;
+  const session = fakeSession({ messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }] });
+  const result = await runSubagentInProcess(
+    { task: "finish", cwd: process.cwd(), model: "p/exact" },
+    async (options) => { observedModel = options?.model; return { session } as CreateAgentSessionResult; },
+  );
+  assert.deepEqual(observedModel, { provider: "p", id: "exact" });
+  assert.equal(result.output, "done");
+  const unknown = await runSubagentInProcess({ task: "finish", cwd: process.cwd(), model: "p/missing" });
+  assert.match(unknown.error?.message ?? "", /unknown concrete model/);
+});
+
 test("reports live assistant and tool activity to parent UIs", async () => {
   const activities: string[] = [];
   let listener: ((event: any) => void) | undefined;

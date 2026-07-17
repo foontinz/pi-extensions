@@ -209,12 +209,14 @@ async function parallel(thunks) {
   if (arguments.length !== 1 || !Array.isArray(thunks) || thunks.some((item) => typeof item !== "function")) {
     contract("PARALLEL_SIGNATURE", "parallel() accepts exactly one array of thunk functions");
   }
+  if (thunks.length > 10000) contract("HELPER_ITEM_LIMIT", "parallel() exceeds the 10000 item limit");
   return await Promise.all(thunks.map((thunk) => Promise.resolve().then(thunk)));
 }
 async function pipeline(items, ...stages) {
   if (!Array.isArray(items) || stages.length === 0 || stages.some((stage) => typeof stage !== "function")) {
     contract("PIPELINE_SIGNATURE", "pipeline() requires an item array followed by variadic stage functions");
   }
+  if (items.length > 10000 || stages.length > 10000) contract("HELPER_ITEM_LIMIT", "pipeline() exceeds the 10000 item/stage limit");
   return await Promise.all(items.map(async (original, index) => {
     let previous = original;
     for (const stage of stages) {

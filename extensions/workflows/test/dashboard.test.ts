@@ -141,8 +141,12 @@ test("finishing a cancelled view terminalizes in-flight agent rows", () => {
     },
   } as unknown as ExtensionContext;
   const view = createWorkflowView(ctx, "cancelled1", "inline");
-  view.onState(snap());
-  view.finish("cancelled");
+  const cancelled = snap({
+    status: "cancelled",
+    agents: snap().agents.map((agent) => agent.status === "completed" ? agent : { ...agent, status: "cancelled", reason: "workflow cancelled" }),
+  });
+  view.onState(cancelled);
+  view.finish(cancelled);
   const text = widget?.render(120).join("\n") ?? "";
   assert.match(text, /◆ {2}CANCELLED/);
   assert.match(text, /⊘ summarize.*workflow cancelled/);

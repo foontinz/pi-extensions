@@ -144,11 +144,24 @@ export class WorkflowRunStore {
     return readJsonLines<JsonValue>(this.paths(runId, true).journal!, MAX_JOURNAL_BYTES);
   }
 
+  async writeTombstone(runId: string, value: { prunedAt: number; expiredAt?: number }): Promise<void> {
+    validateRunId(runId);
+    const directory = path.join(this.root, ".tombstones");
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await atomicWrite(path.join(directory, `${runId}.json`), jsonLine({ runId, ...value }));
+  }
+  async readTombstone(runId: string): Promise<{ runId: string; prunedAt: number; expiredAt?: number } | undefined> {
+    validateRunId(runId);
+    try { return JSON.parse(await readBounded(path.join(this.root, ".tombstones", `${runId}.json`), 16_384)); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+  }
+
   async scan(): Promise<RunScanEntry[]> {
     let entries: string[];
     try { entries = await readdir(this.root); } catch { return []; }
     const results: RunScanEntry[] = [];
     for (const runId of entries) {
+      if (runId === ".trash" || runId === ".tombstones") continue;
       try { validateRunId(runId); } catch { continue; }
       try { results.push({ runId, state: "ok", record: await this.readRun(runId) }); }
       catch (error) {

@@ -136,6 +136,13 @@ export function reduceWorkflowEvent(record: WorkflowRunRecordV1, event: Workflow
       if (event.status === "cached") next.usage.cacheHits += 1;
       break;
     }
+    case "LeafReferencesChanged": {
+      const leaf = findLeaf(next, event.leafId);
+      if (event.transcriptPath !== undefined) leaf.transcriptPath = event.transcriptPath;
+      if (event.workspaceLeaseId !== undefined) leaf.workspaceLeaseId = event.workspaceLeaseId;
+      if (event.artifactIds !== undefined) leaf.artifactIds = [...event.artifactIds];
+      break;
+    }
     case "ProviderAttemptSettled": {
       const leaf = findLeaf(next, event.leafId);
       const existing = next.leaves.flatMap((item) => item.attempts).find((attempt) => attempt.attemptId === event.attempt.attemptId);
@@ -149,6 +156,9 @@ export function reduceWorkflowEvent(record: WorkflowRunRecordV1, event: Workflow
       if (event.attempt.usage) next.usage = addUsage(next.usage, event.attempt.usage);
       break;
     }
+    case "UsageAdded":
+      next.usage = addUsage(next.usage, event.usage);
+      break;
     case "ArtifactRecorded":
       if (next.artifacts.some((item) => item.artifactId === event.artifact.artifactId)) throw invariant("duplicate artifact id");
       next.artifacts.push(structuredClone(event.artifact));
@@ -169,6 +179,10 @@ export function reduceWorkflowEvent(record: WorkflowRunRecordV1, event: Workflow
       break;
     case "BudgetChanged":
       next.budget = structuredClone(event.budget);
+      break;
+    case "JournalAdvanced":
+      if (event.sequence !== next.journalSequence + 1) throw invariant("journal sequence must advance monotonically by one");
+      next.journalSequence = event.sequence;
       break;
     case "RetentionChanged":
       next.pinned = event.pinned;

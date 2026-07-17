@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
+import { parseWorkflowMetadata } from "../core/metadata.js";
 import { WorkflowResolver } from "../registry.js";
 
 function fixture() {
@@ -39,6 +40,17 @@ test("registry rejects symlink escape and discovery uses canonical identities", 
     assert.throws(() => f.resolver.resolveName("user:escape", f.project, true), /escapes/);
     assert.deepEqual(f.resolver.discover(f.project, false).map((item) => item.qualifiedId), ["builtin:built", "user:user-one"]);
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("shipped read-only built-ins are canonical metadata-declared products", () => {
+  const resolver = new WorkflowResolver();
+  for (const name of ["builtin:code-review", "builtin:test-gap-audit"]) {
+    const source = resolver.resolveName(name, process.cwd(), false);
+    const parsed = parseWorkflowMetadata(source.source);
+    assert.equal(parsed.metadata.name, name);
+    assert.deepEqual(parsed.metadata.capabilities, ["read"]);
+    assert.equal(parsed.metadata.resumable, false);
+  }
 });
 
 test("relative paths resolve from the containing source directory and hash content", () => {

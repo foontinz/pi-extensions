@@ -74,6 +74,7 @@ test("metadata parser rejects missing/dynamic/ambiguous metadata and TypeScript 
     "export const meta = { __proto__: {} }",
     "export const meta = { name: \"x\" }",
     `${meta}\nconst value: string = "typescript"`,
+    `${meta}\nimport fs from "node:fs"`,
   ];
   for (const source of invalid) assert.throws(() => parseWorkflowMetadata(source), WorkflowMetadataError, source);
 });

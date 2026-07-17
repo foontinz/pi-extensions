@@ -55,7 +55,6 @@ const THINKING = new Set<SubagentThinkingLevel>(["off", "minimal", "low", "mediu
 const READ_ONLY = new Set(["read", "grep", "find", "ls"]);
 const LOCAL_BUILTINS = new Set(["read", "grep", "find", "ls", "bash", "edit", "write"]);
 const RETURN_TEXT = "Your final assistant text is returned verbatim to the workflow. Return the result itself, not a completion confirmation. Be concise.";
-const RETURN_SCHEMA = "Return only through StructuredOutput. Use no other tool in that turn. If validation fails, correct the call on the next turn. Stop after one accepted call.";
 
 export function resolveAgentExecution(
   cwd: string,
@@ -120,7 +119,9 @@ export function resolveAgentExecution(
   }
 
   const systemPrompt = input.systemPrompt ?? profile?.systemPrompt;
-  const appendSystemPrompt = [input.appendSystemPrompt, schemaMode ? RETURN_SCHEMA : RETURN_TEXT].filter((value): value is string => Boolean(value));
+  // Schema mode's shared leaf runtime appends its schema-bearing mandatory
+  // return instruction last. Text mode appends the verbatim-return contract here.
+  const appendSystemPrompt = [input.appendSystemPrompt, schemaMode ? undefined : RETURN_TEXT].filter((value): value is string => Boolean(value));
   const toolIdentities = tools.map((name) => ({ name, sha256: hashJson(byName.get(name)) }));
   const profileIdentity = profile ? { id: `user:${profile.name}`, sha256: hash(fs.readFileSync(profile.filePath)) } : undefined;
   return {

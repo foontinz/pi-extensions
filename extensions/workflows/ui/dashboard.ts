@@ -78,7 +78,7 @@ export class WorkflowDashboard implements Component {
       t.fg("dim", `RUN ${done}/${s.launched || 0}`),
       t.fg("dim", elapsed(s.startedAt, s.finishedAt)),
       t.fg("dim", `↑${compact(s.usage.input)} ↓${compact(s.usage.output)}`),
-      t.fg("dim", `$${s.usage.cost.toFixed(s.usage.cost < 1 ? 3 : 2)}`),
+      ...(s.usage.cost === undefined ? [] : [t.fg("dim", `$${s.usage.cost.toFixed(s.usage.cost < 1 ? 3 : 2)}`)]),
     ];
     const reservedLeft = Math.min(visibleWidth(left), Math.max(20, Math.floor(width * 0.55)));
     const availableRight = Math.max(0, width - reservedLeft - 2);

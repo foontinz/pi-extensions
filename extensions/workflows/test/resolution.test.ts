@@ -33,7 +33,7 @@ test("workspace effects require isolation and default to verified capture", () =
   }, root, available, false), /requires.*captured workspace/);
 });
 
-test("external effects disable caching and schema return contract is mandatory-last", () => {
+test("external effects disable caching and schema mode delegates mandatory-last prompt to shared runtime", () => {
   assert.throws(() => resolveAgentExecution("/tmp", { mcp: true }, root, available, false), /MCP requires/);
   assert.throws(() => resolveAgentExecution("/tmp", { effects: "external", tools: ["network"], cachePolicy: "pure" }, root, available, false), /non-cacheable/);
   const result = resolveAgentExecution("/tmp", {
@@ -44,8 +44,7 @@ test("external effects disable caching and schema return contract is mandatory-l
     model: "other/exact-model",
   }, root, available, true);
   assert.deepEqual([result.provider, result.model], ["other", "exact-model"]);
-  assert.equal(result.appendSystemPrompt[0], "custom append");
-  assert.match(result.appendSystemPrompt.at(-1)!, /^Return only through StructuredOutput/);
+  assert.deepEqual(result.appendSystemPrompt, ["custom append"]);
 });
 
 test("explicit unknown model and thinking values fail closed", () => {

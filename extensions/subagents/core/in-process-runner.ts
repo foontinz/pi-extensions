@@ -118,6 +118,8 @@ export interface InProcessSubagentOptions {
   tools?: readonly string[];
   systemPrompt?: string;
   appendSystemPrompt?: readonly string[];
+  /** Concrete provider/model id. Explicit unknown values fail closed. */
+  model?: string;
   thinkingLevel?: SubagentThinkingLevel;
   timeoutMs?: number;
   /** Enable the mandatory StructuredOutput tool return channel for this schema. */
@@ -326,6 +328,15 @@ export async function runSubagentInProcess(
       return { output: "", usage: emptyUsageStats(), sessionFile: persistedTranscript(), error: { reason: "error", message } };
     }
     const { modelRuntime } = runtimeStartup;
+    const concreteModel = options.model ? resolveConcreteModel(options.model, modelRuntime) : undefined;
+    if (options.model && !concreteModel) {
+      return {
+        output: "",
+        usage: emptyUsageStats(),
+        sessionFile: persistedTranscript(),
+        error: { reason: "error", message: `unknown concrete model: ${options.model}` },
+      };
+    }
     checkDeadline();
     if (cancellation) {
       return { output: "", usage: emptyUsageStats(), sessionFile: persistedTranscript(), error: cancellation };
@@ -336,6 +347,7 @@ export async function runSubagentInProcess(
         cwd: options.cwd,
         agentDir: getAgentDir(),
         modelRuntime,
+        model: concreteModel as never,
         resourceLoader: createBareResourceLoader(
           options.systemPrompt,
           structuredOutput
@@ -646,6 +658,14 @@ function countAssistantTurns(messages: readonly unknown[]): number {
     if ((message as { role?: unknown }).role === "assistant") turns += 1;
   }
   return Math.max(turns, 1);
+}
+
+function resolveConcreteModel(value: string, runtime: Pick<ModelRuntime, "getModels">): unknown | undefined {
+  const separator = value.indexOf("/");
+  if (separator <= 0 || separator === value.length - 1) return undefined;
+  const provider = value.slice(0, separator);
+  const id = value.slice(separator + 1);
+  return (runtime.getModels() as readonly PatternModel[]).find((model) => model.provider === provider && model.id === id);
 }
 
 export const __inProcessRunnerTest = {

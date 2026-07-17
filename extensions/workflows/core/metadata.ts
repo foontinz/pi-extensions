@@ -64,9 +64,11 @@ export function parseWorkflowMetadata(source: string): ParsedWorkflowScript {
   const raw = literalValue(expression, "$metadata", 0);
   if (!plainObject(raw)) throw new WorkflowMetadataError("workflow metadata must be an object literal", expression.start);
   const metadata = validateMetadata(raw as Record<string, JsonValue>, expression.start);
+  const body = blankRange(source, statement.start, statement.end);
+  validateBodySyntax(body);
   return {
     metadata,
-    body: blankRange(source, statement.start, statement.end),
+    body,
     metadataRange: { start: statement.start, end: statement.end },
   };
 }
@@ -187,6 +189,22 @@ function literalValue(ast: AstNode, path: string, depth: number): JsonValue {
     }
     default:
       throw metadataError(ast, `${path} must contain only JSON-compatible AST literals (found ${ast.type})`);
+  }
+}
+
+function validateBodySyntax(body: string): void {
+  try {
+    // The runtime wraps the body in an async function. Validate that exact
+    // grammar before run-directory creation or worker startup.
+    parse(`async function __workflow__(){\n${body}\n}`, {
+      ecmaVersion: "latest",
+      sourceType: "script",
+      allowHashBang: false,
+    });
+  } catch (error) {
+    const parseError = error as Error & { pos?: number };
+    const offset = parseError.pos === undefined ? undefined : Math.max(0, parseError.pos - "async function __workflow__(){\n".length);
+    throw new WorkflowMetadataError(`invalid workflow body syntax: ${parseError.message}`, offset);
   }
 }
 
