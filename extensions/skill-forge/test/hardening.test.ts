@@ -54,7 +54,9 @@ test("prompt encodes untrusted dynamic data, omits absolute paths, sanitizes ski
   const prompt = analyzerTesting.buildPrompt(chunk, ["Good-Skill", "../bad", "good-skill", "x".repeat(100)]);
   assert.doesNotMatch(prompt, /private\/absolute|<system>attack|<existing-skills>/);
   assert.match(prompt, /SESSION_EVIDENCE_JSON=/);
-  assert.match(prompt, /skill-forge-analyzer-v3/);
+  assert.match(prompt, /skill-forge-analyzer-v4/);
+  assert.match(prompt, /EXISTING-COVERAGE GATE/);
+  assert.match(prompt, /existingResources/);
   assert.match(prompt, /GATE 1 — RECURRENCE/);
   assert.match(prompt, /GATE 2 — GENERALIZATION/);
   assert.match(prompt, /NOT to whether the observed task succeeded/);
@@ -153,9 +155,46 @@ test("loaded system-prompt skills take precedence over fallback inventory", asyn
     await Promise.all([mkdir(cwd), mkdir(agent), mkdir(sessions)]); const path = join(sessions, "s.jsonl");
     await writeFile(path, `${JSON.stringify({ type: "session", id: "s", cwd })}\n${JSON.stringify({ type: "message", id: "u", parentId: null, timestamp: iso, message: { role: "user", content: [{ type: "text", text: "workflow" }] } })}\n`);
     const location = await projectStateDir(agent, cwd); let names: string[] = [];
-    const service = new ForgeService(new ProjectStore(location.dir, location.cwd, location.key), agent, ".pi", async () => [{ path, id: "s", cwd }], async (_ctx, _chunk, existing) => { names = existing; return { candidates: [], analyzerModel: "mock", analyzerPromptVersion: "v" }; });
+    const service = new ForgeService(new ProjectStore(location.dir, location.cwd, location.key), agent, ".pi", async () => [{ path, id: "s", cwd }], async (_ctx, _chunk, existing) => { names = existing.map((resource) => resource.name); return { candidates: [], analyzerModel: "mock", analyzerPromptVersion: "v" }; });
     service.setLoadedSkillNames(["loaded-skill", "../bad"]); await service.initialize(); const ctx = { cwd, sessionManager: { getSessionDir: () => sessions } } as any;
     await service.inventory(ctx); await service.kick(ctx, new AbortController().signal, true); assert.deepEqual(names, ["loaded-skill"]);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("evaluation reconciles user/project skills and prompts and suppresses installed-name creates", async () => {
+  const root = await mkdtemp(join(tmpdir(), "forge-existing-resources-")); const cwd = join(root, "project"); const agent = join(root, "agent"); const sessions = join(root, "sessions");
+  try {
+    const userSkill = join(agent, "skills", "user-covered");
+    const projectSkill = join(cwd, ".pi", "skills", "project-covered");
+    const userPrompts = join(agent, "prompts"); const projectPrompts = join(cwd, ".pi", "prompts");
+    await Promise.all([mkdir(cwd), mkdir(sessions), mkdir(userSkill, { recursive: true }), mkdir(projectSkill, { recursive: true }), mkdir(userPrompts, { recursive: true }), mkdir(projectPrompts, { recursive: true })]);
+    await Promise.all([
+      writeFile(join(userSkill, "SKILL.md"), "---\nname: user-covered\ndescription: Existing user workflow\n---\n\n# User workflow\n\nDo the covered work.\n"),
+      writeFile(join(projectSkill, "SKILL.md"), "---\nname: project-covered\ndescription: Existing project workflow\n---\n\n# Project workflow\n\nRun project checks.\n"),
+      writeFile(join(userPrompts, "user-review.md"), "---\ndescription: Existing user review prompt\n---\nReview user changes carefully.\n"),
+      writeFile(join(projectPrompts, "project-review.md"), "Review this project using its conventions.\n"),
+    ]);
+    const path = join(sessions, "s.jsonl");
+    await writeFile(path, `${JSON.stringify({ type: "session", id: "s", cwd })}\n${JSON.stringify({ type: "message", id: "u", parentId: null, timestamp: iso, message: { role: "user", content: [{ type: "text", text: "repeat workflow" }] } })}\n`);
+    const location = await projectStateDir(agent, cwd); let inventory: any[] = [];
+    const service = new ForgeService(new ProjectStore(location.dir, location.cwd, location.key), agent, ".pi", async () => [{ path, id: "s", cwd }], async (_ctx, chunk, existing) => {
+      inventory = existing;
+      return { candidates: [
+        candidate({ skillName: "user-covered", capabilityKey: "covered-again", evidenceRefs: [chunk.evidence[0]!.ref], operation: "create" }),
+        candidate({ skillName: "project-review", capabilityKey: "improve-project-review", evidenceRefs: [chunk.evidence[0]!.ref], operation: "update" }),
+      ], analyzerModel: "mock", analyzerPromptVersion: "v" };
+    });
+    await service.initialize(); const ctx = { cwd, sessionManager: { getSessionDir: () => sessions } } as any;
+    await service.inventory(ctx); await service.kick(ctx, new AbortController().signal, true);
+    assert.deepEqual(inventory.map((resource) => `${resource.scope}:${resource.kind}:${resource.name}`).sort(), [
+      "project:prompt:project-review", "project:skill:project-covered", "user:prompt:user-review", "user:skill:user-covered",
+    ]);
+    assert.ok(inventory.every((resource) => resource.description && resource.contentExcerpt && resource.contentDigest));
+    const state = await service.store.read();
+    assert.equal(state.proposals.length, 1);
+    assert.equal(state.proposals[0]?.selectedKind, "prompt");
+    assert.equal(state.proposals[0]?.selectedScope, "project");
+    assert.ok(state.diagnostics.some((item) => item.code === "existing_resource_suppressed"));
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -194,6 +233,13 @@ test("inbox sorts ready proposals by confidence descending, newest first on ties
   assert.deepEqual(indexTesting.readyInboxProposals(state).map((proposal: any) => proposal.id), ["b", "d", "a"]);
 });
 
+test("proposal editor prefill is repositioned to the first line", () => {
+  const component = { editor: { state: { lines: ["first", "second", "third"], cursorLine: 2, cursorCol: 5 }, scrollOffset: 9 } };
+  assert.equal(indexTesting.positionExtensionEditorAtStart(component as any), true);
+  assert.deepEqual(component.editor.state, { lines: ["first", "second", "third"], cursorLine: 0, cursorCol: 0 });
+  assert.equal(component.editor.scrollOffset, 0);
+});
+
 test("inbox picker stays bounded, truncated, and filterable with many proposals", async () => {
   const proposals = Array.from({ length: 200 }, (_value, index) => ({
     id: `p-${index}`, status: "ready", skillName: `skill-${index}`, confidence: 0.5,
@@ -228,6 +274,13 @@ test("inbox picker stays bounded, truncated, and filterable with many proposals"
   const rejectPick = await rejectPicking;
   assert.equal(rejectPick?.proposal.id, "p-0");
   assert.equal(rejectPick?.action, "reject");
+
+  const kittyRejecting = makeContext();
+  const kittyRejectPicking = indexTesting.pickProposal(kittyRejecting.ctx as any, proposals);
+  kittyRejecting.holder.component.handleInput("\x1b[114;5u");
+  const kittyRejectPick = await kittyRejectPicking;
+  assert.equal(kittyRejectPick?.proposal.id, "p-0");
+  assert.equal(kittyRejectPick?.action, "reject");
 
   const escaped = makeContext();
   const cancelPicking = indexTesting.pickProposal(escaped.ctx as any, proposals);

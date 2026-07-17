@@ -7,11 +7,11 @@ import { canonicalExistingSkillNames } from "./analyzer.ts";
 import { applyAnalyzerInvalidation, finishAccepted, invalidateSessionEvidence, mergeCandidate, reopenProposal } from "./proposals.ts";
 import { addDiagnostic, ProjectStore, sha256 } from "./storage.ts";
 import { belongsToProject, buildChunk, loadSession, prefixDigest, redactSecrets, sameFileIdentity, sameSnapshotStamp } from "./sessions.ts";
-import type { ActiveProposalSummary, AnalysisChunk, AnalysisJob, AnalyzerResult, ForgeState, ParsedSession } from "./types.ts";
+import type { ActiveProposalSummary, AnalysisChunk, AnalysisJob, AnalyzerResult, ExistingResourceSummary, ForgeState, ParsedSession, Scope } from "./types.ts";
 
 export type SessionListItem = { path: string; id: string; cwd: string };
 export type SessionLister = (cwd: string, sessionDir: string) => Promise<SessionListItem[]>;
-export type Analyzer = (ctx: ExtensionContext, chunk: AnalysisChunk, existingSkills: string[], signal?: AbortSignal, activeProposals?: ActiveProposalSummary[]) => Promise<AnalyzerResult>;
+export type Analyzer = (ctx: ExtensionContext, chunk: AnalysisChunk, existingResources: ExistingResourceSummary[], signal?: AbortSignal, activeProposals?: ActiveProposalSummary[]) => Promise<AnalyzerResult>;
 
 const LEASE_MS = 30 * 60_000;
 const HEARTBEAT_MS = Math.floor(LEASE_MS / 3);
@@ -27,20 +27,120 @@ function activeJobFor(state: ForgeState, path: string, start: number): AnalysisJ
   return state.jobs.find((job) => job.sessionPath === path && job.startEntryIndex === start);
 }
 
-async function discoverSkillNames(root: string): Promise<string[]> {
-  const names: string[] = [];
-  async function walk(dir: string, depth: number): Promise<void> {
-    if (depth > 5) return;
+const MAX_RESOURCE_EXCERPT_CHARS = 24_000;
+
+interface LoadedSkillResource {
+  name: string;
+  description?: string;
+  filePath?: string;
+  sourceInfo?: { scope?: string };
+}
+
+function frontmatterValue(content: string, key: string): string {
+  const block = content.replace(/^\uFEFF/, "").match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1] ?? "";
+  const raw = block.match(new RegExp(`^${key}:\\s*(.+)$`, "m"))?.[1]?.trim() ?? "";
+  if (raw.startsWith("\"") && raw.endsWith("\"")) {
+    try { return String(JSON.parse(raw)); } catch { /* use raw YAML scalar below */ }
+  }
+  return raw.replace(/^['"]|['"]$/g, "");
+}
+
+function semanticResourceDigest(content: string): string {
+  const body = content.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n").replace(/^---\n[\s\S]*?\n---\n?/, "");
+  return sha256(redactSecrets(body).replace(/\s+/g, " ").trim().toLowerCase());
+}
+
+async function summarizeResource(path: string, kind: "skill" | "prompt", scope: Scope, fallbackName: string, loadedDescription = ""): Promise<ExistingResourceSummary | undefined> {
+  try {
+    const raw = await readFile(path, "utf8");
+    const redacted = redactSecrets(raw).replace(/\0/g, "");
+    const withoutFrontmatter = redacted.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n").replace(/^---\n[\s\S]*?\n---\n?/, "").trim();
+    const name = (kind === "skill" ? frontmatterValue(redacted, "name") : fallbackName) || fallbackName;
+    const description = loadedDescription || frontmatterValue(redacted, "description")
+      || withoutFrontmatter.split("\n").map((line) => line.trim()).find(Boolean) || "";
+    return {
+      kind, scope, name: name.trim().slice(0, 100), description: description.replace(/\s+/g, " ").trim().slice(0, 1_024),
+      contentExcerpt: withoutFrontmatter.slice(0, 2_000), contentDigest: sha256(redacted), semanticDigest: semanticResourceDigest(redacted),
+    };
+  } catch { return undefined; }
+}
+
+async function discoverSkills(root: string, scope: Scope): Promise<ExistingResourceSummary[]> {
+  const resources: ExistingResourceSummary[] = [];
+  async function walk(dir: string, depth: number, includeRootFiles: boolean): Promise<void> {
+    if (depth > 12) return;
     let entries;
     try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
+    const skillEntry = entries.find((entry) => entry.name === "SKILL.md" && (entry.isFile() || entry.isSymbolicLink()));
+    if (skillEntry) {
+      const summary = await summarizeResource(join(dir, skillEntry.name), "skill", scope, basename(dir));
+      if (summary) resources.push(summary);
+      return;
+    }
     for (const entry of entries) {
+      if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
       const path = join(dir, entry.name);
-      if (entry.isDirectory()) await walk(path, depth + 1);
-      else if (entry.isFile() && entry.name === "SKILL.md") names.push(basename(dir));
+      if (entry.isDirectory()) await walk(path, depth + 1, false);
+      else if (includeRootFiles && entry.name.endsWith(".md") && (entry.isFile() || entry.isSymbolicLink())) {
+        const summary = await summarizeResource(path, "skill", scope, basename(entry.name, ".md"));
+        if (summary) resources.push(summary);
+      }
     }
   }
-  await walk(root, 0);
-  return names;
+  await walk(root, 0, true);
+  return resources;
+}
+
+async function discoverPrompts(root: string, scope: Scope): Promise<ExistingResourceSummary[]> {
+  let entries;
+  try { entries = await readdir(root, { withFileTypes: true }); } catch { return []; }
+  const resources = await Promise.all(entries
+    .filter((entry) => !entry.name.startsWith(".") && entry.name.endsWith(".md") && (entry.isFile() || entry.isSymbolicLink()))
+    .map((entry) => summarizeResource(join(root, entry.name), "prompt", scope, basename(entry.name, ".md"))));
+  return resources.filter((resource): resource is ExistingResourceSummary => Boolean(resource));
+}
+
+function canonicalResourceInventory(resources: ExistingResourceSummary[]): ExistingResourceSummary[] {
+  const seen = new Set<string>();
+  const selected = resources
+    .filter((resource) => resource.name.trim())
+    .sort((a, b) => a.scope.localeCompare(b.scope) || a.kind.localeCompare(b.kind) || a.name.localeCompare(b.name))
+    .filter((resource) => {
+      const key = `${resource.scope}\0${resource.kind}\0${resource.name.toLowerCase()}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  const excerptShare = Math.min(2_000, Math.max(40, Math.floor(MAX_RESOURCE_EXCERPT_CHARS / Math.max(1, selected.length))));
+  return selected.map((resource) => ({ ...resource, contentExcerpt: resource.contentExcerpt.slice(0, excerptShare) }));
+}
+
+function reconcileResultWithExistingResources(result: AnalyzerResult, resources: ExistingResourceSummary[]): { result: AnalyzerResult; suppressed: string[] } {
+  const targetsByName = new Map<string, ExistingResourceSummary[]>();
+  for (const resource of resources) {
+    const name = resource.name.toLowerCase().trim();
+    targetsByName.set(name, [...targetsByName.get(name) ?? [], resource]);
+  }
+  const semanticDigests = new Set(resources.map((resource) => resource.semanticDigest).filter(Boolean));
+  const suppressed: string[] = [];
+  const candidates = result.candidates.filter((candidate) => {
+    const name = candidate.skillName.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+    if (semanticDigests.has(semanticResourceDigest(candidate.skillMd))) {
+      suppressed.push(`${candidate.skillName}: content is already installed`);
+      return false;
+    }
+    const targets = targetsByName.get(name) ?? [];
+    if (candidate.operation === "create" && targets.length) {
+      suppressed.push(`${candidate.skillName}: create collides with an installed skill or prompt`);
+      return false;
+    }
+    if (candidate.operation === "update" && targets.length !== 1) {
+      suppressed.push(`${candidate.skillName}: update ${targets.length ? "has an ambiguous installed target" : "does not name an installed skill or prompt"}`);
+      return false;
+    }
+    return true;
+  });
+  return { result: { ...result, candidates }, suppressed };
 }
 
 export interface ForgeStatus {
@@ -58,7 +158,7 @@ export class ForgeService {
   private worker?: Promise<void>;
   private readonly owner = `${process.pid}-${randomBytes(8).toString("hex")}`;
   private newlyReadySinceLastRead = 0;
-  private loadedSkillNames: string[] = [];
+  private loadedSkills: LoadedSkillResource[] = [];
 
   constructor(
     readonly store: ProjectStore,
@@ -69,7 +169,42 @@ export class ForgeService {
     private readonly isGenerationCurrent: () => boolean = () => true,
   ) {}
 
-  setLoadedSkillNames(names: string[]): void { this.loadedSkillNames = canonicalExistingSkillNames(names); }
+  setLoadedSkillNames(names: string[]): void { this.loadedSkills = canonicalExistingSkillNames(names).map((name) => ({ name, sourceInfo: { scope: "user" } })); }
+
+  setLoadedSkills(skills: LoadedSkillResource[]): void {
+    this.loadedSkills = skills
+      .filter((skill) => skill && typeof skill.name === "string" && skill.name.trim())
+      .map((skill) => ({
+        name: skill.name.trim().slice(0, 100),
+        description: typeof skill.description === "string" ? skill.description.slice(0, 1_024) : undefined,
+        filePath: typeof skill.filePath === "string" ? skill.filePath : undefined,
+        sourceInfo: skill.sourceInfo,
+      }));
+  }
+
+  private async existingResources(): Promise<ExistingResourceSummary[]> {
+    const userSkillsRoot = join(this.agentDir, "skills");
+    const projectSkillsRoot = join(this.store.cwd, this.projectConfigDirName, "skills");
+    const [userSkills, projectSkills, userPrompts, projectPrompts] = await Promise.all([
+      discoverSkills(userSkillsRoot, "user"),
+      discoverSkills(projectSkillsRoot, "project"),
+      discoverPrompts(join(this.agentDir, "prompts"), "user"),
+      discoverPrompts(join(this.store.cwd, this.projectConfigDirName, "prompts"), "project"),
+    ]);
+    const loaded: ExistingResourceSummary[] = [];
+    for (const skill of this.loadedSkills) {
+      const scope = skill.sourceInfo?.scope === "project" ? "project" : skill.sourceInfo?.scope === "user" ? "user" : undefined;
+      if (!scope) continue;
+      const fromFile = skill.filePath ? await summarizeResource(skill.filePath, "skill", scope, skill.name, skill.description) : undefined;
+      loaded.push(fromFile ?? {
+        kind: "skill", scope, name: skill.name, description: skill.description ?? "", contentExcerpt: "",
+        contentDigest: "", semanticDigest: "",
+      });
+    }
+    // Loaded metadata is first so Pi's effective collision winner is retained;
+    // default-directory discovery still fills resources before the first turn.
+    return canonicalResourceInventory([...loaded, ...userSkills, ...projectSkills, ...userPrompts, ...projectPrompts]);
+  }
 
   async initialize(): Promise<void> {
     await this.store.initialize();
@@ -237,14 +372,9 @@ export class ForgeService {
           await this.inventory(ctx);
           continue;
         }
-        const fallback = this.loadedSkillNames.length ? [] : [
-          ...(await discoverSkillNames(join(this.agentDir, "skills"))),
-          ...(await discoverSkillNames(join(this.store.cwd, this.projectConfigDirName, "skills"))),
-        ];
-        const existing = canonicalExistingSkillNames([...this.loadedSkillNames, ...fallback]);
+        const existing = await this.existingResources();
         const activeProposals: ActiveProposalSummary[] = (await this.store.read()).proposals
-          .filter((proposal) => ["ready", "deferred", "apply_failed"].includes(proposal.status)
-            && proposal.provenance.some((record) => record.sessionId === chunk.sessionId && record.candidateFingerprint === proposal.fingerprint))
+          .filter((proposal) => ["ready", "deferred", "apply_failed"].includes(proposal.status))
           .slice(-100)
           .map((proposal) => ({
             capabilityKey: proposal.capabilityKey,
@@ -253,7 +383,15 @@ export class ForgeService {
             rationale: proposal.rationale,
             proposedScope: proposal.selectedScope ?? proposal.proposedScope.scope,
           }));
-        const result = await this.analyzer(ctx, chunk, existing, callController.signal, activeProposals);
+        const analyzed = await this.analyzer(ctx, chunk, existing, callController.signal, activeProposals);
+        // Re-scan after the model call so exact/name collisions created while it
+        // was running are deterministically suppressed before proposal commit.
+        const currentExisting = canonicalResourceInventory([...existing, ...await this.existingResources()]);
+        const reconciled = reconcileResultWithExistingResources(analyzed, currentExisting);
+        if (reconciled.suppressed.length) {
+          await this.store.withLock((state) => addDiagnostic(state, "info", "existing_resource_suppressed", `Suppressed ${reconciled.suppressed.length} analyzer candidate(s): ${reconciled.suppressed.join("; ")}`));
+        }
+        const result = reconciled.result;
         stopHeartbeat(); // No renewal may race commit/release.
         if (signal.aborted || callController.signal.aborted || !this.isGenerationCurrent()) {
           await this.releaseWithoutFailure(claimed);
@@ -275,7 +413,7 @@ export class ForgeService {
           await this.inventory(ctx);
           continue;
         }
-        await this.commit(claimed, verify, chunk, result);
+        await this.commit(claimed, verify, chunk, result, currentExisting);
         // Inventory immediately; trigger-level notification occurs only after all
         // currently persisted corrections and following chunks are caught up.
         await this.inventory(ctx);
@@ -338,7 +476,7 @@ export class ForgeService {
     });
   }
 
-  private async commit(job: AnalysisJob, session: ParsedSession, chunk: AnalysisChunk, result: AnalyzerResult): Promise<void> {
+  private async commit(job: AnalysisJob, session: ParsedSession, chunk: AnalysisChunk, result: AnalyzerResult, existingResources: ExistingResourceSummary[]): Promise<void> {
     await this.store.withLock((state) => {
       const durable = state.jobs.find((item) => item.id === job.id);
       if (!sameLease(durable, job)) return;
@@ -357,6 +495,13 @@ export class ForgeService {
       let newReady = 0;
       for (const candidate of result.candidates) {
         const merged = mergeCandidate(state, candidate, chunk.evidence, analysis);
+        if (candidate.operation === "update" && merged.proposal) {
+          const targetName = candidate.skillName.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+          const target = existingResources.find((resource) => resource.name.toLowerCase().trim() === targetName);
+          if (!target) throw new Error(`Reconciled update target disappeared: ${candidate.skillName}`);
+          merged.proposal.selectedScope = target.scope;
+          merged.proposal.selectedKind = target.kind;
+        }
         if (merged.newlyReady) newReady++;
       }
       const watermark = state.watermarks[job.sessionPath];
@@ -515,4 +660,4 @@ function isAbort(error: unknown): boolean {
 }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 
-export const __testing = { jobId, activeJobFor, discoverSkillNames, sameLease, processAlive, LEASE_MS, HEARTBEAT_MS };
+export const __testing = { jobId, activeJobFor, discoverSkills, discoverPrompts, canonicalResourceInventory, reconcileResultWithExistingResources, semanticResourceDigest, sameLease, processAlive, LEASE_MS, HEARTBEAT_MS };

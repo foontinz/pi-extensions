@@ -1,5 +1,5 @@
 export const STATE_VERSION = 2;
-export const ANALYZER_PROMPT_VERSION = "skill-forge-analyzer-v3";
+export const ANALYZER_PROMPT_VERSION = "skill-forge-analyzer-v4";
 
 export type Scope = "user" | "project";
 export type InstallKind = "skill" | "prompt";
@@ -81,6 +81,17 @@ export interface ActiveProposalSummary {
   skillName: string;
   rationale: string;
   proposedScope: Scope;
+}
+
+/** Bounded, secret-redacted metadata used to reconcile analyzer output with installed resources. */
+export interface ExistingResourceSummary {
+  kind: InstallKind;
+  scope: Scope;
+  name: string;
+  description: string;
+  contentExcerpt: string;
+  contentDigest: string;
+  semanticDigest: string;
 }
 
 export interface AnalyzerCandidate {

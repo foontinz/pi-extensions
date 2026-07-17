@@ -1,11 +1,11 @@
 import { watch, type FSWatcher } from "node:fs";
 import { basename, dirname } from "node:path";
-import { getAgentDir, CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { ExtensionEditorComponent, getAgentDir, CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { applyInstall, prepareInstall, type InstallOptions } from "./install.ts";
 import { deferProposal, editProposal, rejectProposal, reopenProposal, setKindOverride, setScopeOverride } from "./proposals.ts";
 import { ForgeService, type ForgeStatus } from "./service.ts";
 import { ProjectStore, projectStateDir, sha256 } from "./storage.ts";
-import { Input, SelectList, truncateToWidth, type AutocompleteItem, type SelectItem } from "@earendil-works/pi-tui";
+import { Input, Key, matchesKey, SelectList, truncateToWidth, type AutocompleteItem, type SelectItem } from "@earendil-works/pi-tui";
 import type { ForgeState, InstallKind, Proposal, Scope } from "./types.ts";
 
 interface Runtime {
@@ -22,7 +22,7 @@ interface Runtime {
   rerun: boolean;
   force: boolean;
   lastNotificationAt: number;
-  loadedSkillNames: string[];
+  loadedSkills: Array<{ name: string; description?: string; filePath?: string; sourceInfo?: { scope?: string } }>;
 }
 
 export function renderStatus(status: ForgeStatus, width = 80): string {
@@ -93,7 +93,33 @@ export function filterProposalItems(items: SelectItem[], query: string): SelectI
 }
 
 export interface InboxPick { proposal: Proposal; action: "review" | "reject" }
-const CTRL_R = "\x12";
+
+/** Pi's extension editor currently places prefilled cursors at EOF. Keep this
+ * compatibility shim isolated until the public editor API supports placement. */
+function positionExtensionEditorAtStart(component: ExtensionEditorComponent): boolean {
+  const editor = (component as unknown as {
+    editor?: { state?: { lines?: unknown[]; cursorLine?: number; cursorCol?: number }; scrollOffset?: number };
+  }).editor;
+  if (!editor?.state || !Array.isArray(editor.state.lines)) return false;
+  editor.state.cursorLine = 0;
+  editor.state.cursorCol = 0;
+  editor.scrollOffset = 0;
+  return true;
+}
+
+async function openEditorAtTop(ctx: ExtensionCommandContext, title: string, prefill: string): Promise<string | undefined> {
+  if (ctx.mode !== "tui" || typeof (ctx.ui as { custom?: unknown }).custom !== "function") return ctx.ui.editor(title, prefill);
+  return ctx.ui.custom<string | undefined>((tui, _theme, keybindings, done) => {
+    const component = new ExtensionEditorComponent(tui, keybindings, title, prefill, done, () => done(undefined));
+    if (!positionExtensionEditorAtStart(component)) {
+      // Compatibility fallback for a future editor implementation: move up
+      // through more visual rows than the prefill can contain, then home.
+      for (let index = 0; index <= prefill.length; index++) component.handleInput("\x1b[A");
+      component.handleInput("\x1b[H");
+    }
+    return component;
+  });
+}
 
 async function pickProposal(ctx: ExtensionCommandContext, proposals: Proposal[]): Promise<InboxPick | undefined> {
   if (typeof (ctx.ui as { custom?: unknown }).custom !== "function") {
@@ -138,7 +164,7 @@ async function pickProposal(ctx: ExtensionCommandContext, proposals: Proposal[])
       },
       invalidate() {},
       handleInput(data: string) {
-        if (data === CTRL_R) {
+        if (matchesKey(data, Key.ctrl("r"))) {
           const selected = list.getSelectedItem();
           if (selected) done({ id: selected.value, action: "reject" });
         } else if (keybindings.matches(data, "tui.select.up") || keybindings.matches(data, "tui.select.down")
@@ -319,7 +345,7 @@ export default function skillForge(pi: ExtensionAPI) {
     const controller = new AbortController();
     const candidate: Runtime = {
       generation: currentGeneration, sessionId: contextSessionId(ctx), ctx, controller,
-      initialized: Promise.resolve(), rerun: false, force: false, lastNotificationAt: 0, loadedSkillNames: [],
+      initialized: Promise.resolve(), rerun: false, force: false, lastNotificationAt: 0, loadedSkills: [],
     };
     // Publish pending ownership synchronously, before canonicalProject's first await.
     runtime = candidate;
@@ -328,7 +354,7 @@ export default function skillForge(pi: ExtensionAPI) {
       if (!isCurrent(candidate)) return;
       const service = new ForgeService(new ProjectStore(location.dir, location.cwd, location.key), getAgentDir(), CONFIG_DIR_NAME, undefined, undefined, () => isCurrent(candidate));
       candidate.service = service;
-      service.setLoadedSkillNames(candidate.loadedSkillNames);
+      service.setLoadedSkills(candidate.loadedSkills);
       await service.initialize();
       if (!isCurrent(candidate)) return;
       const state = await service.store.read();
@@ -360,8 +386,10 @@ export default function skillForge(pi: ExtensionAPI) {
   pi.on("before_agent_start", (event, ctx) => {
     const candidate = runtime;
     if (!candidate || !adoptContext(candidate, ctx)) return;
-    candidate.loadedSkillNames = (event.systemPromptOptions.skills ?? []).map((skill) => skill.name);
-    candidate.service?.setLoadedSkillNames(candidate.loadedSkillNames);
+    candidate.loadedSkills = (event.systemPromptOptions.skills ?? []).map((skill) => ({
+      name: skill.name, description: skill.description, filePath: skill.filePath, sourceInfo: skill.sourceInfo,
+    }));
+    candidate.service?.setLoadedSkills(candidate.loadedSkills);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
@@ -384,7 +412,10 @@ export default function skillForge(pi: ExtensionAPI) {
     if (!adoptContext(candidate, ctx) || !candidate.service) throw new Error("Skill Forge is still starting or this session is shutting down; try again shortly");
     if ("getSystemPromptOptions" in ctx) {
       const skills = (ctx as ExtensionCommandContext).getSystemPromptOptions().skills ?? [];
-      candidate.loadedSkillNames = skills.map((skill) => skill.name); candidate.service.setLoadedSkillNames(candidate.loadedSkillNames);
+      candidate.loadedSkills = skills.map((skill) => ({
+        name: skill.name, description: skill.description, filePath: skill.filePath, sourceInfo: skill.sourceInfo,
+      }));
+      candidate.service.setLoadedSkills(candidate.loadedSkills);
     }
     return candidate;
   };
@@ -441,10 +472,12 @@ export default function skillForge(pi: ExtensionAPI) {
         continue;
       }
       let proposal = picked.proposal;
-      // Metadata is displayed separately; the editor buffer contains only SKILL.md.
-      output(ctx, proposalMetadata(proposal));
-      const reviewed = await ctx.ui.editor(`Review ${proposal.id} — SKILL.md only`, proposal.skillMd);
-      if (reviewed === undefined) return;
+      // Keep the review buffer limited to SKILL.md. Do not emit proposal metadata
+      // through ui.notify(): TUI notifications persist as a gray transcript block
+      // after the temporary review UI closes. Full metadata remains available via
+      // `/forge inspect <id>`.
+      const reviewed = await openEditorAtTop(ctx, `Review ${proposal.id} — SKILL.md only`, proposal.skillMd);
+      if (reviewed === undefined) continue; // Cancel review: return to the Forge inbox.
       if (reviewed.trim() !== proposal.skillMd.trim()) await candidate.service!.store.withLock((fresh) => editProposal(resolveProposal(fresh.proposals, proposal!.id), reviewed));
       proposal = resolveProposal((await candidate.service!.store.read()).proposals, proposal.id);
       const scope = proposal.selectedScope ?? proposal.proposedScope.scope;
@@ -508,7 +541,7 @@ export default function skillForge(pi: ExtensionAPI) {
       if (command === "inspect") { output(ctx, proposalDetail(proposal)); return; }
       if (command === "edit") {
         if (!ctx.hasUI) throw new Error("/forge edit requires a UI editor");
-        const markdown = await ctx.ui.editor(`Edit ${proposal.id} SKILL.md`, proposal.skillMd); if (markdown === undefined) { output(ctx, "Edit cancelled."); return; }
+        const markdown = await openEditorAtTop(ctx, `Edit ${proposal.id} SKILL.md`, proposal.skillMd); if (markdown === undefined) { output(ctx, "Edit cancelled."); return; }
         await service.store.withLock((fresh) => editProposal(resolveProposal(fresh.proposals, id), markdown)); await refreshUi(candidate); output(ctx, `Edited ${proposal.id}; it remains uninstalled until explicit acceptance.`); return;
       }
       if (command === "accept") {
@@ -545,4 +578,4 @@ export default function skillForge(pi: ExtensionAPI) {
   });
 }
 
-export const __testing = { renderStatus, proposalSummary, proposalMetadata, proposalDetail, resolveProposal, contextSessionId, proposalItem, filterProposalItems, pickProposal, readyInboxProposals };
+export const __testing = { renderStatus, proposalSummary, proposalMetadata, proposalDetail, resolveProposal, contextSessionId, proposalItem, filterProposalItems, positionExtensionEditorAtStart, openEditorAtTop, pickProposal, readyInboxProposals };
