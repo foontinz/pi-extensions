@@ -179,13 +179,13 @@ export default function workflowsExtension(pi: ExtensionAPI) {
     name: "Workflow",
     label: "Workflow",
     description: [
-      "Execute a workflow script that orchestrates multiple in-process subagents — your go-to tool for anything that fans out.",
-      "REACH FOR THIS FIRST whenever a task splits into independent parts: multi-file edits/reviews, codebase-wide search+analysis, per-package/per-service work, batch refactors, migrations, test generation, doc sweeps, or any 'do X for each of these' request. Parallel subagents finish far faster than doing it yourself sequentially, and each gets its own context window so you avoid bloating this one.",
+      "Execute a workflow script that orchestrates multiple in-process subagents.",
+      "Use it when a task has several substantial, genuinely independent parts and parallel execution clearly saves time or context. Prefer direct tools for focused, quick, or tightly sequential work. Strong fits include broad reviews/searches, per-package migrations, batch refactors, and explicit multi-agent requests.",
       "Provide the script via `script` (inline), `scriptPath` (a file), or `name` (a saved workflow).",
       "Inline scripts are persisted to a file; the path is returned so you can edit + re-invoke with `scriptPath`.",
       "Runs in the background by default and delivers a notification on completion. Built-in async hooks: agent, parallel, pipeline, workflow, phase, log, args, failures.",
     ].join("\n"),
-    promptSnippet: "Fan work out across parallel subagents — prefer this for any multi-part/parallelizable task.",
+    promptSnippet: "Fan out substantial independent work when parallel execution clearly helps.",
     // Collapse the call/result in the transcript unless the shared `tool-view`
     // flag is `verbose` (or the row is expanded), matching the tool minimizer.
     renderShell: "self",
@@ -198,9 +198,11 @@ export default function workflowsExtension(pi: ExtensionAPI) {
       return renderWorkflowResult(result, theme, ctx, full);
     },
     promptGuidelines: [
-      "Proactively prefer a Workflow whenever a task has independent parts you could split — don't wait to be asked. If you catch yourself about to do the same kind of step repeatedly (per file/module/service/item), fan it out with parallel() instead.",
-      "Good fits: parallel code review, repo-wide search+summarize, batch refactors/migrations, generating tests or docs across many files, comparing approaches, multi-step pipelines. A quick planning phase() then parallel() agents usually beats sequential hand work.",
-      "It does spawn multiple agents and use tokens, so match the agent count to the work (a handful for small jobs, more for big fan-outs) rather than avoiding it — the parallelism and isolated context windows are the point.",
+      "Consider Workflow when a task has several substantial, genuinely independent parts; prefer direct tools for focused changes, quick investigations, tightly coupled edits, and sequential debugging.",
+      "Good Workflow fits include parallel code review, broad repo search+summarize, batch refactors/migrations, per-package work, comparing independent approaches, and explicit multi-agent requests.",
+      "Use judgment rather than workflow-by-default. Routine phase verification usually needs direct focused tests, not a separate workflow; add an independent audit when risk, breadth, or the user warrants it.",
+      "Keep workflows well scoped. One coherent workflow is usually better than several successive audit workflows.",
+      "Inspect retained output from a failed or timed-out workflow before replacing or rerunning it; continue from usable results instead of duplicating completed work.",
       "Workflow agents run in-process with minimal tools by default: read,bash. Pass opts.tools to widen.",
       "Workflow agents inherit the root session's selected thinking level; pass opts.thinking ('off' through 'max') to override it per agent.",
       "Reviews and verification are often time-consuming; give them generous overall timeoutMs and per-agent opts.timeoutMs instead of short deadlines.",

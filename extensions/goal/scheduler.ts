@@ -679,7 +679,7 @@ const REJECTION_EXPLANATIONS: Record<EvidenceRejectionReason, string> = {
 export function explainCriteriaVerificationFailure(
   criteria: readonly GoalCriterion[],
   reconciliation: GoalEvidenceReconciliation,
-  maxLength = GOAL_BOUNDS.text,
+  maxLength: number = GOAL_BOUNDS.text,
 ): string {
   const lines = ["Phase verification rejected the following evidence:"];
   for (const criterion of criteria) {

@@ -240,13 +240,11 @@ export function formatGoalStatusLine(
   options: GoalRenderOptions = {},
 ): string {
   const width = checkedWidth(options.maxWidth);
-  const context = formatContextPercent(goalContextPercent(options));
   const attention = getGoalAttention(checkpoint, options);
   const line = [
     `🎯 ${attention.badge}`,
     phaseLabel(checkpoint, 48),
     `run ${checkpoint.budgets.epochRuns}/${checkpoint.budgets.maxEpochRuns}`,
-    `ctx ${context}`,
   ].filter((part): part is string => part !== undefined).join(" · ");
   return bounded(line, width);
 }

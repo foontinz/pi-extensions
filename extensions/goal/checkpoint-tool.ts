@@ -243,6 +243,34 @@ function phaseIndex(checkpoint: GoalCheckpointV2, phaseId: string): number {
   return index;
 }
 
+export function goalCandidateRejection(
+  checkpoint: GoalCheckpointV2,
+  suppliedEvidence: readonly { criterionId?: string }[] = [],
+): string | undefined {
+  if (checkpoint.activePhaseId !== undefined) {
+    return "goal completion requires no active phase; finish or replan the current rolling horizon first";
+  }
+  const unfinished = checkpoint.phases.filter((phase) => phase.status !== "completed" && phase.status !== "skipped");
+  if (unfinished.length > 0) {
+    return `goal completion requires every phase completed or skipped; unresolved: ${unfinished.map((phase) => phase.id).join(", ")}`;
+  }
+  const suppliedCriterionIds = new Set(
+    suppliedEvidence
+      .map((evidence) => evidence.criterionId === undefined ? undefined : cleanText(evidence.criterionId))
+      .filter((id): id is string => id !== undefined),
+  );
+  if (checkpoint.acceptanceCriteria.length === 0) {
+    return "goal completion requires explicit acceptance criteria";
+  }
+  const unreadyCriteria = checkpoint.acceptanceCriteria.filter((criterion) =>
+    criterion.status !== "satisfied"
+    || ((criterion.evidenceIds?.length ?? 0) === 0 && !suppliedCriterionIds.has(criterion.id)));
+  if (unreadyCriteria.length > 0) {
+    return `goal completion requires every acceptance criterion satisfied with evidence; unresolved: ${unreadyCriteria.map((criterion) => criterion.id).join(", ")}`;
+  }
+  return undefined;
+}
+
 function validateAction(checkpoint: GoalCheckpointV2, params: GoalCheckpointParams): void {
   const changesPlan = params.phases !== undefined
     || params.acceptanceCriteria !== undefined
@@ -275,6 +303,11 @@ function validateAction(checkpoint: GoalCheckpointV2, params: GoalCheckpointPara
 
   if (params.action === "phase_candidate_complete" && params.phaseId === undefined) {
     fail("phase_candidate_complete requires phaseId");
+  }
+  if (params.action === "goal_candidate_complete") {
+    if (params.phaseId !== undefined) fail("goal_candidate_complete must not specify phaseId");
+    const rejection = goalCandidateRejection(checkpoint, params.evidence ?? []);
+    if (rejection) fail(`goal_candidate_complete rejected: ${rejection}`);
   }
   if (params.action === "blocked") {
     const hasQuestion = params.openQuestions?.some((question) => cleanText(question).length > 0) ?? false;

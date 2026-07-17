@@ -229,13 +229,48 @@ test("goal_checkpoint applies plan, progress, and completion-claim transitions w
   assert.equal(phaseClaim.lifecycle, "verifying_phase");
   assert.equal(phaseClaim.phases[0]?.status, "candidate_complete");
 
-  const goalClaim = applyGoalCheckpoint(phaseClaim, params(phaseClaim, {
+  assert.throws(
+    () => applyGoalCheckpoint(phaseClaim, params(phaseClaim, {
+      action: "goal_candidate_complete",
+      summary: "The bounded phase is not the whole goal",
+    }), run(140, "event-premature-goal-claim")),
+    /requires no active phase/,
+  );
+
+  const phasesDone = structuredClone(phaseClaim);
+  delete phasesDone.activePhaseId;
+  for (const phase of phasesDone.phases) phase.status = "completed";
+  assert.throws(
+    () => applyGoalCheckpoint(phasesDone, params(phasesDone, {
+      action: "goal_candidate_complete",
+      summary: "Phases ended but acceptance remains pending",
+    }), run(145, "event-unproved-goal-claim")),
+    /acceptance criterion satisfied with evidence.*accept-1/,
+  );
+
+  const ready = structuredClone(phasesDone);
+  for (const phase of ready.phases) {
+    phase.status = "completed";
+    for (const criterion of phase.criteria) criterion.status = "satisfied";
+  }
+  ready.acceptanceCriteria[0]!.status = "satisfied";
+  ready.acceptanceCriteria[0]!.evidenceIds = ["acceptance-proof"];
+  ready.evidence.push({
+    id: "acceptance-proof",
+    criterionId: "accept-1",
+    kind: "test",
+    description: "The final acceptance test passed.",
+    locator: "tool:call-final-test",
+    observedAt: 135,
+    runId: controlDetails.runId,
+  });
+  const goalClaim = applyGoalCheckpoint(ready, params(ready, {
     action: "goal_candidate_complete",
-    summary: "Goal appears complete",
-  }), run(140, "event-goal-claim"));
+    summary: "The entire evidenced objective appears complete",
+  }), run(150, "event-goal-claim"));
   assert.equal(goalClaim.lifecycle, "verifying_goal");
   assert.notEqual(goalClaim.lifecycle as string, "succeeded", "a model completion claim is not verification");
-  assert.equal(goalClaim.phases[0]?.status, "candidate_complete");
+  assert.ok(goalClaim.phases.every((phase) => phase.status === "completed"));
 });
 
 test("goal_checkpoint records one typed external wait and clears it on every other action", () => {
@@ -837,7 +872,7 @@ test("attention ownership is explicit and shared by compact renderers", () => {
   assert.match(corrupt.badge, /CORRUPT STATE/);
 });
 
-test("interrupted rendering stays compact and makes reconciliation explicit with unknown context", () => {
+test("interrupted rendering stays compact without duplicating Pi context usage", () => {
   const checkpoint = createInitialCheckpoint("Recover interrupted work", {
     now: 100,
     goalId: "goal-interrupted",
@@ -857,7 +892,8 @@ test("interrupted rendering stays compact and makes reconciliation explicit with
     contextUsage: { tokens: null, contextWindow: 128_000, percent: 95 },
   });
   assert.match(status, /🎯 PAUSED \(interrupted\)/);
-  assert.match(status, /ctx \?/);
+  assert.match(status, /run 0\/30/);
+  assert.doesNotMatch(status, /ctx\s+[?0-9]/i);
 
   const lines = formatGoalWidgetLines(checkpoint, {
     maxWidth: 100,

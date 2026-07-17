@@ -457,6 +457,8 @@ test("create persists its dispatch before sending correlated control", async () 
   assert.equal(harness.statuses.at(-1)?.value, undefined, "goal UI is not duplicated in the footer");
   const widgetLines = harness.widgets.at(-1)?.value as string[];
   assert.equal(widgetLines.length, 2, "goal widget separates status from the next action");
+  assert.doesNotMatch(widgetLines[0]!, /CTX|ctx\s+[?0-9]/, "Pi already renders context usage globally");
+  assert.match(widgetLines[0]!, /RUN 1\/30$/, "the run budget occupies the rightmost header position");
   assert.ok(widgetLines.every((line) => line.length <= 120), "widget rows never wrap into a text blob");
 });
 
@@ -912,6 +914,109 @@ test("goal_checkpoint result details are authoritative and settlement queues one
   assert.equal(harness.controls().length, 2);
 });
 
+test("finishing the bounded horizon returns to planning instead of claiming the whole goal", async () => {
+  const harness = new ExtensionHarness();
+  await createAndObserve(harness, "finish the whole roadmap");
+  await settleWithProgress(harness); // one-phase rolling plan
+
+  const callId = "call-final-phase-test";
+  harness.append({
+    type: "message",
+    message: {
+      role: "assistant",
+      content: [{ type: "toolCall", id: callId, name: "bash", arguments: { command: "npm test" } }],
+      stopReason: "toolUse",
+    },
+  });
+  harness.append({
+    type: "message",
+    message: {
+      role: "toolResult",
+      toolCallId: callId,
+      toolName: "bash",
+      content: [{ type: "text", text: "tests passed" }],
+      isError: false,
+    },
+  });
+  const active = harness.latestPersisted();
+  const result = await harness.callCheckpoint({
+    action: "phase_candidate_complete",
+    expectedRevision: active.revision,
+    phaseId: "phase-1",
+    summary: "The current bounded roadmap slice is complete.",
+    nextAction: "Re-inventory the roadmap and plan the next slice.",
+    evidence: [{
+      id: "phase-proof",
+      criterionId: "phase-criterion-1",
+      kind: "test",
+      description: "The bounded slice tests passed.",
+      locator: `tool:${callId}`,
+    }],
+  });
+  harness.appendCheckpointResult(result);
+  harness.appendAssistant("The bounded phase is ready for acceptance.");
+  await harness.emit("agent_settled");
+
+  const planning = harness.latestPersisted();
+  assert.equal(planning.phases[0]?.status, "completed");
+  assert.equal(planning.lifecycle, "planning");
+  assert.equal(planning.activePhaseId, undefined);
+  assert.equal(planning.acceptanceCriteria[0]?.status, "pending");
+  assert.match(planning.ledger.nextAction ?? "", /Re-inventory the full objective/);
+  assert.equal(planning.scheduler.state, "run_in_flight", "the next run must extend the rolling plan");
+  assert.doesNotMatch(harness.notifications.map((item) => item.message).join("\n"), /Goal completion is claimed/);
+});
+
+test("a structurally complete but unproved whole-goal claim returns to planning", async () => {
+  const harness = new ExtensionHarness();
+  const active = await createAndObserve(harness, "finish the whole roadmap");
+  let result = await harness.callCheckpoint({
+    action: "set_plan",
+    expectedRevision: active.revision,
+    summary: "Model-authored closure has a deliberately missing proof source.",
+    acceptanceCriteria: [{
+      id: "accept-1",
+      description: "The whole roadmap is complete.",
+      status: "satisfied",
+      evidenceIds: ["missing-goal-proof"],
+    }],
+    phases: [{
+      id: "phase-1",
+      title: "Roadmap",
+      intent: "Finish the roadmap.",
+      status: "completed",
+      criteria: [{ id: "phase-criterion-1", description: "Phase complete.", status: "satisfied" }],
+    }],
+    evidence: [{
+      id: "missing-goal-proof",
+      criterionId: "accept-1",
+      kind: "test",
+      description: "Purported final proof.",
+      locator: "tool:missing-final-proof",
+    }],
+  });
+  harness.appendCheckpointResult(result);
+  harness.appendAssistant("Closure plan recorded.");
+  await harness.emit("agent_settled");
+
+  const ready = harness.latestPersisted();
+  result = await harness.callCheckpoint({
+    action: "goal_candidate_complete",
+    expectedRevision: ready.revision,
+    summary: "Claim the whole goal with the unresolved source.",
+  });
+  harness.appendCheckpointResult(result);
+  harness.appendAssistant("Goal claim recorded.");
+  await harness.emit("agent_settled");
+
+  const rejected = harness.latestPersisted();
+  assert.equal(rejected.lifecycle, "planning");
+  assert.equal(rejected.scheduler.state, "run_in_flight");
+  assert.match(rejected.ledger.nextAction ?? "", /Whole-goal verification rejected/);
+  assert.match(rejected.ledger.nextAction ?? "", /accept-1 \/ missing-goal-proof/);
+  assert.doesNotMatch(harness.notifications.map((item) => item.message).join("\n"), /Goal completion is claimed/);
+});
+
 test("rejected phase evidence returns to work with criterion-specific diagnostics", async () => {
   const harness = new ExtensionHarness();
   await createAndObserve(harness);
@@ -1152,9 +1257,10 @@ test("legacy text sentinels remain bounded migration compatibility only", async 
   await createAndObserve(achieved);
   achieved.appendAssistant("legacy client claim\n[[GOAL_ACHIEVED]]");
   await achieved.emit("agent_settled");
-  assert.equal(achieved.latestPersisted().lifecycle, "verifying_goal");
+  assert.equal(achieved.latestPersisted().lifecycle, "planning");
   assert.notEqual(achieved.latestPersisted().lifecycle, "succeeded");
-  assert.equal(achieved.controls().length, 1, "legacy achievement never auto-verifies or loops");
+  assert.match(achieved.latestPersisted().ledger.nextAction ?? "", /Legacy completion claim rejected/);
+  assert.equal(achieved.controls().length, 2, "an unproved legacy claim returns to one planning run");
 
   const blocked = new ExtensionHarness();
   await createAndObserve(blocked);
@@ -1169,7 +1275,70 @@ test("completion is only a verification claim and /goal done explicitly succeeds
   const harness = new ExtensionHarness();
   await createAndObserve(harness);
   await settleWithProgress(harness);
-  await settleWithProgress(harness, "goal_candidate_complete");
+
+  const proofCallId = "call-final-acceptance-test";
+  harness.append({
+    type: "message",
+    message: {
+      role: "assistant",
+      content: [{ type: "toolCall", id: proofCallId, name: "bash", arguments: { command: "npm test" } }],
+      stopReason: "toolUse",
+    },
+  });
+  harness.append({
+    type: "message",
+    message: {
+      role: "toolResult",
+      toolCallId: proofCallId,
+      toolName: "bash",
+      content: [{ type: "text", text: "tests passed" }],
+      isError: false,
+    },
+  });
+  let active = harness.latestPersisted();
+  let result = await harness.callCheckpoint({
+    action: "set_plan",
+    expectedRevision: active.revision,
+    summary: "Reconciled the entire objective and its acceptance evidence.",
+    acceptanceCriteria: [{
+      id: "accept-1",
+      description: "The objective is observably satisfied.",
+      status: "satisfied",
+      evidenceIds: ["final-proof"],
+    }],
+    phases: [{
+      id: "phase-1",
+      title: "Execute objective",
+      intent: "Perform and verify the bounded work.",
+      status: "completed",
+      criteria: [{
+        id: "phase-criterion-1",
+        description: "The phase has observed evidence.",
+        status: "satisfied",
+        evidenceIds: ["final-proof"],
+      }],
+    }],
+    evidence: [{
+      id: "final-proof",
+      criterionId: "accept-1",
+      kind: "test",
+      description: "The final acceptance test passed.",
+      locator: `tool:${proofCallId}`,
+    }],
+  });
+  harness.appendCheckpointResult(result);
+  harness.appendAssistant("The complete objective is now structurally ready for a goal claim.");
+  await harness.emit("agent_settled");
+
+  active = harness.latestPersisted();
+  result = await harness.callCheckpoint({
+    action: "goal_candidate_complete",
+    expectedRevision: active.revision,
+    summary: "The entire evidenced objective is complete and ready for review.",
+  });
+  harness.appendCheckpointResult(result);
+  harness.appendAssistant("Goal completion claim recorded.");
+  await harness.emit("agent_settled");
 
   assert.equal(harness.latestPersisted().lifecycle, "verifying_goal");
   assert.equal(harness.latestPersisted().scheduler.state, "idle");
@@ -1177,7 +1346,7 @@ test("completion is only a verification claim and /goal done explicitly succeeds
 
   await harness.command("verify");
   assert.equal(harness.latestPersisted().scheduler.state, "run_in_flight");
-  assert.equal(harness.controls().length, 3);
+  assert.equal(harness.controls().length, 4);
   await harness.command("done");
   assert.equal(harness.latestPersisted().lifecycle, "succeeded");
   assert.equal(harness.latestPersisted().scheduler.state, "idle");

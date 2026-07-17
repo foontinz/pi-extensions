@@ -16,6 +16,7 @@ import { Type } from "typebox";
 import {
   GoalCheckpointParams,
   applyGoalCheckpoint,
+  goalCandidateRejection,
   type GoalCheckpointRunIdentity,
 } from "./checkpoint-tool.ts";
 import { buildGoalWorkingPacket, GOAL_COMPACTION_INSTRUCTIONS } from "./prompt.ts";
@@ -60,17 +61,16 @@ import {
   type GoalHydrationSource,
 } from "./state.ts";
 import {
-  formatContextPercent,
   formatGoalStatusLine,
   formatGoalWidgetLines,
   getGoalAttention,
   getGoalPhaseDisplay,
-  goalContextPercent,
   truncateOneLine,
 } from "./render.ts";
 
 const DEFAULT_MAX_RUNS = 30;
 const MAX_MAX_RUNS = 500;
+const TERMINAL_WIDGET_VISIBLE_MS = 15_000;
 const CONTROL_CONTENT = "Continue the current bounded goal phase and record exactly one durable goal checkpoint.";
 const WIDGET_KEY = "goal";
 
@@ -500,6 +500,19 @@ export default function goalExtension(pi: ExtensionAPI): void {
   let resumeCandidate: GoalResumeCandidate | undefined;
   let resumeCandidateHadPriorTool = false;
   let pendingResumeDispatch: PendingGoalAnswerSettlement | undefined;
+  let terminalWidgetTimer: ReturnType<typeof setTimeout> | undefined;
+  let terminalWidgetEventId: string | undefined;
+
+  const clearTerminalWidgetTimer = (): void => {
+    if (terminalWidgetTimer) clearTimeout(terminalWidgetTimer);
+    terminalWidgetTimer = undefined;
+    terminalWidgetEventId = undefined;
+  };
+
+  const hideGoalWidget = (ctx: ExtensionContext): void => {
+    ctx.ui.setWidget(WIDGET_KEY, undefined);
+    ctx.ui.setStatus(WIDGET_KEY, undefined);
+  };
 
   const notify = (
     ctx: ExtensionContext,
@@ -511,6 +524,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 
   const render = (ctx: ExtensionContext): void => {
     if (!state) {
+      clearTerminalWidgetTimer();
       if (corruption) {
         const header = "◆  PAUSED — CORRUPT STATE";
         const detail = "   └─ ACTION  run /goal resume to recover or /goal stop to discard";
@@ -533,18 +547,38 @@ export default function goalExtension(pi: ExtensionAPI): void {
       ctx.ui.setStatus(WIDGET_KEY, undefined);
       return;
     }
-    if (state.lifecycle === "succeeded" && !corruption) {
-      ctx.ui.setWidget(WIDGET_KEY, undefined);
-      ctx.ui.setStatus(WIDGET_KEY, undefined);
-      return;
+    if (isTerminalLifecycle(state) && !corruption) {
+      if (state.lifecycle === "succeeded") {
+        clearTerminalWidgetTimer();
+        hideGoalWidget(ctx);
+        return;
+      }
+      const eventId = state.eventId;
+      const remaining = TERMINAL_WIDGET_VISIBLE_MS - Math.max(0, Date.now() - state.updatedAt);
+      if (remaining <= 0) {
+        clearTerminalWidgetTimer();
+        hideGoalWidget(ctx);
+        return;
+      }
+      if (terminalWidgetEventId !== eventId) {
+        clearTerminalWidgetTimer();
+        terminalWidgetEventId = eventId;
+        terminalWidgetTimer = setTimeout(() => {
+          terminalWidgetTimer = undefined;
+          terminalWidgetEventId = undefined;
+          if (!alive || state?.eventId !== eventId || !isTerminalLifecycle(state)) return;
+          hideGoalWidget(ctx);
+        }, remaining);
+        terminalWidgetTimer.unref?.();
+      }
+    } else {
+      clearTerminalWidgetTimer();
     }
     const checkpoint = state;
-    const usage = contextUsage(ctx);
     const attention = getGoalAttention(checkpoint, { corruptState: corruption !== undefined });
 
     if (ctx.mode === "tui") {
       const phase = getGoalPhaseDisplay(checkpoint);
-      const context = formatContextPercent(goalContextPercent({ contextUsage: usage }));
 
       ctx.ui.setWidget(WIDGET_KEY, (_tui, theme) => ({
         render(width: number): string[] {
@@ -565,7 +599,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
             : "";
           const right = volatile + theme.fg(
             "dim",
-            `RUN ${checkpoint.budgets.epochRuns}/${checkpoint.budgets.maxEpochRuns}  ·  CTX ${context}`,
+            `RUN ${checkpoint.budgets.epochRuns}/${checkpoint.budgets.maxEpochRuns}`,
           );
           const rightWidth = visibleWidth(right);
           let header: string;
@@ -589,7 +623,6 @@ export default function goalExtension(pi: ExtensionAPI): void {
       }));
     } else {
       const lines = formatGoalWidgetLines(checkpoint, {
-        contextUsage: usage,
         corruptState: corruption !== undefined,
       });
       if (volatileUntilFirstAssistant) lines[0] = truncateOneLine(`${lines[0]} · volatile`, 140);
@@ -1019,13 +1052,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
             } else {
               delete draft.activePhaseId;
               const unresolved = draft.phases.some((candidate) => candidate.status === "pending");
-              if (unresolved) {
-                draft.lifecycle = "planning";
-                draft.ledger.nextAction = "Replan unresolved phases whose dependencies cannot currently be satisfied.";
-              } else {
-                draft.lifecycle = "verifying_goal";
-                draft.ledger.nextAction = "Verify every acceptance criterion against branch evidence.";
-              }
+              draft.lifecycle = "planning";
+              draft.ledger.nextAction = unresolved
+                ? "Replan unresolved phases whose dependencies cannot currently be satisfied."
+                : "Re-inventory the full objective and acceptance criteria. Call set_plan for the next rolling horizon; use goal_candidate_complete only when the entire objective—not merely the current bounded plan—is complete.";
             }
           });
         } else {
@@ -1046,9 +1076,25 @@ export default function goalExtension(pi: ExtensionAPI): void {
       }
     }
 
-    // Generic tool observations cannot prove arbitrary acceptance semantics.
-    // Goal completion therefore remains a claim until the user explicitly
-    // accepts it with /goal done (or requests another /goal verify run).
+    if (state?.lifecycle === "verifying_goal") {
+      const evidence = reconcileSuccessfulEvidence(state, branch);
+      if (!areCriteriaVerifiablySatisfied(state.acceptanceCriteria, evidence)) {
+        const prefix = "Whole-goal verification rejected; the bounded plan is not the objective. ";
+        const diagnostics = explainCriteriaVerificationFailure(
+          state.acceptanceCriteria,
+          evidence,
+          GOAL_BOUNDS.text - prefix.length,
+        );
+        persistAdapterTransition(ctx, (draft) => {
+          draft.lifecycle = "planning";
+          delete draft.activePhaseId;
+          draft.ledger.nextAction = `${prefix}${diagnostics}`;
+        });
+      }
+    }
+
+    // A fully reconciled goal completion remains a claim until the user
+    // explicitly accepts it with /goal done (or requests another verification).
     return phaseFinished;
   };
 
@@ -1416,9 +1462,16 @@ export default function goalExtension(pi: ExtensionAPI): void {
       if (signal) {
         recorded = persistAdapterTransition(ctx, (draft) => {
           if (signal.type === "achieved") {
-            draft.lifecycle = "verifying_goal";
-            delete draft.pauseReason;
-            draft.ledger.nextAction = "Verify the legacy completion claim against actual branch evidence.";
+            const rejection = goalCandidateRejection(draft);
+            if (rejection) {
+              draft.lifecycle = draft.activePhaseId ? "running" : "planning";
+              delete draft.pauseReason;
+              draft.ledger.nextAction = `Legacy completion claim rejected: ${rejection}. Continue the active phase or set the next rolling plan.`;
+            } else {
+              draft.lifecycle = "verifying_goal";
+              delete draft.pauseReason;
+              draft.ledger.nextAction = "Verify the legacy completion claim against actual branch evidence.";
+            }
             if (draft.ledger.recentProgress.at(-1) !== "Legacy completion sentinel claimed success.") {
               draft.ledger.recentProgress.push("Legacy completion sentinel claimed success.");
             }
@@ -1686,6 +1739,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
   pi.on("session_tree", (_event: SessionTreeEvent, ctx: ExtensionContext) => restore(ctx, "tree"));
   pi.on("session_shutdown", (_event: SessionShutdownEvent) => {
     alive = false;
+    clearTerminalWidgetTimer();
     compactionLease = undefined;
     resumeCandidate = undefined;
     resumeCandidateHadPriorTool = false;
@@ -1828,6 +1882,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
         if (!state) return void notify(ctx, "No goal to accept.", "info");
         if (state.lifecycle !== "verifying_goal") {
           return void notify(ctx, "/goal done is explicit acceptance of a pending goal-completion claim.", "warning");
+        }
+        const rejection = goalCandidateRejection(state);
+        if (rejection) {
+          return void notify(ctx, `/goal done rejected: ${rejection}. Replan or verify the remaining objective first.`, "warning");
         }
         if (reduceAndExecute({ type: "mark_succeeded", now: nowFor(state), eventId: newEventId() }, ctx)) {
           notify(ctx, "Goal completion explicitly accepted.", "info");

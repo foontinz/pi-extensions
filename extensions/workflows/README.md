@@ -4,11 +4,12 @@ Always-available `Workflow` tool that orchestrates multiple **in-process**
 subagents (via the SDK `createAgentSession`, no `pi` subprocess / tmux). Depends on
 the `subagents` extension's in-process runner.
 
-## When to use it (reach for this first)
+## When to use it
 
-Prefer a `Workflow` **proactively** — don't wait to be explicitly asked — whenever
-a task splits into independent parts. If you're about to repeat the same kind of
-step across many files/modules/services/items, fan it out instead. Strong fits:
+Use a `Workflow` when a task has several substantial, genuinely independent
+parts and parallel execution clearly saves time or context. Prefer direct tools
+for focused changes, quick investigations, tightly coupled edits, sequential
+debugging, and routine verification. Strong fits:
 
 - Parallel code review or repo-wide search + summarize
 - Batch refactors / migrations / codemods across many files
@@ -16,11 +17,11 @@ step across many files/modules/services/items, fan it out instead. Strong fits:
 - Comparing multiple approaches in parallel
 - Multi-step pipelines (a planning `phase()` then `parallel()` agents)
 
-Parallel subagents finish far faster than sequential hand-work, and each gets its
-own context window so this session stays lean. It does spawn multiple agents and
-use tokens — so size the agent count to the job (a handful for small tasks, more
-for big fan-outs) rather than avoiding it; the parallelism and isolated context
-are the point.
+Parallel subagents can be faster than sequential work, and each gets its own
+context window. Prefer one coherent workflow over successive audit workflows.
+Routine phase checks should normally use focused direct tests; add an independent
+audit when risk, breadth, or the user warrants it. Inspect retained output before
+replacing a failed or timed-out workflow so completed work is not duplicated.
 
 ## Tool: `Workflow`
 
