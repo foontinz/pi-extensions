@@ -59,6 +59,12 @@ test("a long runId never overflows when shown after finish", () => {
   for (const line of long) assert.ok(visibleWidth(line) <= 60, `overflow: ${JSON.stringify(line)}`);
 });
 
+test("phase remains visible at common narrow widths", () => {
+  const header = new WorkflowDashboard(snap(), plainTheme, 0).render(76)[0];
+  assert.match(header, /WORKFLOW {2}PHASE 2\/2/);
+  assert.match(header, /RUN 1\/4/);
+});
+
 test("running dashboard shows phase, counts, tokens and agent glyphs", () => {
   const text = new WorkflowDashboard(snap(), plainTheme, 0).render(120).join("\n");
   assert.match(text, /WORKFLOW {2}PHASE 2\/2 {2}synthesize/);
@@ -70,6 +76,27 @@ test("running dashboard shows phase, counts, tokens and agent glyphs", () => {
   assert.match(text, /↻ verify/);
   assert.match(text, /retry 1\/2/);
   assert.match(text, /timeout/);
+});
+
+test("phase is shown only in the header, not repeated on agent rows", () => {
+  const text = new WorkflowDashboard(snap(), plainTheme, 0).render(120).join("\n");
+  assert.equal(text.match(/synthesize/g)?.length, 1);
+  assert.doesNotMatch(text, /research/);
+});
+
+test("running rows show each agent's latest activity", () => {
+  const current = snap();
+  current.agents[2].activity = "→ read extensions/workflows/index.ts";
+  const text = new WorkflowDashboard(current, plainTheme, 0).render(120).join("\n");
+  assert.match(text, /summarize.*→ read extensions\/workflows\/index\.ts/);
+});
+
+test("agent activity strips terminal escape and control sequences", () => {
+  const current = snap();
+  current.agents[2].activity = "safe \x1b]2;spoofed title\x07\x1b[2J text\x00";
+  const text = new WorkflowDashboard(current, plainTheme, 0).render(120).join("\n");
+  assert.match(text, /safe\s+text/);
+  assert.doesNotMatch(text, /spoofed|\x1b|\x00/);
 });
 
 test("live view updates one registered widget without changing its order", () => {
@@ -92,12 +119,34 @@ test("live view updates one registered widget without changing its order", () =>
   const view = createWorkflowView(ctx, "a1b2c3d4", "inline");
   view.onState(snap({ phase: "research", phases: ["research"] }));
   assert.equal(setWidgetCalls, 1);
-  assert.match(widget?.render(76).join("\n") ?? "", /research/);
+  assert.match(widget?.render(110).join("\n") ?? "", /research/);
 
   view.onState(snap({ phase: "synthesize", phases: ["research", "synthesize"] }));
   assert.equal(setWidgetCalls, 1, "state updates must not remove and re-add the widget");
   assert.equal(renderRequests, 1);
-  assert.match(widget?.render(76).join("\n") ?? "", /synthesize/);
+  assert.match(widget?.render(110).join("\n") ?? "", /synthesize/);
+});
+
+test("finishing a cancelled view terminalizes in-flight agent rows", () => {
+  let widget: Component | undefined;
+  const tui = { requestRender: () => {} };
+  const ctx = {
+    hasUI: true,
+    ui: {
+      setWidget: (_key: string, content: unknown) => {
+        if (typeof content === "function") {
+          widget = (content as (_tui: typeof tui, theme: typeof plainTheme) => Component)(tui, plainTheme);
+        }
+      },
+    },
+  } as unknown as ExtensionContext;
+  const view = createWorkflowView(ctx, "cancelled1", "inline");
+  view.onState(snap());
+  view.finish("cancelled");
+  const text = widget?.render(120).join("\n") ?? "";
+  assert.match(text, /◆ {2}CANCELLED/);
+  assert.match(text, /⊘ summarize.*workflow cancelled/);
+  assert.doesNotMatch(text, /⠋ summarize/);
 });
 
 test("completed dashboard replaces the phase with a status label", () => {
@@ -109,6 +158,18 @@ test("completed dashboard replaces the phase with a status label", () => {
 test("cancelled dashboard shows the cancelled label", () => {
   const text = new WorkflowDashboard(snap({ status: "cancelled", phase: undefined }), plainTheme, 0).render(76).join("\n");
   assert.match(text, /◆ {2}CANCELLED/);
+});
+
+test("failed agents are prioritized ahead of queued rows when collapsed", () => {
+  const now = Date.now();
+  const agents: WorkflowSnapshot["agents"] = [
+    ...Array.from({ length: 5 }, (_, i) => ({ index: i, label: `running-${i}`, status: "running" as const, attempt: 0, maxRetries: 2, startedAt: now })),
+    { index: 5, label: "queued-a", status: "queued", attempt: 0, maxRetries: 2 },
+    { index: 6, label: "queued-b", status: "queued", attempt: 0, maxRetries: 2 },
+    { index: 7, label: "important-failure", status: "failed", attempt: 0, maxRetries: 2, reason: "boom" },
+  ];
+  const text = new WorkflowDashboard(snap({ agents, launched: agents.length }), plainTheme, 0).render(100).join("\n");
+  assert.match(text, /important-failure/);
 });
 
 test("collapses to a bounded number of agent rows", () => {

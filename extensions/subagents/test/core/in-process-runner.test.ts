@@ -332,6 +332,76 @@ test("explicit thinking level is forwarded to createAgentSession", async () => {
   assert.equal(result.output, "done");
 });
 
+test("reports live assistant and tool activity to parent UIs", async () => {
+  const activities: string[] = [];
+  let listener: ((event: any) => void) | undefined;
+  const session = fakeSession({
+    subscribe: (next: (event: any) => void) => {
+      listener = next;
+      return () => { listener = undefined; };
+    },
+    prompt: async () => {
+      listener?.({ type: "tool_execution_start", toolName: "read", args: { path: "/tmp/example.ts" } });
+      listener?.({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "First line\nSummarizing findings" }] },
+      });
+      listener?.({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: `${"x".repeat(400)}LATEST` }] },
+      });
+    },
+    messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+  });
+
+  const result = await runSubagentInProcess(
+    { task: "inspect", cwd: process.cwd(), onActivity: (activity) => activities.push(activity) },
+    async () => ({ session } as CreateAgentSessionResult),
+  );
+
+  assert.equal(result.output, "done");
+  assert.ok(activities.some((activity) => activity.includes("→ read /tmp/example.ts")));
+  assert.ok(activities.includes("Summarizing findings"));
+  assert.equal(activities.at(-1)?.length, 300);
+  assert.match(activities.at(-1) ?? "", /LATEST$/);
+  assert.equal(listener, undefined, "activity subscription should be removed on completion");
+});
+
+test("activity observer failures never break the child run", async (t) => {
+  await t.test("throwing callback and malformed event", async () => {
+    let listener: ((event: any) => void) | undefined;
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    const session = fakeSession({
+      subscribe: (next: (event: any) => void) => { listener = next; return () => {}; },
+      prompt: async () => {
+        listener?.({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "visible" }] } });
+        listener?.({ type: "tool_execution_start", toolName: "custom", args: circular });
+      },
+      messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+    });
+    const result = await runSubagentInProcess(
+      { task: "inspect", cwd: process.cwd(), onActivity: () => { throw new Error("observer failed"); } },
+      async () => ({ session } as CreateAgentSessionResult),
+    );
+    assert.equal(result.output, "done");
+    assert.equal(result.error, undefined);
+  });
+
+  await t.test("throwing subscription", async () => {
+    const session = fakeSession({
+      subscribe: () => { throw new Error("subscription unavailable"); },
+      messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+    });
+    const result = await runSubagentInProcess(
+      { task: "inspect", cwd: process.cwd(), onActivity: () => {} },
+      async () => ({ session } as CreateAgentSessionResult),
+    );
+    assert.equal(result.output, "done");
+    assert.equal(result.error, undefined);
+  });
+});
+
 test("dispose exceptions do not replace a successful result", async () => {
   const session = fakeSession({
     messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],

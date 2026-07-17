@@ -3,6 +3,7 @@ import * as path from "node:path";
 import {
   createAgentSession,
   createExtensionRuntime,
+  type AgentSessionEventListener,
   getAgentDir,
   getLastAssistantUsage,
   ModelRuntime,
@@ -14,6 +15,7 @@ import {
 
 import { getSharedMcpGateway } from "../mcp/gateway.js";
 import { createMcpProxyTool } from "../mcp/proxy-tool.js";
+import { formatToolCall, previewToolResult } from "../output/message-format.js";
 import { emptyUsageStats, type SubagentResult, type TerminalReason, type UsageStats } from "./types.js";
 
 // Shared, process-wide runtime so fanned-out agents don't each rebuild auth/model
@@ -125,6 +127,8 @@ export interface InProcessSubagentOptions {
   sessionDir?: string;
   /** Explicit session id (controls the transcript filename suffix). */
   sessionId?: string;
+  /** Best-effort live activity text for parent UIs (assistant text, tool calls, retries). */
+  onActivity?: (activity: string) => void;
 }
 
 export function createBareResourceLoader(systemPrompt?: string, appendSystemPrompt: readonly string[] = []): ResourceLoader {
@@ -183,6 +187,7 @@ export async function runSubagentInProcess(
     | { kind: "create-error"; error: unknown };
 
   let session: Session | undefined;
+  let unsubscribe: (() => void) | undefined;
   let cancellation: Cancellation | undefined;
   let resolveCancellation!: (value: Cancellation) => void;
   const cancellationPromise = new Promise<Cancellation>((resolve) => { resolveCancellation = resolve; });
@@ -332,6 +337,61 @@ export async function runSubagentInProcess(
     }
 
     session = startup.session;
+    let lastAssistantActivityAt = Number.NEGATIVE_INFINITY;
+    const reportActivity = (activity: string | undefined): void => {
+      if (!activity?.trim()) return;
+      try {
+        options.onActivity?.(activity);
+      } catch {
+        // Visibility is best-effort and must never break the child run.
+      }
+    };
+    const subscribe = (session as unknown as {
+      subscribe?: (listener: AgentSessionEventListener) => () => void;
+    }).subscribe;
+    if (typeof subscribe === "function" && options.onActivity) {
+      try {
+        unsubscribe = subscribe.call(session, (event) => {
+          try {
+            switch (event?.type) {
+              case "message_update": {
+                if (event.message?.role !== "assistant") break;
+                const now = performance.now();
+                if (now - lastAssistantActivityAt < 100) break;
+                lastAssistantActivityAt = now;
+                reportActivity(latestAssistantActivity(event.message.content)
+                  ?? (event.assistantMessageEvent?.type === "thinking_delta" ? "thinking…" : undefined));
+                break;
+              }
+              case "message_end":
+                if (event.message?.role === "assistant") reportActivity(latestAssistantActivity(event.message.content));
+                break;
+              case "tool_execution_start":
+                reportActivity(`→ ${formatToolCall(String(event.toolName ?? "tool"), event.args)}`);
+                break;
+              case "tool_execution_update": {
+                const preview = previewToolResult(event.partialResult);
+                if (preview) reportActivity(`↻ ${String(event.toolName ?? "tool")}: ${preview}`);
+                break;
+              }
+              case "tool_execution_end":
+                reportActivity(`${event.isError ? "✗" : "✓"} ${String(event.toolName ?? "tool")}: ${previewToolResult(event.result) || "done"}`);
+                break;
+              case "auto_retry_start":
+                reportActivity(`retry ${event.attempt ?? "?"}/${event.maxAttempts ?? "?"}: ${event.errorMessage ?? "provider error"}`);
+                break;
+              case "compaction_start":
+                reportActivity("compacting context…");
+                break;
+            }
+          } catch {
+            // Malformed/unexpected session events must not break the child run.
+          }
+        });
+      } catch {
+        // Session observability is optional; continue if subscription fails.
+      }
+    }
     checkDeadline();
     if (cancellation) {
       const partial = partialResult(session);
@@ -384,8 +444,16 @@ export async function runSubagentInProcess(
   } finally {
     if (timeout) clearTimeout(timeout);
     options.signal?.removeEventListener("abort", onAbort);
+    try { unsubscribe?.(); } catch { /* best-effort observer cleanup */ }
     disposeSession(session);
   }
+}
+
+/** Latest non-empty assistant line, compact enough to retain as live UI state. */
+function latestAssistantActivity(content: unknown): string | undefined {
+  const text = assistantMessageText(content);
+  const line = text.split(/\r?\n/).map((value) => value.trim()).filter(Boolean).at(-1);
+  return line ? line.replace(/\s+/g, " ").slice(-300) : undefined;
 }
 
 /**

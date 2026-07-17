@@ -107,6 +107,26 @@ test("schema retry succeeds on second attempt", async () => {
   assert.equal(n, 2);
 });
 
+test("schema correction attempts remain visibly retrying", async () => {
+  const controller = new AbortController();
+  let calls = 0;
+  const statuses: string[] = [];
+  const runner = new WorkflowRunner(
+    "/tmp",
+    undefined,
+    controller.signal,
+    () => {},
+    async () => (++calls === 1 ? ok("invalid") : ok('{"answer":42}', { answer: 42 })),
+    (snapshot) => {
+      const status = snapshot.agents[0]?.status;
+      if (status) statuses.push(status);
+    },
+  );
+  await runner.run(`return await agent("q", { schema: { required: ["answer"] } });`);
+  assert.ok(statuses.includes("retrying"));
+  assert.equal(runner.snapshot().agents[0].status, "completed");
+});
+
 test("ordinary executor errors are not retried", async () => {
   let calls = 0;
   const runner = makeRunner(async () => {
@@ -340,6 +360,27 @@ test("snapshot tracks agent lifecycle, phases and usage", async () => {
   assert.equal(final.launched, 2);
   assert.equal(final.usage.input, 20);
   assert.ok(snaps.length > 0, "onState should be called during the run");
+});
+
+test("snapshot exposes each agent's task and latest live activity", async () => {
+  const controller = new AbortController();
+  const activities: string[] = [];
+  const runner = new WorkflowRunner(
+    "/tmp",
+    undefined,
+    controller.signal,
+    () => {},
+    async (options) => {
+      options.onActivity?.("\x1b]2;spoofed\x07\x1b[2J→ read extensions/workflows/index.ts\x00");
+      return ok("done");
+    },
+    (snapshot) => {
+      if (snapshot.agents[0]?.activity) activities.push(snapshot.agents[0].activity);
+    },
+  );
+  await runner.run(`return await agent("Inspect workflow rendering in detail", { label: "inspect" });`);
+  assert.ok(activities.includes("Inspect workflow rendering in detail"));
+  assert.equal(runner.snapshot().agents[0].activity, "→ read extensions/workflows/index.ts");
 });
 
 test("snapshot records a failed agent with its reason", async () => {

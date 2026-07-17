@@ -2,6 +2,20 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 // Shared pure formatting helpers for the workflows UI widgets.
 
+// Covers OSC strings plus CSI/related sequences. Apply before stripping C0/C1
+// controls so BEL/ST terminators remain available to delimit OSC payloads.
+const TERMINAL_ESCAPE_RE = new RegExp(
+  "(?:\\u001B\\][\\s\\S]*?(?:\\u0007|\\u001B\\u005C|\\u009C))|"
+    + "[\\u001B\\u009B][[\\]()#;?]*(?:\\d{1,4}(?:[;:]\\d{0,4})*)?[\\dA-PR-TZcf-nq-uy=><~]",
+  "g",
+);
+const TERMINAL_CONTROL_RE = /[\u0000-\u001F\u007F-\u009F]/g;
+
+/** Remove terminal escape/control sequences from untrusted model/tool text. */
+export function sanitizeTerminalText(text: string): string {
+  return text.replace(TERMINAL_ESCAPE_RE, "").replace(TERMINAL_CONTROL_RE, " ");
+}
+
 /** Abbreviate a count: `1234` -> `"1.2k"`, `1_500_000` -> `"1.5m"`. */
 export function compact(n: number): string {
   if (n < 1000) return `${n}`;

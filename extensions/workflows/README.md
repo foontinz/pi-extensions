@@ -88,36 +88,30 @@ Reviews and verification are often time-consuming. Give them generous per-agent
 
 ## Live view (TUI)
 
-While a run is active — including background runs — a boxed dashboard is shown
-`belowEditor`, keyed per `runId` (no footer status line):
+While a run is active — including background runs — a borderless dashboard is
+shown `belowEditor`, keyed per `runId` (no footer status line):
 
 ```
-╭─ Workflow a1b2c3d4 ──────────────────────────────────────────╮
-│ ⠸ research › synthesize                  ▰▱▱▱▱▱▱▱ 2/11         │
-│ 8 active · 3 queued · ↑12k ↓4.1k · $0.083 · 1 failed     0:42 │
-├──────────────────────────────────────────────────────────────┤
-│ ✓ crawl-docs      research                              0:12 │
-│ ✗ fetch-legacy    research                   timeout after…  │
-│ ⠸ summarize       synthesize                            0:03 │
-│ ↻ verify          synthesize                       retry 1/2 │
-│ · draft-report    synthesize                          queued │
-│ … 3 more                                                     │
-╰──────────────────────────────────────────────────────────────╯
+◆  ⠸ RUNNING  │  WORKFLOW  PHASE 2/2  synthesize       RUN 1/4 · ↑12k ↓4.1k · $0.083 · 0:42
+   ├─ ✓ crawl-docs    done                                                     0:12
+   ├─ ✗ fetch-legacy  timeout                                                  0:25
+   ├─ ⠸ summarize     → read extensions/workflows/index.ts                     0:03
+   └─ ↻ verify        retry 1/2 · correcting output                            0:05
 ```
 
-- The header shows a spinner + a **phase breadcrumb** (`research › synthesize`,
-  current one highlighted) — or `completed`/`failed` when done — plus a progress
-  bar of completed/launched agents and the count.
-- The metrics row shows live concurrency (`active`/`queued`) while running (or the
-  total agent count when finished), rolled-up token usage, cost, failures, a
-  rate-limit flag, and elapsed time (frozen at finish).
-- Agent rows use glyphs: `✓` done · `✗` failed · `↻` retrying · `⠸` running ·
+- The header shows run state, current phase, completed/launched count, rolled-up
+  token usage, cost, failures/rate limits, and elapsed time.
+- Every running agent row shows its **latest real activity**: its task while
+  queued/starting, streaming assistant text, current tool call/output, provider
+  retry, or compaction. The activity is updated in place without adding transcript
+  noise or triggering a render for every token.
+- Agent rows use glyphs: `✓` done · `✗` failed · `↻` retrying · spinner running ·
   `·` queued. Running/retrying/failed agents are prioritized; the rest collapse
-  into a `… N more` line.
-- The view is responsive to terminal width and disappears a few seconds after the
-  run finishes. Rendering is driven by `WorkflowRunner.snapshot()` /
-  `WorkflowSnapshot`; see `ui/dashboard.ts`. In RPC mode the component factory is
-  ignored (no widget is shown).
+  into a `… N more` line. Phase appears only once in the workflow header so each
+  row can prioritize its agent activity.
+- The view disappears a few seconds after the run finishes. Rendering is driven by
+  `WorkflowRunner.snapshot()` / `WorkflowSnapshot`; see `ui/dashboard.ts`. In RPC
+  mode the component factory is ignored (no widget is shown).
 
 ## Stopping a run
 
@@ -126,10 +120,10 @@ A background run can be cancelled while in flight with the **`stop_workflow`** t
 running workflow. Optional `reason` is recorded on the run.
 
 Stopping aborts the shared `AbortSignal`, which cancels in-flight subagents. The run
-ends as **cancelled** (not failed): a distinct `⊘ cancelled` glyph in the dashboard and
-completion notice, and the reason is surfaced inline. A turn abort (Esc) on a
-foreground run is treated the same way; the overall `timeoutMs` still ends the run as
-`failed`.
+ends as **cancelled** (not failed): the dashboard header switches to `CANCELLED`,
+in-flight rows switch to `⊘`, and the completion notice includes the stop reason. A
+turn abort (Esc) on a foreground run is treated the same way; the overall `timeoutMs`
+still ends the run as `failed`.
 
 ## Completion notifications
 
@@ -168,8 +162,8 @@ ack or summary. Errors are always shown.
   abort in-flight agents.
 - **Shared runtime:** all agents reuse one process-wide async `ModelRuntime`
   (validated under concurrency) instead of rebuilding model/auth state per agent.
-- **Background delivery:** background runs notify the parent session on completion via
-  an idle-aware `sendUserMessage` (`followUp` when idle, else `steer`).
+- **Background delivery:** background runs notify the parent session with an idle-aware
+  custom `sendMessage` (`followUp` when idle, else `steer`).
 
 ## Worktree isolation
 

@@ -13,6 +13,7 @@ import { DEFAULT_RUN_RETENTION_MS, pruneOldRuns } from "../subagents/core/run-ar
 import { addUsage, emptyUsageStats, type SubagentResult, type UsageStats } from "../subagents/core/types.js";
 import { createWorktree, WorktreeStartupCleanupError } from "../subagents/workspace/create-worktree.js";
 import { WorkflowDashboard } from "./ui/dashboard.js";
+import { sanitizeTerminalText } from "./ui/format.js";
 import { renderWorkflowNotification, type WorkflowNotificationDetails } from "./ui/notification.js";
 import { renderWorkflowCall, renderWorkflowResult } from "./ui/tool-render.js";
 
@@ -68,7 +69,7 @@ function runDirFor(runId: string): string {
   return path.join(getAgentDir(), "workflows", "runs", runId);
 }
 
-export type WorkflowAgentStatus = "queued" | "running" | "retrying" | "completed" | "failed";
+export type WorkflowAgentStatus = "queued" | "running" | "retrying" | "completed" | "failed" | "cancelled";
 
 export interface WorkflowAgentView {
   index: number;
@@ -80,6 +81,8 @@ export interface WorkflowAgentView {
   startedAt?: number;
   finishedAt?: number;
   reason?: string;
+  /** Latest task/assistant/tool activity shown in the live dashboard. */
+  activity?: string;
 }
 
 export interface WorkflowSnapshot {
@@ -1034,7 +1037,15 @@ export class WorkflowRunner {
     const maxRetries = Math.max(0, opts.retries ?? 2);
     const baseCwd = opts.cwd ? path.resolve(this.cwd, opts.cwd) : this.cwd;
 
-    const view: WorkflowAgentView = { index, label, phase: this.currentPhase, status: "queued", attempt: 0, maxRetries };
+    const view: WorkflowAgentView = {
+      index,
+      label,
+      phase: this.currentPhase,
+      status: "queued",
+      attempt: 0,
+      maxRetries,
+      activity: compactActivity(task),
+    };
     this.agentViews.set(index, view);
     this.touch();
 
@@ -1084,8 +1095,9 @@ export class WorkflowRunner {
       const sessionDir = this.logDir ? path.join(this.logDir, "agents") : undefined;
       const sessionId = this.logDir ? `${this.runId || "run"}-a${index}` : undefined;
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        view.status = "running";
-        const result = await this.runWith429Backoff(prompt, opts, effectiveCwd, sessionDir, sessionId);
+        // Keep the retry glyph/state visible throughout corrective attempts.
+        view.status = attempt === 0 ? "running" : "retrying";
+        const result = await this.runWith429Backoff(prompt, opts, effectiveCwd, view, sessionDir, sessionId);
         this.usage = addUsage(this.usage, result.usage);
         if (result.sessionFile) this.writeLog(`agent ${label} (#${index}) transcript: agents/${path.basename(result.sessionFile)}`);
         // A workflow-level abort (external cancel or the overall timeout) cancels
@@ -1157,7 +1169,14 @@ export class WorkflowRunner {
     return existing.reason;
   }
 
-  private async runWith429Backoff(task: string, opts: AgentOptions, cwd: string, sessionDir?: string, sessionId?: string) {
+  private async runWith429Backoff(
+    task: string,
+    opts: AgentOptions,
+    cwd: string,
+    view: WorkflowAgentView,
+    sessionDir?: string,
+    sessionId?: string,
+  ) {
     for (let attempt = 0; ; attempt++) {
       const execution = this.trackExecution(this.executor({
         task,
@@ -1170,11 +1189,16 @@ export class WorkflowRunner {
         signal: this.runSignal,
         sessionDir,
         sessionId,
+        // The snapshot keeps references to agent view objects. Mutating this
+        // field is enough for the dashboard's 120ms render ticker to pick up
+        // streaming activity without rerendering once per model token.
+        onActivity: (activity) => { view.activity = compactActivity(activity); },
       }));
       const result = await this.withAbort(execution);
       if (result.error && isRateLimit(result.error.message) && attempt < MAX_429_RETRIES) {
         const delayMs = Math.min(30_000, 500 * 2 ** attempt) + Math.floor(Math.random() * 250);
         this.rateLimited = true;
+        view.activity = `rate-limited; retrying in ${delayMs}ms`;
         this.emit(`rate-limited; backing off ${delayMs}ms`);
         await delay(delayMs, this.runSignal);
         this.rateLimited = false;
@@ -1273,6 +1297,10 @@ function validateSchema(value: unknown, schema?: AgentSchema): string | undefine
   const missing = (schema.required ?? []).filter((key) => !(key in (value as Record<string, unknown>)));
   if (missing.length > 0) return `missing required keys: ${missing.join(", ")}`;
   return undefined;
+}
+
+function compactActivity(text: string): string {
+  return sanitizeTerminalText(text).replace(/\s+/g, " ").trim().slice(-300) || "starting…";
 }
 
 function isRateLimit(message: string): boolean {
@@ -1393,11 +1421,17 @@ export function createWorkflowView(ctx: ExtensionContext, runId: string, origin:
         failures: result?.failures.length ?? 0,
         rateLimited: false,
       };
+      const finishedAt = Date.now();
       snap = {
         ...base,
         status,
-        finishedAt: Date.now(),
+        finishedAt,
         phase: undefined,
+        agents: base.agents.map((agent) => {
+          if (agent.status === "completed" || agent.status === "failed" || agent.status === "cancelled") return agent;
+          const reason = status === "cancelled" ? "workflow cancelled" : "workflow ended";
+          return { ...agent, status: status === "cancelled" ? "cancelled" : "failed", finishedAt, reason, activity: reason };
+        }),
         active: 0,
         queued: 0,
         rateLimited: false,
