@@ -78,7 +78,9 @@ export class WorkspaceArtifactStore {
         const bundleFile = await this.fileRecord(bundlePath);
         this.assertArtifactSize(bundleFile.bytes);
         await this.git(record.repositoryRoot, ["bundle", "verify", bundlePath]);
+        await this.syncFile(bundlePath);
         await fs.rename(bundlePath, path.join(leaseDir, "baseline.bundle"));
+        await this.syncDirectory(leaseDir);
         const baseline: BaselineRecord = {
           repositoryId,
           provisioningBase: head,
@@ -332,10 +334,19 @@ export class WorkspaceArtifactStore {
         },
       };
       this.validateManifestPaths(manifest);
+      const totalArtifactBytes = manifest.files["full.patch"].bytes + manifest.files["snapshot.bundle"].bytes;
+      this.assertArtifactSize(totalArtifactBytes);
       const manifestPath = path.join(staging, "manifest.json");
       await this.atomicJson(manifestPath, manifest);
       const manifestDigest = (await this.fileRecord(manifestPath)).sha256;
+      await Promise.all([
+        this.syncFile(path.join(staging, "full.patch")),
+        this.syncFile(path.join(staging, "snapshot.bundle")),
+        this.syncFile(manifestPath),
+      ]);
+      await this.syncDirectory(staging);
       await fs.rename(staging, this.artifactDir(artifactId));
+      await this.syncDirectory(path.join(this.root, "artifacts"));
 
       // Reopen from its final name, anchor the manifest in the durable lease,
       // then verify again before making cleanup possible.
@@ -455,6 +466,27 @@ export class WorkspaceArtifactStore {
       await handle.close();
     }
     await fs.rename(temporary, file);
+    await this.syncDirectory(path.dirname(file));
+  }
+
+  private async syncFile(file: string): Promise<void> {
+    const handle = await fs.open(file, "r");
+    try { await handle.sync(); } finally { await handle.close(); }
+  }
+
+  private async syncDirectory(directory: string): Promise<void> {
+    let handle: fs.FileHandle | undefined;
+    try {
+      handle = await fs.open(directory, "r");
+      await handle.sync();
+    } catch (error) {
+      // Directory fsync is unsupported on some filesystems/platforms. Only
+      // suppress the documented unsupported-operation cases.
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EINVAL" && code !== "ENOTSUP" && code !== "EISDIR") throw error;
+    } finally {
+      await handle?.close().catch(() => {});
+    }
   }
 
   private async readJson<T>(file: string): Promise<T> {
