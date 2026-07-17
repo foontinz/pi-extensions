@@ -102,6 +102,29 @@ test("schema validation is strict Draft 2020-12 with local refs", async () => {
   assert.equal((await submit(capability, { name: "ok" })).terminate, true);
 });
 
+test("standard formats are explicitly enabled", async () => {
+  const capability = createStructuredOutputCapability({
+    schema: {
+      type: "object",
+      properties: { createdAt: { type: "string", format: "date-time" } },
+      required: ["createdAt"],
+    },
+  });
+  assert.equal((await submit(capability, { createdAt: "not-a-date" })).terminate, false);
+  assert.equal((await submit(capability, { createdAt: "2026-07-17T12:00:00Z" })).terminate, true);
+});
+
+test("schema and submitted value bytes are bounded", async () => {
+  assert.throws(
+    () => createStructuredOutputCapability({ schema: { type: "object", description: "x".repeat(300_000) } }),
+    /encoded JSON bytes/,
+  );
+  const capability = createStructuredOutputCapability({ schema: { type: "object" } });
+  const result = await submit(capability, { payload: "x".repeat(1_100_000) });
+  assert.equal(result.terminate, false);
+  assert.match((result.content[0] as { text: string }).text, /encoded JSON bytes/);
+});
+
 test("rejects remote refs, custom keywords, async/$data, non-JSON schemas, cycles, and non-object roots", () => {
   assert.throws(
     () => createStructuredOutputCapability({ schema: { type: "object", properties: { x: { $ref: "https://example.test/schema" } } } }),

@@ -1,4 +1,5 @@
 import { Ajv2020, type ErrorObject, type ValidateFunction } from "ajv/dist/2020.js";
+import addFormats from "ajv-formats";
 import { Type } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 
@@ -7,7 +8,10 @@ export const MAX_STRUCTURED_OUTPUT_SUBMISSIONS = 5;
 
 const MAX_DIAGNOSTIC_CHARS = 2_000;
 const MAX_PREVIEW_CHARS = 1_000;
+const MAX_SCHEMA_BYTES = 256 * 1024;
+const MAX_VALUE_BYTES = 1024 * 1024;
 const MAX_SCHEMA_NODES = 10_000;
+const MAX_SCHEMA_REFERENCES = 256;
 const MAX_NESTING_DEPTH = 64;
 
 /** A JSON Schema Draft 2020-12 document whose root describes an object. */
@@ -50,6 +54,7 @@ export function createStructuredOutputCapability(options: StructuredOutputOption
     removeAdditional: false,
     $data: false,
   });
+  (addFormats as unknown as (instance: Ajv2020) => unknown)(ajv);
 
   let validate: ValidateFunction;
   try {
@@ -84,8 +89,11 @@ export function createStructuredOutputCapability(options: StructuredOutputOption
       submissions += 1;
 
       const jsonProblem = jsonCompatibilityProblem(value, "value");
-      const objectValue = !jsonProblem && isObject(value) ? value : undefined;
-      let problem = jsonProblem;
+      const sizeProblem = !jsonProblem && jsonBytes(value) > MAX_VALUE_BYTES
+        ? `value exceeds ${MAX_VALUE_BYTES} encoded JSON bytes`
+        : undefined;
+      const objectValue = !jsonProblem && !sizeProblem && isObject(value) ? value : undefined;
+      let problem = jsonProblem ?? sizeProblem;
       if (!problem && !objectValue) problem = "value must be a JSON object at the top level";
       if (!problem && objectValue && !validate(objectValue)) problem = formatAjvErrors(validate.errors, objectValue);
 
@@ -125,6 +133,9 @@ export function createStructuredOutputCapability(options: StructuredOutputOption
 function validateAndCloneSchema(input: StructuredOutputSchema): StructuredOutputSchema {
   const problem = jsonCompatibilityProblem(input, "schema", true);
   if (problem) throw new Error(bound(`Invalid structured output schema: ${problem}. Schema: ${preview(input)}`));
+  if (jsonBytes(input) > MAX_SCHEMA_BYTES) {
+    throw new Error(bound(`Invalid structured output schema: schema exceeds ${MAX_SCHEMA_BYTES} encoded JSON bytes. Schema: ${preview(input)}`));
+  }
   if (!isObject(input)) throw new Error("Invalid structured output schema: schema must be a JSON object");
   if (input.type !== undefined && input.type !== "object") {
     throw new Error(bound(`Invalid structured output schema: top-level type must be \"object\". Schema: ${preview(input)}`));
@@ -137,6 +148,7 @@ function validateAndCloneSchema(input: StructuredOutputSchema): StructuredOutput
 function jsonCompatibilityProblem(value: unknown, root: string, inspectSchema = false): string | undefined {
   const seen = new WeakSet<object>();
   let nodes = 0;
+  let references = 0;
 
   const visit = (current: unknown, path: string, depth: number): string | undefined => {
     if (++nodes > MAX_SCHEMA_NODES) return `${root} exceeds ${MAX_SCHEMA_NODES} nodes`;
@@ -154,8 +166,9 @@ function jsonCompatibilityProblem(value: unknown, root: string, inspectSchema = 
       if (inspectSchema) {
         if (key === "$async") return `${childPath} uses unsupported async validation`;
         if (key === "$data") return `${childPath} uses disabled $data references`;
-        if (key === "$ref" && (typeof child !== "string" || !child.startsWith("#"))) {
-          return `${childPath} must be a local reference beginning with #`;
+        if (key === "$ref") {
+          if (++references > MAX_SCHEMA_REFERENCES) return `${root} exceeds ${MAX_SCHEMA_REFERENCES} schema references`;
+          if (typeof child !== "string" || !child.startsWith("#")) return `${childPath} must be a local reference beginning with #`;
         }
       }
       const problem = visit(child, childPath, depth + 1);
@@ -184,6 +197,11 @@ function toolResult(text: string, terminate: boolean) {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function jsonBytes(value: unknown): number {
+  const encoded = JSON.stringify(value);
+  return encoded === undefined ? 0 : Buffer.byteLength(encoded, "utf8");
 }
 
 function preview(value: unknown): string {
