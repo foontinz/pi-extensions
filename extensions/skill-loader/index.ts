@@ -1,5 +1,5 @@
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { getAgentDir, getSettingsListTheme, loadSkillsFromDir } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, Skill } from "@earendil-works/pi-coding-agent";
+import { formatSkillsForPrompt, getAgentDir, getSettingsListTheme, loadSkillsFromDir } from "@earendil-works/pi-coding-agent";
 import { Container, type SettingItem, SettingsList, truncateToWidth } from "@earendil-works/pi-tui";
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
@@ -14,6 +14,7 @@ const ROOT = join(getAgentDir(), "skill-loader");
 const SOURCES_DIR = join(ROOT, "sources");
 const REGISTRY_PATH = join(ROOT, "registry.json");
 const REGISTRY_LOCK_PATH = join(ROOT, "registry.lock");
+const USER_SKILLS_DIR = join(getAgentDir(), "skills");
 const SKILLS_UI_COMMAND_NAME = "skills-ui";
 const LOCK_RETRY_DELAY_MS = 25;
 const LOCK_TIMEOUT_MS = 10_000;
@@ -22,6 +23,13 @@ const LOCK_STALE_MS = 60_000;
 export type Registry = {
   version: 1;
   skills: Record<string, InstalledSkill>;
+  userSkills: Record<string, UserSkillPreference>;
+};
+
+export type UserSkillPreference = {
+  enabled: boolean;
+  discoveredAt: string;
+  updatedAt: string;
 };
 
 export type InstalledSkill = {
@@ -45,7 +53,7 @@ export type GitHubSpec = {
 type DiscoveredSkill = Pick<InstalledSkill, "name" | "description" | "path">;
 
 function emptyRegistry(): Registry {
-  return { version: 1, skills: {} };
+  return { version: 1, skills: {}, userSkills: {} };
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -69,7 +77,15 @@ async function lstatIfExists(path: string) {
 async function loadRegistry(): Promise<Registry> {
   try {
     const parsed = JSON.parse(await readFile(REGISTRY_PATH, "utf8"));
-    if (parsed?.version === 1 && parsed.skills && typeof parsed.skills === "object") return parsed;
+    if (parsed?.version === 1 && parsed.skills && typeof parsed.skills === "object") {
+      return {
+        version: 1,
+        skills: parsed.skills,
+        // Registry v1 originally tracked only downloaded skills. Missing local
+        // preferences migrate safely: user-directory skills default to user-only.
+        userSkills: parsed.userSkills && typeof parsed.userSkills === "object" ? parsed.userSkills : {},
+      };
+    }
   } catch {
     // First run or corrupt file. Start clean rather than crashing pi startup.
   }
@@ -384,6 +400,66 @@ export async function discoverSkills(root: string): Promise<DiscoveredSkill[]> {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
+/** Discover Pi's normal user skills without modifying their SKILL.md files. */
+export function discoverUserSkills(root = USER_SKILLS_DIR): Skill[] {
+  return loadSkillsFromDir({ dir: root, source: "user" }).skills
+    .sort((a, b) => a.name.localeCompare(b.name) || a.filePath.localeCompare(b.filePath));
+}
+
+/** New user-directory skills are deliberately user-only until explicitly enabled. */
+export function reconcileUserSkillPreferences(
+  registry: Registry,
+  discovered: Skill[],
+  now: string,
+): void {
+  const currentPaths = new Set(discovered.map((skill) => resolve(skill.filePath)));
+  for (const path of Object.keys(registry.userSkills)) {
+    if (!currentPaths.has(path)) delete registry.userSkills[path];
+  }
+  for (const path of currentPaths) {
+    registry.userSkills[path] ??= { enabled: false, discoveredAt: now, updatedAt: now };
+  }
+}
+
+function userSkillPreference(registry: Registry, skill: Skill, userSkillsRoot = USER_SKILLS_DIR): UserSkillPreference | undefined {
+  if (!isPathWithin(userSkillsRoot, skill.filePath)) return undefined;
+  return registry.userSkills[resolve(skill.filePath)] ?? { enabled: false, discoveredAt: "", updatedAt: "" };
+}
+
+/** Apply Skill Loader visibility while preserving non-user/project/package skill policy. */
+export function selectSkillsForPrompt(skills: Skill[], registry: Registry, userSkillsRoot = USER_SKILLS_DIR): Skill[] {
+  const installedByPath = new Map(
+    Object.values(registry.skills).map((skill) => [resolve(skill.path), skill.enabled] as const),
+  );
+  return skills.flatMap((skill) => {
+    const userPreference = userSkillPreference(registry, skill, userSkillsRoot);
+    const installedEnabled = installedByPath.get(resolve(skill.baseDir));
+    const enabled = userPreference?.enabled ?? installedEnabled;
+    if (enabled === undefined) return [skill];
+    return enabled ? [{ ...skill, disableModelInvocation: false }] : [];
+  });
+}
+
+const STANDARD_SKILLS_SECTION = /\n\nThe following skills provide specialized instructions for specific tasks\.[\s\S]*?<\/available_skills>/;
+
+/** Replace Pi's generated skills section without rewriting user-owned skill files. */
+export function rewriteSkillsInPrompt(systemPrompt: string, allSkills: Skill[], selectedSkills: Skill[]): string {
+  const originalSection = formatSkillsForPrompt(allSkills);
+  const selectedSection = formatSkillsForPrompt(selectedSkills);
+  if (originalSection && systemPrompt.includes(originalSection)) {
+    return systemPrompt.replace(originalSection, selectedSection);
+  }
+  if (STANDARD_SKILLS_SECTION.test(systemPrompt)) {
+    return systemPrompt.replace(STANDARD_SKILLS_SECTION, selectedSection);
+  }
+  if (!selectedSection) return systemPrompt;
+  const cwdMarker = "\nCurrent working directory:";
+  const markerIndex = systemPrompt.lastIndexOf(cwdMarker);
+  return markerIndex >= 0
+    ? `${systemPrompt.slice(0, markerIndex)}${selectedSection}${systemPrompt.slice(markerIndex)}`
+    : `${systemPrompt}${selectedSection}`;
+}
+
 export function reconcileSourceSkills(
   registry: Registry,
   source: Pick<InstalledSkill, "sourceId" | "sourceUrl">,
@@ -434,38 +510,78 @@ async function installFromGitHub(url: string, options: { enabled: boolean }): Pr
   });
 }
 
-function getSortedSkills(registry: Registry): InstalledSkill[] {
-  return Object.values(registry.skills).sort((a, b) => a.name.localeCompare(b.name));
+type SkillToggleTarget = {
+  id: string;
+  key: string;
+  name: string;
+  origin: "user" | "downloaded";
+  enabled: boolean;
+};
+
+async function skillToggleTargets(): Promise<SkillToggleTarget[]> {
+  const userSkills = discoverUserSkills();
+  const now = new Date().toISOString();
+  await mutateRegistry((registry) => reconcileUserSkillPreferences(registry, userSkills, now));
+  const registry = await loadRegistry();
+  return [
+    ...Object.values(registry.skills).map((skill) => ({
+      id: `downloaded:${skill.name}`,
+      key: skill.name,
+      name: skill.name,
+      origin: "downloaded" as const,
+      enabled: skill.enabled,
+    })),
+    ...userSkills.map((skill) => {
+      const key = resolve(skill.filePath);
+      return {
+        id: `user:${key}`,
+        key,
+        name: skill.name,
+        origin: "user" as const,
+        enabled: registry.userSkills[key]?.enabled ?? false,
+      };
+    }),
+  ].sort((a, b) => a.name.localeCompare(b.name) || a.origin.localeCompare(b.origin) || a.key.localeCompare(b.key));
 }
 
-function toSkillSettingItems(registry: Registry): SettingItem[] {
-  return getSortedSkills(registry).map((skill) => ({
-    id: skill.name,
-    label: skill.name,
-    currentValue: skill.enabled ? "enabled" : "disabled",
-    values: ["enabled", "disabled"],
+function toSkillSettingItems(targets: SkillToggleTarget[]): SettingItem[] {
+  return targets.map((skill) => ({
+    id: skill.id,
+    label: `${skill.name} (${skill.origin})`,
+    currentValue: skill.enabled ? "enabled" : "user-only",
+    values: ["enabled", "user-only"],
   }));
 }
 
-async function setSkillEnabled(name: string, enabled: boolean): Promise<boolean> {
+async function setSkillEnabled(target: SkillToggleTarget, enabled: boolean): Promise<boolean> {
   return mutateRegistry((registry) => {
-    const skill = registry.skills[name];
-    if (!skill) return false;
-    if (skill.enabled !== enabled) {
-      skill.enabled = enabled;
-      skill.updatedAt = new Date().toISOString();
+    const now = new Date().toISOString();
+    if (target.origin === "downloaded") {
+      const skill = registry.skills[target.key];
+      if (!skill) return false;
+      if (skill.enabled !== enabled) {
+        skill.enabled = enabled;
+        skill.updatedAt = now;
+      }
+      return true;
+    }
+    const preference = registry.userSkills[target.key];
+    if (!preference) return false;
+    if (preference.enabled !== enabled) {
+      preference.enabled = enabled;
+      preference.updatedAt = now;
     }
     return true;
   });
 }
 
 async function openSkillsUi(ctx: ExtensionCommandContext): Promise<void> {
-  let registry = await loadRegistry();
-  if (getSortedSkills(registry).length === 0) {
-    ctx.ui.notify("No skills installed with skill-loader yet. Start pi with --install-skill <github-url> first.", "info");
+  const targets = await skillToggleTargets();
+  if (targets.length === 0) {
+    ctx.ui.notify(`No skills found in ${USER_SKILLS_DIR} or installed with --install-skill.`, "info");
     return;
   }
-
+  const targetsById = new Map(targets.map((target) => [target.id, target]));
   let dirty = false;
   let updateQueue = Promise.resolve();
 
@@ -475,11 +591,11 @@ async function openSkillsUi(ctx: ExtensionCommandContext): Promise<void> {
       new (class {
         render(width: number) {
           return [
-            truncateToWidth(theme.fg("accent", theme.bold("Skill Loader")), width),
+            truncateToWidth(theme.fg("accent", theme.bold("Skills")), width),
             truncateToWidth(
               theme.fg(
                 "dim",
-                "Toggle installed skills. Enabled skills appear in the system prompt after reload; disabled skills stay hidden but can still be invoked with /skill:name.",
+                "Enabled skills are advertised to the model. User-only skills stay out of the prompt and remain available through /skill:name.",
               ),
               width,
             ),
@@ -491,20 +607,20 @@ async function openSkillsUi(ctx: ExtensionCommandContext): Promise<void> {
     );
 
     const settingsList = new SettingsList(
-      toSkillSettingItems(registry),
-      Math.min(getSortedSkills(registry).length + 2, 18),
+      toSkillSettingItems(targets),
+      Math.min(targets.length + 2, 18),
       getSettingsListTheme(),
       (id, newValue) => {
         updateQueue = updateQueue
           .then(async () => {
             const enabled = newValue === "enabled";
-            const skill = registry.skills[id];
-            if (!skill || skill.enabled === enabled) return;
-            const ok = await setSkillEnabled(id, enabled);
+            const target = targetsById.get(id);
+            if (!target || target.enabled === enabled) return;
+            const ok = await setSkillEnabled(target, enabled);
             if (!ok) return;
-            registry = await loadRegistry();
+            target.enabled = enabled;
             dirty = true;
-            settingsList.updateValue(id, enabled ? "enabled" : "disabled");
+            settingsList.updateValue(id, enabled ? "enabled" : "user-only");
             tui.requestRender();
           })
           .catch((error) => {
@@ -512,6 +628,7 @@ async function openSkillsUi(ctx: ExtensionCommandContext): Promise<void> {
           });
       },
       () => done(undefined),
+      { enableSearch: true },
     );
 
     container.addChild(settingsList);
@@ -532,7 +649,7 @@ async function openSkillsUi(ctx: ExtensionCommandContext): Promise<void> {
 
   await updateQueue;
   if (!dirty) return;
-  const ok = !ctx.hasUI || (await ctx.ui.confirm("Reload skills", "Skill settings updated. Reload resources now so the system prompt reflects changes?"));
+  const ok = !ctx.hasUI || (await ctx.ui.confirm("Reload skills", "Skill settings updated. Reload resources now so model visibility reflects changes?"));
   if (!ok) {
     ctx.ui.notify("Saved changes. Run /reload later to apply them.", "info");
     return;
@@ -546,30 +663,47 @@ export default function skillLoader(pi: ExtensionAPI) {
     type: "string",
   });
 
+  pi.registerFlag("install-skill-enabled", {
+    description: "Install --install-skill skills enabled and visible to the model instead of the user-only default",
+    type: "boolean",
+    default: false,
+  });
+
   pi.registerFlag("install-skill-disabled", {
-    description: "Install --install-skill skills but leave them disabled/hidden from the system prompt",
+    description: "Keep --install-skill skills user-only (legacy compatibility; this is now the default)",
     type: "boolean",
     default: false,
   });
 
   pi.on("resources_discover", async () => {
     const registry = await loadRegistry();
+    // Discover every downloaded skill so Pi owns /skill:name expansion. Prompt
+    // visibility is filtered separately and defaults to user-only.
     const skillPaths = await Promise.all(
       Object.values(registry.skills)
-        .filter((skill) => skill.enabled)
         .map((skill) => assertSafeSkillTree(skill.path, sourcePathFor(SOURCES_DIR, skill.sourceId))),
     );
     return { skillPaths };
+  });
+
+  pi.on("before_agent_start", async (event) => {
+    const allSkills = event.systemPromptOptions.skills ?? [];
+    const selectedTools = event.systemPromptOptions.selectedTools;
+    if (selectedTools && !selectedTools.includes("read")) return;
+    const registry = await loadRegistry();
+    const selectedSkills = selectSkillsForPrompt(allSkills, registry);
+    event.systemPromptOptions.skills = selectedSkills;
+    return { systemPrompt: rewriteSkillsInPrompt(event.systemPrompt, allSkills, selectedSkills) };
   });
 
   pi.on("session_start", async (_event, ctx) => {
     const url = pi.getFlag("install-skill");
     if (typeof url !== "string" || !url.trim()) return;
     try {
-      const enabled = pi.getFlag("install-skill-disabled") !== true;
+      const enabled = pi.getFlag("install-skill-enabled") === true && pi.getFlag("install-skill-disabled") !== true;
       const installed = await installFromGitHub(url, { enabled });
       ctx.ui.notify(
-        `Installed ${installed.length} skill(s): ${installed.map((s) => s.name).join(", ")}${enabled ? "" : " (disabled)"}`,
+        `Installed ${installed.length} skill(s): ${installed.map((s) => s.name).join(", ")}${enabled ? " (enabled)" : " (user-only)"}`,
         "info",
       );
     } catch (error) {
@@ -579,30 +713,8 @@ export default function skillLoader(pi: ExtensionAPI) {
     }
   });
 
-  pi.on("input", async (event) => {
-    const match = event.text.match(/^\/skill:([a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)(?:\s+([\s\S]*))?$/);
-    if (!match) return { action: "continue" };
-
-    const [, name, args = ""] = match;
-    const registry = await loadRegistry();
-    const skill = registry.skills[name];
-    if (!skill || skill.enabled) return { action: "continue" };
-
-    const safeSkillPath = await assertSafeSkillTree(skill.path, sourcePathFor(SOURCES_DIR, skill.sourceId));
-    const markdown = await readFile(join(safeSkillPath, "SKILL.md"), "utf8");
-    const userArgs = args.trim() ? `\n\nUser: ${args.trim()}` : "";
-    return {
-      action: "transform",
-      text:
-        `Load and use this disabled/on-demand skill. Resolve all relative paths against: ${safeSkillPath}\n\n` +
-        markdown +
-        userArgs,
-      images: event.images,
-    };
-  });
-
   pi.registerCommand(SKILLS_UI_COMMAND_NAME, {
-    description: "Open an interactive UI to enable/disable installed skills",
+    description: "Open an interactive UI to control model visibility for downloaded and user-directory skills",
     handler: async (_args, ctx) => {
       await openSkillsUi(ctx);
     },

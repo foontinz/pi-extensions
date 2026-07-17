@@ -10,10 +10,14 @@ import {
   cloneOrUpdate,
   discoverSkills,
   reconcileSourceSkills,
+  reconcileUserSkillPreferences,
+  rewriteSkillsInPrompt,
+  selectSkillsForPrompt,
   splitTreePath,
   withDirectoryLock,
   type Registry,
 } from "../index";
+import { formatSkillsForPrompt, type Skill } from "@earendil-works/pi-coding-agent";
 
 const execFileAsync = promisify(execFile);
 
@@ -44,6 +48,7 @@ test("discovers skills with Pi's YAML parser and reconciles removed source skill
 
     const registry: Registry = {
       version: 1,
+      userSkills: {},
       skills: {
         stale: {
           name: "stale",
@@ -90,6 +95,63 @@ test("discovers skills with Pi's YAML parser and reconciles removed source skill
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("user-directory skills default to user-only and prompt filtering preserves explicit choices", () => {
+  const userRoot = "/agent/skills";
+  const skill = (name: string, filePath: string, baseDir: string, disableModelInvocation = false): Skill => ({
+    name,
+    description: `${name} description`,
+    filePath,
+    baseDir,
+    disableModelInvocation,
+    sourceInfo: {} as Skill["sourceInfo"],
+  });
+  const local = skill("local-skill", `${userRoot}/local-skill/SKILL.md`, `${userRoot}/local-skill`, true);
+  const downloaded = skill("downloaded-skill", "/agent/skill-loader/sources/repo/downloaded/SKILL.md", "/agent/skill-loader/sources/repo/downloaded");
+  const project = skill("project-skill", "/project/.pi/skills/project-skill/SKILL.md", "/project/.pi/skills/project-skill");
+  const registry: Registry = {
+    version: 1,
+    userSkills: {},
+    skills: {
+      "downloaded-skill": {
+        name: "downloaded-skill",
+        description: "downloaded",
+        path: downloaded.baseDir,
+        sourceUrl: "https://github.com/acme/skills",
+        sourceId: "acme",
+        enabled: false,
+        installedAt: "earlier",
+        updatedAt: "earlier",
+      },
+    },
+  };
+
+  assert.deepEqual(selectSkillsForPrompt([local], registry, userRoot), [], "an unseen local skill is user-only immediately");
+  const localOnlyPrompt = `Header${formatSkillsForPrompt([{ ...local, disableModelInvocation: false }])}\nCurrent working directory: /project`;
+  assert.doesNotMatch(rewriteSkillsInPrompt(localOnlyPrompt, [{ ...local, disableModelInvocation: false }], []), /available_skills|local-skill/);
+
+  reconcileUserSkillPreferences(registry, [local], "now");
+  assert.equal(registry.userSkills[local.filePath]?.enabled, false);
+  const initiallySelected = selectSkillsForPrompt([local, downloaded, project], registry, userRoot);
+  assert.deepEqual(initiallySelected.map((item) => item.name), ["project-skill"]);
+
+  const initialPrompt = `Header${formatSkillsForPrompt([local, downloaded, project])}\nCurrent working directory: /project`;
+  const filteredPrompt = rewriteSkillsInPrompt(initialPrompt, [local, downloaded, project], initiallySelected);
+  assert.doesNotMatch(filteredPrompt, /local-skill|downloaded-skill/);
+  assert.match(filteredPrompt, /project-skill/);
+
+  registry.userSkills[local.filePath]!.enabled = true;
+  registry.skills["downloaded-skill"]!.enabled = true;
+  const enabled = selectSkillsForPrompt([local, downloaded, project], registry, userRoot);
+  assert.deepEqual(enabled.map((item) => item.name), ["local-skill", "downloaded-skill", "project-skill"]);
+  assert.equal(enabled[0]?.disableModelInvocation, false, "an explicit UI enable overrides user-only frontmatter");
+  const enabledPrompt = rewriteSkillsInPrompt(initialPrompt, [local, downloaded, project], enabled);
+  assert.match(enabledPrompt, /local-skill/);
+  assert.match(enabledPrompt, /downloaded-skill/);
+
+  reconcileUserSkillPreferences(registry, [], "later");
+  assert.equal(registry.userSkills[local.filePath], undefined);
 });
 
 test("serializes concurrent registry mutations with a directory lock", async () => {

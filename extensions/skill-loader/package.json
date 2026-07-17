@@ -3,7 +3,7 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "Pi extension for installing and enabling Agent Skills from GitHub repositories.",
+  "description": "Pi extension for installing skills and controlling model visibility for downloaded and local user skills.",
   "scripts": {
     "clean": "echo 'nothing to clean'",
     "build": "tsc --noEmit",
