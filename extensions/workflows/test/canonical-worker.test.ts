@@ -116,6 +116,26 @@ test("failures and budget are immutable snapshots refreshed by RPC", async () =>
   assert.deepEqual(result, { failure: "boom", immutable: true, spent: 12, remaining: 85 });
 });
 
+test("detached async failures cannot race a successful worker result", async () => {
+  const workflow = runner();
+  await assert.rejects(
+    workflow.run(input(`agent("x", {id:"x"}).then(() => { throw new Error("detached boom") }); return "early";`)),
+    /detached boom/,
+  );
+  await assert.rejects(
+    workflow.run(input(`void (async () => { await new Promise((resolve) => setTimeout(resolve, 10)); throw new Error("timer boom") })(); return "early";`)),
+    /timer boom/,
+  );
+});
+
+test("synchronous parent hook failures terminalize instead of escaping the message callback", async () => {
+  const workflow = new CanonicalWorkflowWorker({
+    agent: (() => { throw new Error("hook boom"); }) as WorkerRuntimeHooks["agent"],
+    workflow: async () => ({ value: null, failures: [], budget }),
+  });
+  await assert.rejects(workflow.run(input(`return await agent("x", {id:"x"});`)), /hook boom/);
+});
+
 test("worker disables string/wasm code generation and enforces the parent deadline", async () => {
   const workflow = runner();
   await assert.rejects(workflow.run(input(`return Function("return 1")();`)), /Code generation from strings disallowed/);

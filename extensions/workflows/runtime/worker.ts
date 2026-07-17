@@ -84,6 +84,44 @@ const WORKER_SOURCE = String.raw`
 "use strict";
 const { parentPort, workerData } = require("node:worker_threads");
 const vm = require("node:vm");
+const { AsyncLocalStorage, createHook } = require("node:async_hooks");
+
+// The worker is a liveness boundary, not a security boundary. Track the entire
+// script async tree so detached continuations and unhandled rejections cannot
+// race a successful result after the returned promise settles.
+const workflowScope = new AsyncLocalStorage();
+const WORKFLOW_SCOPE = {};
+const scriptResources = new Map();
+let activityVersion = 0;
+let activityWaiters = [];
+let firstUnhandledRejection;
+function markActivity() {
+  activityVersion++;
+  const waiters = activityWaiters;
+  activityWaiters = [];
+  for (const resolve of waiters) resolve();
+}
+const asyncHook = createHook({
+  init(asyncId, type) {
+    if (workflowScope.getStore() !== WORKFLOW_SCOPE) return;
+    scriptResources.set(asyncId, type);
+    markActivity();
+  },
+  before(asyncId) { if (scriptResources.has(asyncId)) markActivity(); },
+  after(asyncId) { if (scriptResources.has(asyncId)) markActivity(); },
+  destroy(asyncId) { if (scriptResources.delete(asyncId)) markActivity(); },
+  promiseResolve(asyncId) {
+    if (scriptResources.get(asyncId) === "PROMISE") {
+      scriptResources.delete(asyncId);
+      markActivity();
+    }
+  },
+});
+asyncHook.enable();
+process.on("unhandledRejection", (reason) => {
+  firstUnhandledRejection ??= reason;
+  markActivity();
+});
 
 const pending = new Map();
 let nextRpcId = 1;
@@ -198,6 +236,41 @@ function phase(id) {
   currentPhase = id;
   parentPort.postMessage({ version: 1, type: "phase", id });
 }
+function blockerCount() {
+  let count = pending.size;
+  for (const type of scriptResources.values()) if (type !== "PROMISE") count++;
+  return count;
+}
+function nextEventLoopTurn() {
+  return workflowScope.exit(() => new Promise((resolve) => setImmediate(resolve)));
+}
+function waitForActivity(version) {
+  return workflowScope.exit(() => new Promise((resolve) => {
+    if (activityVersion !== version) resolve();
+    else activityWaiters.push(resolve);
+  }));
+}
+function throwUnhandledRejection() { if (firstUnhandledRejection !== undefined) throw firstUnhandledRejection; }
+async function waitForQuiescence() {
+  let observed = activityVersion;
+  let stableTurns = 0;
+  while (stableTurns < 2) {
+    throwUnhandledRejection();
+    if (blockerCount() > 0) {
+      stableTurns = 0;
+      await waitForActivity(observed);
+      observed = activityVersion;
+      continue;
+    }
+    await nextEventLoopTurn();
+    throwUnhandledRejection();
+    const current = activityVersion;
+    if (blockerCount() === 0 && current === observed) stableTurns++;
+    else stableTurns = 0;
+    observed = current;
+  }
+  throwUnhandledRejection();
+}
 function safeLog(value) {
   if (typeof value === "string") return value;
   try { const encoded = JSON.stringify(value); return encoded === undefined ? String(value) : encoded; }
@@ -224,10 +297,14 @@ const wrapped = "(async () => {\n\"use strict\";\n" + workerData.bodySource + "\
 void (async () => {
   try {
     const script = new vm.Script(wrapped, { filename: workerData.filename });
-    const value = await script.runInContext(context);
+    const execution = workflowScope.run(WORKFLOW_SCOPE, () => script.runInContext(context));
+    const value = await execution;
     while (openRpc > 0) await idlePromise;
+    await waitForQuiescence();
+    asyncHook.disable();
     parentPort.postMessage({ version: 1, type: "complete", value });
   } catch (cause) {
+    asyncHook.disable();
     parentPort.postMessage({ version: 1, type: "failed", error: serializeError(cause) });
   }
 })();
@@ -277,7 +354,13 @@ export class CanonicalWorkflowWorker {
         }
         if (message.type === "agent" || message.type === "workflow") {
           const request = message;
-          const operation = request.type === "agent" ? this.hooks.agent(request) : this.hooks.workflow(request);
+          let operation: Promise<{ value: unknown; failures: readonly unknown[]; budget: WorkerBudgetSnapshot }>;
+          try {
+            operation = Promise.resolve(request.type === "agent" ? this.hooks.agent(request) : this.hooks.workflow(request));
+          } catch (error) {
+            finish(error);
+            return;
+          }
           void operation.then(
             (result) => {
               const response: RpcSuccess = { version: 1, type: "rpc-result", rpcId: request.rpcId, ok: true, ...result };
