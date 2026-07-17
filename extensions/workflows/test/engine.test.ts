@@ -70,7 +70,7 @@ test("child workflows resolve explicit relative references with independent dura
     const child = path.join(root, "child.js");
     await fs.writeFile(child, `${metadata.replace('name: "test"', 'name: "child"')}\nreturn {child: args.value}`);
     const parent = path.join(root, "parent.js");
-    await fs.writeFile(parent, `${metadata}\nreturn await workflow({scriptPath:"./child.js"}, {value:42})`);
+    await fs.writeFile(parent, `${metadata}\nreturn await workflow({id:"child",scriptPath:"./child.js"}, {value:42})`);
     const launch = await engine.launch({ scriptPath: parent }, ctx, true);
     const finished = await launch.completion;
     assert.equal(finished.status, "completed");
@@ -80,6 +80,52 @@ test("child workflows resolve explicit relative references with independent dura
     assert.equal(childRecord?.rootRunId, launch.runId);
     assert.equal((childRecord?.args as { value: number }).value, 42);
     assert.equal(finished.usage.output, 0, "child had no leaf in this fixture");
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test("live child executor claims prevent restart reconciliation from stealing nested runs", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "workflow-engine-child-claim-"));
+  try {
+    const { engine, ctx } = harness(root, async () => {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      return { output: "done", usage: emptyUsageStats() };
+    });
+    await fs.writeFile(path.join(root, "child.js"), `${metadata.replace('name: "test"', 'name: "child"')}\nreturn await agent("wait", {id:"wait", tools:["read"]})`);
+    const parent = path.join(root, "parent.js");
+    await fs.writeFile(parent, `${metadata}\nreturn await workflow({id:"child",scriptPath:"./child.js"}, null)`);
+    const launch = await engine.launch({ scriptPath: parent }, ctx, true);
+    let childId = "";
+    await waitFor(async () => {
+      const child = (await engine.store.scan()).find((entry) => entry.state === "ok" && entry.record?.parentRunId === launch.runId && entry.record.status === "running");
+      childId = child?.runId ?? "";
+      return Boolean(childId);
+    });
+    await engine.reconcileInterruptedRuns();
+    assert.equal((await engine.store.readRun(childId)).status, "running");
+    assert.equal((await launch.completion).status, "completed");
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test("parent failure aborts and drains nested child coordinators before terminalization", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "workflow-engine-child-abort-"));
+  try {
+    const executor = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      return { output: "child settled", usage: emptyUsageStats() };
+    };
+    const { engine, ctx } = harness(root, executor);
+    await fs.writeFile(path.join(root, "child.js"), `${metadata.replace('name: "test"', 'name: "child"')}\nreturn await agent("wait", {id:"wait", tools:["read"]})`);
+    const parent = path.join(root, "parent.js");
+    await fs.writeFile(parent, `${metadata}\nreturn await parallel([\n  () => workflow({id:"child",scriptPath:"./child.js"}, null),\n  () => { throw new Error("parent branch failed") }\n])`);
+    const launch = await engine.launch({ scriptPath: parent }, ctx, true);
+    const finished = await launch.completion;
+    assert.equal(finished.status, "failed");
+    const runs = (await engine.store.scan()).filter((entry) => entry.state === "ok").map((entry) => entry.record!);
+    const child = runs.find((record) => record.parentRunId === launch.runId);
+    assert.ok(child);
+    assert.notEqual(child.status, "running");
+    assert.ok(["completed", "failed", "cancelled", "interrupted", "recovery_required"].includes(child.status));
+    assert.ok(["completed", "failed", "interrupted", "skipped", "cached"].includes(child.leaves[0]!.status));
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 
@@ -118,6 +164,68 @@ test("exact resumable pure replay invokes zero executors for cached nodes", asyn
     assert.equal(replayed.status, "completed");
     assert.equal(replayed.leaves[0].status, "cached");
     assert.equal(calls, 1);
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test("nested resumable children replay pure leaves without invoking executors", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "workflow-engine-child-resume-"));
+  try {
+    let calls = 0;
+    const { engine, ctx } = harness(root, async () => { calls++; return { output: "child cached", usage: emptyUsageStats() }; });
+    const resumableMeta = metadata.replace("resumable: false", "resumable: true");
+    await fs.writeFile(path.join(root, "input.txt"), "stable");
+    const inputHash = createHash("sha256").update("stable").digest("hex");
+    await fs.writeFile(path.join(root, "child.js"), `${resumableMeta.replace('name: "test"', 'name: "child"')}\nreturn await agent("child", {id:"child", tools:["read"], cachePolicy:"pure", inputManifest:[{path:"input.txt",sha256:"${inputHash}"}]})`);
+    const parent = path.join(root, "parent.js");
+    await fs.writeFile(parent, `${resumableMeta}\nreturn await workflow({id:"child",scriptPath:"./child.js"}, null)`);
+    const first = await engine.launch({ scriptPath: parent }, ctx, true);
+    const firstResult = await first.completion;
+    assert.equal(firstResult.status, "completed");
+    const resumed = await engine.resume(first.runId, ctx);
+    assert.equal((await resumed.completion).status, "completed");
+    const runs = (await engine.store.scan()).filter((entry) => entry.state === "ok").map((entry) => entry.record!);
+    const resumedChild = runs.find((record) => record.parentRunId === resumed.runId);
+    assert.equal(resumedChild?.leaves[0]?.status, "cached");
+    assert.equal(calls, 1);
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test("resumable workspace artifacts are verified in a fresh worktree before cache replay", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "workflow-engine-workspace-resume-"));
+  try {
+    await execFile("git", ["-C", root, "init", "--initial-branch=main"]);
+    await execFile("git", ["-C", root, "config", "user.name", "Test"]);
+    await execFile("git", ["-C", root, "config", "user.email", "test@example.invalid"]);
+    await fs.writeFile(path.join(root, "base.txt"), "base\n");
+    await execFile("git", ["-C", root, "add", "."]);
+    await execFile("git", ["-C", root, "commit", "-m", "base"]);
+    let calls = 0;
+    const executor = async (options: any) => {
+      calls++;
+      await fs.writeFile(path.join(options.cwd, "cached.txt"), "cached artifact\n");
+      return { output: "cached workspace", usage: emptyUsageStats() };
+    };
+    const { engine, ctx } = harness(root, executor);
+    const workspaceMeta = metadata.replace("resumable: false", "resumable: true").replace('capabilities: ["read"]', 'capabilities: ["read", "workspace"]');
+    const script = `${workspaceMeta}\nreturn await agent("write", {id:"write", effects:"workspace", workspace:"isolated", artifactPolicy:"capture", cachePolicy:"workspace-artifact", tools:["read"]})`;
+    const first = await engine.launch({ script }, ctx, true);
+    const original = await first.completion;
+    assert.equal(original.status, "completed");
+    const resumed = await engine.resume(first.runId, ctx);
+    const replayed = await resumed.completion;
+    assert.equal(replayed.status, "completed");
+    assert.equal(replayed.leaves[0].status, "cached");
+    assert.deepEqual(replayed.leaves[0].artifactIds, original.leaves[0].artifactIds);
+    assert.equal(calls, 1);
+
+    await fs.writeFile(path.join(root, "cached.txt"), "current branch owns this path\n");
+    await execFile("git", ["-C", root, "add", "cached.txt"]);
+    await execFile("git", ["-C", root, "commit", "-m", "conflict with cached artifact"]);
+    const cacheMiss = await engine.resume(resumed.runId, ctx);
+    const rerun = await cacheMiss.completion;
+    assert.equal(rerun.status, "completed");
+    assert.equal(rerun.leaves[0].status, "completed");
+    assert.equal(calls, 2);
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 

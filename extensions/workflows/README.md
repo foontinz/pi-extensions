@@ -47,8 +47,8 @@ The parser rejects dynamic values, calls, identifiers, spreads, computed keys, m
 agent(prompt, { id, ...options })
 parallel([() => agent(...), () => agent(...)])
 pipeline(items, stage1, stage2, ...)
-workflow({ name: "user:child" }, childArgs)
-workflow({ scriptPath: "./child.workflow.js" }, childArgs)
+workflow({ id: "child-analysis", name: "user:child" }, childArgs)
+workflow({ id: "child-local", scriptPath: "./child.workflow.js" }, childArgs)
 phase(id)
 log(message)
 failures()
@@ -66,7 +66,7 @@ Operational leaf failures return `null` and appear in `failures()`. Script, cont
 - `effects:"workspace", workspace:"isolated"` — dedicated Git worktree; verified artifact capture by default or explicit recorded discard.
 - `effects:"external"` — MCP/network/custom effects; non-cacheable.
 
-Workspace capture records a baseline, full-index binary patch, Git object bundle, tracked/staged/unstaged/untracked changes, deletes, renames, modes and symlinks. Hash verification completes before cleanup. Dirty submodules and unresolved indexes retain the workspace for recovery. Apply never mutates the caller's working tree.
+Workspace capture records a baseline, full-index binary patch, Git object bundle, tracked/staged/unstaged/untracked changes, deletes, renames, modes and symlinks. Hash verification completes before cleanup. Dirty submodules, unresolved indexes, cancellation, and cleanup-deadline expiry retain the workspace for recovery. Git subprocesses receive the operation signal. Apply never mutates the caller's working tree.
 
 ## Structured output
 
@@ -93,7 +93,7 @@ The reducer is the sole lifecycle owner. First terminal intent wins, terminal st
 
 ## Resume and controls
 
-`resumable:true` enables checksummed journaling, exact source/args/execution-fingerprint validation, reclaimable concurrent resume claims, torn-tail repair, root-scope pure-node cache replay, stable node controls, pause, skip, and conservative retry invalidation. Changed source, args, model, prompts, tools, schema, or engine fingerprint refuses resume. Effectful uncertain work becomes `recovery_required`; it is never rerun automatically. `workspace-artifact` cache requests currently fail closed until verified fresh-worktree restoration is available.
+`resumable:true` enables checksummed journaling, exact source/args/execution-fingerprint validation, reclaimable concurrent resume claims, torn-tail repair, pure-node replay across nested workflows, verified workspace-artifact replay in fresh worktrees, stable node controls, pause, skip, and conservative retry invalidation. Changed source, args, model, prompts, tools, schema, or engine fingerprint refuses resume. Effectful uncertain work becomes `recovery_required`; it is never rerun automatically. Missing, corrupt, or conflicting cached workspace artifacts become cache misses or recovery outcomes rather than direct effects in the caller's tree.
 
 ## Activation and trust
 

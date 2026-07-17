@@ -66,7 +66,7 @@ export default function workflowsExtension(pi: ExtensionAPI) {
     description: [
       "Execute one metadata-declared local workflow with durable ownership and canonical hooks.",
       "Exactly one of script, scriptPath, or qualified name is required.",
-      "Hooks: agent(prompt,{id,...}), parallel([thunks]), pipeline(items,...stages), workflow({name|scriptPath},childArgs), phase(id), log(), failures(), immutable args, budget.",
+      "Hooks: agent(prompt,{id,...}), parallel([thunks]), pipeline(items,...stages), workflow({id,name|scriptPath},childArgs), phase(id), log(), failures(), immutable args, budget.",
       "Operational leaf failures return null; script/contract/infrastructure failures fail the run.",
     ].join(" "),
     promptSnippet: "Run a durable local workflow using the canonical metadata-declared DSL.",
@@ -75,7 +75,7 @@ export default function workflowsExtension(pi: ExtensionAPI) {
       "Every Workflow source must begin with pure-literal export const meta containing name, description, resumable, maxAgents, and capabilities.",
       "Workflow parallel accepts only an array of zero-argument thunks; pipeline accepts items followed by variadic stage functions.",
       "Every Workflow agent call requires a stable unique id and an explicit effects declaration when it writes or accesses external systems.",
-      "Workflow args is immutable data, not a function; nested workflows require explicit {name} or {scriptPath} references.",
+      "Workflow args is immutable data, not a function; nested workflows require stable IDs and explicit {id,name} or {id,scriptPath} references.",
     ],
     parameters: workflowParameters,
     renderShell: "self",
@@ -146,7 +146,11 @@ export default function workflowsExtension(pi: ExtensionAPI) {
         if (scanned.state !== "ok") return textResult(`Workflow ${params.runId} is ${scanned.state}: ${scanned.error}`, scanned);
         const record = scanned.record!;
         if (params.scope !== "all" && record.owner.sessionId !== owner.sessionId) return textResult(`Unknown workflow run ${params.runId}.`, { state: "unknown", runId: params.runId });
-        const detail = statusProjection(record, new Set(params.include ?? []));
+        const include = new Set(params.include ?? []);
+        const detail = {
+          ...statusProjection(record, include),
+          ...(include.has("artifacts") ? { integrations: await engine.artifacts.integrationsForRun(record.runId) } : {}),
+        };
         return textResult(JSON.stringify(detail, null, 2), detail);
       }
       const statuses = new Set(params.statuses ?? []);
@@ -219,10 +223,10 @@ export default function workflowsExtension(pi: ExtensionAPI) {
     label: "Apply Workflow Artifact",
     description: "Verify and apply one captured workspace artifact into a fresh integration worktree; never mutates the caller's current tree.",
     parameters: Type.Object({ artifactId: Type.String(), repositoryRoot: Type.Optional(Type.String()), targetRef: Type.Optional(Type.String()) }),
-    async execute(_id, params, _signal, _update, ctx) {
+    async execute(_id, params, signal, _update, ctx) {
       const owner = engine.owners.bind(ctx);
       await assertOwnerArtifact(engine, params.artifactId, owner.sessionId);
-      const applied = await engine.artifacts.apply(params.artifactId, path.resolve(ctx.cwd, params.repositoryRoot ?? "."), params.targetRef ?? "HEAD", owner.sessionId);
+      const applied = await engine.artifacts.apply(params.artifactId, path.resolve(ctx.cwd, params.repositoryRoot ?? "."), params.targetRef ?? "HEAD", owner.sessionId, signal);
       return textResult(`${applied.state === "applied" ? "Applied" : "Conflicted"} in integration worktree ${applied.root}${applied.conflicts.length ? `\nConflicts: ${applied.conflicts.join(", ")}` : ""}`, applied);
     },
   });
@@ -232,13 +236,13 @@ export default function workflowsExtension(pi: ExtensionAPI) {
     label: "Release Workflow Workspace",
     description: "Idempotently release a retained source workspace lease or integration worktree after durable cleanup.",
     parameters: Type.Object({ leaseId: Type.Optional(Type.String()), integrationId: Type.Optional(Type.String()) }),
-    async execute(_id, params, _signal, _update, ctx) {
+    async execute(_id, params, signal, _update, ctx) {
       if ((params.leaseId ? 1 : 0) + (params.integrationId ? 1 : 0) !== 1) throw new Error("exactly one of leaseId or integrationId is required");
       const owner = engine.owners.bind(ctx);
       if (params.leaseId) {
         await assertOwnerLease(engine, params.leaseId, owner.sessionId);
-        await engine.artifacts.release(params.leaseId);
-      } else await engine.artifacts.releaseApplied(params.integrationId!, owner.sessionId);
+        await engine.artifacts.release(params.leaseId, signal);
+      } else await engine.artifacts.releaseApplied(params.integrationId!, owner.sessionId, signal);
       return textResult("Workspace released.", { released: true });
     },
   });

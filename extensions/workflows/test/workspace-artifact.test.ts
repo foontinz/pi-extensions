@@ -181,6 +181,11 @@ test("integration release uses opaque durable IDs and owner checks", async () =>
     assert.equal((await fs.stat(integration.root)).isDirectory(), true);
     await value.store.releaseApplied(integration.integrationId, "owner-a");
     await value.store.releaseApplied(integration.integrationId, "owner-a");
+
+    const cached = await value.store.apply(artifact.id, value.repo, "HEAD", "owner-a", undefined, { runId: "run-a", purpose: "cache-replay" });
+    assert.equal((await value.store.integrationsForRun("run-a"))[0]?.integrationId, cached.integrationId);
+    await value.store.reconcileCacheIntegrations(async () => false);
+    assert.equal((await value.store.getIntegration(cached.integrationId)).state, "cleaned");
     await assert.rejects(value.store.releaseApplied("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "owner-a"), /ENOENT|no such file/i);
   } finally { await removeFixture(value); }
 });
@@ -204,6 +209,25 @@ test("three-way apply retains a fresh integration worktree on conflict", async (
     assert.equal((await fs.stat(integration.root)).isDirectory(), true);
   } finally {
     if (integration) await value.store.releaseApplied(integration.integrationId).catch(() => {});
+    await removeFixture(value);
+  }
+});
+
+test("cleanup cancellation retains the workspace for recovery", async () => {
+  const value = await fixture();
+  let leaseId: string | undefined;
+  try {
+    const lease = await value.store.register(value.provisioned);
+    leaseId = lease.id;
+    await fs.writeFile(path.join(value.provisioned.worktree!.root, "important.txt"), "keep me\n");
+    const controller = new AbortController();
+    const release = value.store.release(lease.id, controller.signal);
+    setTimeout(() => controller.abort(new Error("cleanup deadline")), 10);
+    await assert.rejects(release, /abort|deadline/i);
+    assert.equal((await value.store.getLease(lease.id)).state, "recovery_required");
+    assert.equal(await fs.readFile(path.join(value.provisioned.worktree!.root, "important.txt"), "utf8"), "keep me\n");
+  } finally {
+    if (leaseId) await value.store.discard(leaseId).catch(() => {});
     await removeFixture(value);
   }
 });

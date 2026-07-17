@@ -16,7 +16,7 @@ export interface WorkflowJournalRecordV1 {
   payload: JsonValue;
   checksum: string;
 }
-export interface WorkflowReplayEntry { fingerprint: string; result: JsonValue; artifactIds?: string[] }
+export interface WorkflowReplayEntry { fingerprint: string; cachePolicy: "pure" | "workspace-artifact"; result: JsonValue; artifactIds?: string[] }
 
 export class WorkflowJournal {
   constructor(private readonly store: WorkflowRunStore) {}
@@ -68,11 +68,14 @@ export class WorkflowJournal {
     for (const record of records) {
       if (record.type !== "node-result" || !record.payload || typeof record.payload !== "object" || Array.isArray(record.payload)) continue;
       const payload = record.payload as Record<string, JsonValue>;
-      if (payload.cachePolicy !== "pure" || typeof payload.fingerprint !== "string" || !("result" in payload)) continue;
+      if ((payload.cachePolicy !== "pure" && payload.cachePolicy !== "workspace-artifact") || typeof payload.fingerprint !== "string" || !("result" in payload)) continue;
+      const artifactIds = Array.isArray(payload.artifactIds) ? payload.artifactIds.filter((item): item is string => typeof item === "string") : [];
+      if (payload.cachePolicy === "workspace-artifact" && artifactIds.length === 0) continue;
       map.set(record.nodeId, {
         fingerprint: payload.fingerprint,
+        cachePolicy: payload.cachePolicy,
         result: cloneCanonicalJson(payload.result),
-        ...(Array.isArray(payload.artifactIds) ? { artifactIds: payload.artifactIds.filter((item): item is string => typeof item === "string") } : {}),
+        ...(artifactIds.length ? { artifactIds } : {}),
       });
     }
     return map;
@@ -87,6 +90,16 @@ export async function claimRunExecution(store: WorkflowRunStore, runId: string, 
   return claimProcessLock(`${store.paths(runId).runDir}/executor.lock`, {
     pid: process.pid, instanceId: owner.instanceId, sessionId: owner.sessionId, createdAt: Date.now(),
   }, `workflow ${runId} already has a live executor`);
+}
+
+export function publishedRunExecutionClaim(store: WorkflowRunStore, runId: string, owner: WorkflowOwnerV1): () => Promise<void> {
+  const lock = `${store.paths(runId).runDir}/executor.lock`;
+  return async () => {
+    try {
+      const current = JSON.parse(await readFile(lock, "utf8")) as { instanceId?: string };
+      if (current.instanceId === owner.instanceId) await rm(lock, { force: true });
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  };
 }
 
 export async function hasLiveRunExecutionClaim(store: WorkflowRunStore, runId: string): Promise<boolean> {

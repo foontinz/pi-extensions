@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -30,6 +31,7 @@ export class WorkspaceArtifactStore {
   readonly root: string;
   readonly maxArtifactBytes: number;
   readonly gitTimeoutMs: number;
+  private readonly operationSignal = new AsyncLocalStorage<AbortSignal>();
 
   constructor(root: string, options: WorkspaceArtifactStoreOptions = {}) {
     this.root = path.resolve(root);
@@ -122,35 +124,47 @@ export class WorkspaceArtifactStore {
   }
 
   /** Verify, capture if needed, then remove the worktree. Safe to call repeatedly. */
-  async release(id: string): Promise<WorkspaceArtifact | undefined> {
+  async release(id: string, signal?: AbortSignal): Promise<WorkspaceArtifact | undefined> {
+    if (signal && this.operationSignal.getStore() !== signal) return this.operationSignal.run(signal, () => this.release(id));
+    signal?.throwIfAborted();
     return await this.withLeaseLock(id, async () => {
       let record = await this.getLease(id);
-      if (record.state === "discarded") return undefined;
-      if (record.state === "cleaned") {
-        return record.artifactId ? await this.verifyArtifact(record.artifactId) : undefined;
-      }
+      try {
+        if (record.state === "discarded") return undefined;
+        if (record.state === "cleaned") {
+          return record.artifactId ? await this.verifyArtifact(record.artifactId) : undefined;
+        }
 
-      let artifact: WorkspaceArtifact;
-      if (record.artifactId && ["captured", "cleanup_pending", "recovery_required"].includes(record.state)) {
+        let artifact: WorkspaceArtifact;
+        if (record.artifactId && ["captured", "cleanup_pending", "recovery_required"].includes(record.state)) {
+          try {
+            artifact = await this.verifyArtifact(record.artifactId);
+          } catch (error) {
+            await this.transition(record, "recovery_required", { reason: `artifact verification failed: ${errorMessage(error)}` });
+            throw error;
+          }
+        } else {
+          artifact = await this.captureLocked(record);
+        }
+
+        record = await this.getLease(id);
+        record = await this.transition(record, "cleanup_pending");
         try {
-          artifact = await this.verifyArtifact(record.artifactId);
+          await this.cleanupOwnedWorktree(record);
+          await this.deleteBaselineRef(record);
+          await this.transition(record, "cleaned", { reason: undefined });
+          return artifact;
         } catch (error) {
-          await this.transition(record, "recovery_required", { reason: `artifact verification failed: ${errorMessage(error)}` });
+          await this.transition(record, "recovery_required", { reason: `verified artifact retained; cleanup failed: ${errorMessage(error)}` });
           throw error;
         }
-      } else {
-        artifact = await this.captureLocked(record);
-      }
-
-      record = await this.getLease(id);
-      record = await this.transition(record, "cleanup_pending");
-      try {
-        await this.cleanupOwnedWorktree(record);
-        await this.deleteBaselineRef(record);
-        await this.transition(record, "cleaned", { reason: undefined });
-        return artifact;
       } catch (error) {
-        await this.transition(record, "recovery_required", { reason: `verified artifact retained; cleanup failed: ${errorMessage(error)}` });
+        if (this.operationSignal.getStore()?.aborted) {
+          record = await this.getLease(id);
+          if (record.state !== "cleaned" && record.state !== "discarded") {
+            await this.transition(record, "recovery_required", { reason: `cleanup deadline/cancellation; workspace retained: ${errorMessage(error)}` });
+          }
+        }
         throw error;
       }
     });
@@ -166,7 +180,9 @@ export class WorkspaceArtifactStore {
   }
 
   /** The only operation allowed to delete an unverified changed workspace. */
-  async discard(id: string): Promise<WorkspaceLeaseRecord> {
+  async discard(id: string, signal?: AbortSignal): Promise<WorkspaceLeaseRecord> {
+    if (signal && this.operationSignal.getStore() !== signal) return this.operationSignal.run(signal, () => this.discard(id));
+    signal?.throwIfAborted();
     return await this.withLeaseLock(id, async () => {
       let record = await this.getLease(id);
       if (record.state === "discarded" || record.state === "cleaned") return record;
@@ -182,7 +198,9 @@ export class WorkspaceArtifactStore {
     });
   }
 
-  async verifyArtifact(id: string): Promise<WorkspaceArtifact> {
+  async verifyArtifact(id: string, signal?: AbortSignal): Promise<WorkspaceArtifact> {
+    if (signal && this.operationSignal.getStore() !== signal) return this.operationSignal.run(signal, () => this.verifyArtifact(id));
+    signal?.throwIfAborted();
     this.assertId(id);
     const directory = this.artifactDir(id);
     const manifestPath = path.join(directory, "manifest.json");
@@ -210,7 +228,16 @@ export class WorkspaceArtifactStore {
   }
 
   /** Apply into a newly-created detached integration worktree. Conflicted worktrees are always retained. */
-  async apply(id: string, repositoryRoot: string, base = "HEAD", ownerSessionId?: string): Promise<AppliedWorkspace> {
+  async apply(
+    id: string,
+    repositoryRoot: string,
+    base = "HEAD",
+    ownerSessionId?: string,
+    signal?: AbortSignal,
+    ownership?: { runId: string; purpose: "cache-replay" },
+  ): Promise<AppliedWorkspace> {
+    if (signal && this.operationSignal.getStore() !== signal) return this.operationSignal.run(signal, () => this.apply(id, repositoryRoot, base, ownerSessionId, undefined, ownership));
+    signal?.throwIfAborted();
     const artifact = await this.verifyArtifact(id);
     const repo = await fs.realpath(repositoryRoot);
     if ((await this.repositoryId(repo)) !== artifact.manifest.repositoryId) throw new Error("artifact belongs to a different repository");
@@ -235,6 +262,7 @@ export class WorkspaceArtifactStore {
     const now = new Date().toISOString();
     let integration: IntegrationWorkspaceRecord = {
       version: 1, integrationId, artifactId: id, ...(ownerSessionId ? { ownerSessionId } : {}),
+      ...(ownership ? { ownerRunId: ownership.runId } : {}), purpose: ownership?.purpose ?? "artifact-apply",
       state: "provisioning", root: worktreeRoot, tempParent, repositoryRoot: repo, targetRef: base,
       conflicts: [], createdAt: now, updatedAt: now,
     };
@@ -273,8 +301,10 @@ export class WorkspaceArtifactStore {
       if (added) {
         const removed = await this.git(repo, ["worktree", "remove", "--force", worktreeRoot], true).catch(() => ({ ok: false as const, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }));
         if (!removed.ok) {
-          await this.updateIntegration(integration, "recovery_required", { reason: `apply cleanup failed: ${removed.stderr.toString("utf8").trim()}` }).catch(() => {});
-          throw error;
+          const recovery = new Error(`apply cleanup failed: ${removed.stderr.toString("utf8").trim()}`, { cause: error });
+          (recovery as NodeJS.ErrnoException).code = "WORKSPACE_INTEGRATION_RECOVERY";
+          await this.updateIntegration(integration, "recovery_required", { reason: recovery.message }).catch(() => {});
+          throw recovery;
         }
       }
       await fs.rm(tempParent, { recursive: true, force: true }).catch(() => {});
@@ -288,31 +318,61 @@ export class WorkspaceArtifactStore {
     return this.readJson<IntegrationWorkspaceRecord>(path.join(this.integrationDir(id), "record.json"));
   }
 
+  async integrationsForRun(runId: string): Promise<IntegrationWorkspaceRecord[]> {
+    await this.initialize();
+    const names = await fs.readdir(path.join(this.root, "integrations"));
+    const records: IntegrationWorkspaceRecord[] = [];
+    for (const name of names) {
+      if (!ID_PATTERN.test(name)) continue;
+      try {
+        const record = await this.getIntegration(name);
+        if (record.ownerRunId === runId) records.push(record);
+      } catch { /* corrupt records remain on disk for manual recovery */ }
+    }
+    return records.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  async reconcileCacheIntegrations(isRunLive: (runId: string) => Promise<boolean>): Promise<void> {
+    await this.initialize();
+    const names = await fs.readdir(path.join(this.root, "integrations"));
+    for (const name of names) {
+      if (!ID_PATTERN.test(name)) continue;
+      let record: IntegrationWorkspaceRecord;
+      try { record = await this.getIntegration(name); } catch { continue; }
+      if (record.purpose !== "cache-replay" || record.state === "cleaned" || !record.ownerRunId) continue;
+      if (await isRunLive(record.ownerRunId)) continue;
+      await this.releaseApplied(record.integrationId, record.ownerSessionId).catch(() => {});
+    }
+  }
+
   /** Idempotent owner-checked cleanup resolved only from a durable opaque ID. */
-  async releaseApplied(integrationId: string, ownerSessionId?: string): Promise<void> {
+  async releaseApplied(integrationId: string, ownerSessionId?: string, signal?: AbortSignal): Promise<void> {
+    if (signal && this.operationSignal.getStore() !== signal) return this.operationSignal.run(signal, () => this.releaseApplied(integrationId, ownerSessionId));
+    signal?.throwIfAborted();
     this.assertId(integrationId);
     await this.withIntegrationLock(integrationId, async () => {
       let record = await this.getIntegration(integrationId);
       if (ownerSessionId && record.ownerSessionId !== ownerSessionId) throw new Error("integration workspace belongs to another owner");
       if (record.state === "cleaned") return;
-      const expectedRoot = path.join(record.tempParent, "worktree");
-      if (path.resolve(record.root) !== path.resolve(expectedRoot) || !path.basename(record.tempParent).startsWith("pi-workflow-integration-")) {
-        throw new Error("integration workspace paths failed confinement validation");
-      }
-      record = await this.updateIntegration(record, "cleanup_pending");
-      let listed = (await this.git(record.repositoryRoot, ["worktree", "list", "--porcelain", "-z"])).stdout.toString("utf8");
-      if (await exists(record.root) || listed.includes(record.root)) {
-        const removed = await this.git(record.repositoryRoot, ["worktree", "remove", "--force", record.root], true);
-        if (!removed.ok) await this.git(record.repositoryRoot, ["worktree", "prune", "--expire", "now"], true);
-        listed = (await this.git(record.repositoryRoot, ["worktree", "list", "--porcelain", "-z"])).stdout.toString("utf8");
-        if (listed.includes(record.root)) {
-          const reason = `integration cleanup left a registered worktree: ${record.root}`;
-          await this.updateIntegration(record, "recovery_required", { reason });
-          throw new Error(reason);
+      try {
+        const expectedRoot = path.join(record.tempParent, "worktree");
+        if (path.resolve(record.root) !== path.resolve(expectedRoot) || !path.basename(record.tempParent).startsWith("pi-workflow-integration-")) {
+          throw new Error("integration workspace paths failed confinement validation");
         }
+        record = await this.updateIntegration(record, "cleanup_pending");
+        let listed = (await this.git(record.repositoryRoot, ["worktree", "list", "--porcelain", "-z"])).stdout.toString("utf8");
+        if (await exists(record.root) || listed.includes(record.root)) {
+          const removed = await this.git(record.repositoryRoot, ["worktree", "remove", "--force", record.root], true);
+          if (!removed.ok) await this.git(record.repositoryRoot, ["worktree", "prune", "--expire", "now"], true);
+          listed = (await this.git(record.repositoryRoot, ["worktree", "list", "--porcelain", "-z"])).stdout.toString("utf8");
+          if (listed.includes(record.root)) throw new Error(`integration cleanup left a registered worktree: ${record.root}`);
+        }
+        await fs.rm(record.tempParent, { recursive: true, force: true });
+        await this.updateIntegration(record, "cleaned", { reason: undefined });
+      } catch (error) {
+        if (record.state !== "cleaned") await this.updateIntegration(record, "recovery_required", { reason: `integration cleanup failed: ${errorMessage(error)}` }).catch(() => {});
+        throw error;
       }
-      await fs.rm(record.tempParent, { recursive: true, force: true });
-      await this.updateIntegration(record, "cleaned", { reason: undefined });
     });
   }
 
@@ -646,9 +706,12 @@ export class WorkspaceArtifactStore {
   private git(cwd: string, args: string[], allowFailure?: false, env?: NodeJS.ProcessEnv, input?: Buffer): Promise<GitResult>;
   private git(cwd: string, args: string[], allowFailure = false, env?: NodeJS.ProcessEnv, input?: Buffer): Promise<GitResult | (GitResult & { ok: boolean })> {
     return new Promise((resolve, reject) => {
+      const signal = this.operationSignal.getStore();
+      signal?.throwIfAborted();
       const child = spawn("git", ["-C", cwd, ...args], {
         env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0", ...env },
         stdio: ["pipe", "pipe", "pipe"],
+        ...(signal ? { signal } : {}),
       });
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];

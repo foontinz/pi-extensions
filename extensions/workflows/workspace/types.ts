@@ -90,6 +90,8 @@ export interface IntegrationWorkspaceRecord {
   integrationId: string;
   artifactId: string;
   ownerSessionId?: string;
+  ownerRunId?: string;
+  purpose: "artifact-apply" | "cache-replay";
   state: "provisioning" | "applied" | "conflicted" | "cleanup_pending" | "cleaned" | "recovery_required";
   root: string;
   tempParent: string;

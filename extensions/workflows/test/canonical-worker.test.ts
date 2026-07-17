@@ -96,11 +96,12 @@ test("workflow requires explicit references and clones child args", async () => 
       return { value: request.args, failures: [], budget };
     },
   });
-  const result = await workflow.run(input(`return await workflow({scriptPath:"./child.workflow.js"}, {x:1});`));
+  const result = await workflow.run(input(`return await workflow({id:"child",scriptPath:"./child.workflow.js"}, {x:1});`));
   assert.deepEqual(result, { x: 1 });
-  assert.deepEqual((observed as any).reference, { scriptPath: "./child.workflow.js" });
+  assert.deepEqual((observed as any).reference, { id: "child", scriptPath: "./child.workflow.js" });
+  await assert.rejects(workflow.run(input(`return await workflow({scriptPath:"./child.workflow.js"});`)), (error: any) => error?.code === "WORKFLOW_REFERENCE");
   await assert.rejects(workflow.run(input(`return await workflow("return 1");`)), (error: any) => error?.code === "WORKFLOW_REFERENCE");
-  await assert.rejects(workflow.run(input(`return await workflow({name:"x", scriptPath:"y"});`)), (error: any) => error?.code === "WORKFLOW_REFERENCE");
+  await assert.rejects(workflow.run(input(`return await workflow({id:"child", name:"x", scriptPath:"y"});`)), (error: any) => error?.code === "WORKFLOW_REFERENCE");
 });
 
 test("failures and budget are immutable snapshots refreshed by RPC", async () => {

@@ -59,7 +59,7 @@ export class WorkflowRunStore {
   }
 
   /** Initial record and copied provenance become durable before execution can start. */
-  async createRun(record: WorkflowRunRecordV1, copiedSource: string): Promise<WorkflowRunPaths> {
+  async createRun(record: WorkflowRunRecordV1, copiedSource: string, publishExecutorClaim = false): Promise<WorkflowRunPaths> {
     assertWorkflowRunInvariants(record);
     if (record.status !== "created" || record.recordRevision !== 0) throw new Error("initial workflow record must be revision 0 created");
     const paths = this.paths(record.runId, record.metadata.resumable);
@@ -69,6 +69,14 @@ export class WorkflowRunStore {
       try {
         await Promise.all([mkdir(paths.agents, { mode: 0o700 }), mkdir(paths.artifacts, { mode: 0o700 })]);
         await atomicWrite(paths.script, copiedSource);
+        if (publishExecutorClaim) {
+          await atomicWrite(path.join(paths.runDir, "executor.lock"), jsonLine({
+            pid: record.owner.parentPid,
+            instanceId: record.owner.instanceId,
+            sessionId: record.owner.sessionId,
+            createdAt: Date.now(),
+          }));
+        }
         const copiedHash = createHash("sha256").update(copiedSource).digest("hex");
         if (copiedHash !== record.source.sha256) throw new Error("copied workflow source hash does not match run provenance");
         await atomicWrite(paths.run, jsonLine(record));

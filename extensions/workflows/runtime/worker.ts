@@ -18,7 +18,7 @@ export interface WorkerChildRequest {
   version: 1;
   type: "workflow";
   rpcId: number;
-  reference: { name: string } | { scriptPath: string };
+  reference: { id: string; name: string } | { id: string; scriptPath: string };
   args: unknown;
 }
 
@@ -231,9 +231,10 @@ async function pipeline(items, ...stages) {
 }
 function workflow(reference, childArgs) {
   const valid = reference && typeof reference === "object" && !Array.isArray(reference)
-    && ((Object.keys(reference).length === 1 && typeof reference.name === "string" && reference.name)
-      || (Object.keys(reference).length === 1 && typeof reference.scriptPath === "string" && reference.scriptPath));
-  if (!valid) contract("WORKFLOW_REFERENCE", "workflow() requires exactly one explicit {name} or {scriptPath} reference");
+    && typeof reference.id === "string" && /^[A-Za-z][A-Za-z0-9_-]{0,79}$/.test(reference.id)
+    && ((Object.keys(reference).length === 2 && typeof reference.name === "string" && reference.name)
+      || (Object.keys(reference).length === 2 && typeof reference.scriptPath === "string" && reference.scriptPath));
+  if (!valid) contract("WORKFLOW_REFERENCE", "workflow() requires a stable id and exactly one explicit {id,name} or {id,scriptPath} reference");
   return rpc("workflow", { reference: { ...reference }, args: childArgs });
 }
 function phase(id) {

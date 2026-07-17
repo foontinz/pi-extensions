@@ -54,7 +54,7 @@ export interface WorkflowAgentOptions {
   mcp?: boolean;
 }
 
-export type WorkflowReference = { name: string } | { scriptPath: string };
+export type WorkflowReference = { id: string; name: string } | { id: string; scriptPath: string };
 export interface WorkflowLeafFailure {
   nodeId: string;
   agentId: string;

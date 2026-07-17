@@ -32,7 +32,7 @@ import { BudgetManager, FairSemaphore, WorkflowPolicyError } from "./runtime/pol
 import { resolveAgentExecution, type AvailableTool, type RootExecutionDefaults } from "./runtime/resolution.js";
 import { CanonicalWorkflowWorker, type WorkerAgentRequest, type WorkerBudgetSnapshot, type WorkerChildRequest } from "./runtime/worker.js";
 import { WorkflowOwnerRegistry, type WorkflowOwnerIdentity } from "./runtime/owners.js";
-import { WorkflowJournal, claimRunExecution, claimWorkflowResume, hasLiveRunExecutionClaim, type WorkflowReplayEntry } from "./resume/journal.js";
+import { WorkflowJournal, claimWorkflowResume, hasLiveRunExecutionClaim, publishedRunExecutionClaim, type WorkflowReplayEntry } from "./resume/journal.js";
 import { WorkspaceArtifactStore } from "./workspace/artifact-store.js";
 
 export interface WorkflowLaunch {
@@ -66,6 +66,8 @@ interface RootState {
   journal: WorkflowJournal;
   replay: Map<string, WorkflowReplayEntry>;
   leafControllers: Map<string, AbortController>;
+  executionControllers: Set<AbortController>;
+  lingeringLeafOperations: Set<Promise<unknown>>;
   onRecord?: (record: WorkflowRunRecordV1) => void;
 }
 
@@ -120,7 +122,7 @@ export class WorkflowEngine {
     const deadlineAt = Date.now() + timeoutMs;
     const paths = this.store.paths(runId, parsed.metadata.resumable);
     const argsSha256 = hashCanonical(args);
-    const fingerprint = hashCanonical({ source: source.sha256, args: argsSha256, metadata: parsed.metadata, defaults, engine: 1 });
+    const fingerprint = hashCanonical({ source: source.sha256, args: argsSha256, metadata: parsed.metadata, defaults, engine: 2 });
     const journal = new WorkflowJournal(this.store);
     let replay = new Map<string, WorkflowReplayEntry>();
     let previousSpent = 0;
@@ -145,6 +147,7 @@ export class WorkflowEngine {
           ? records.find((record) => record.type === "node-intent" && record.nodeId === invalidateNodeId)?.sequence
           : undefined;
         replay = journal.replayIndex(invalidationSequence === undefined ? records : records.filter((record) => record.sequence < invalidationSequence));
+        await this.mergeDescendantReplay(previous.runId, replay, journal, invalidateNodeId);
       }
       catch (error) { await releaseResumeClaim(); releaseResumeClaim = undefined; throw error; }
     }
@@ -172,11 +175,9 @@ export class WorkflowEngine {
       budgetSpent: previousSpent,
       ...(previousUsage ? { initialUsage: previousUsage } : {}),
     });
-    try { await this.store.createRun(record, source.source); }
+    try { await this.store.createRun(record, source.source, true); }
     catch (error) { await releaseResumeClaim?.(); throw error; }
-    let releaseExecutionClaim: (() => Promise<void>) | undefined;
-    try { releaseExecutionClaim = await claimRunExecution(this.store, runId, owner); }
-    catch (error) { await releaseResumeClaim?.(); throw error; }
+    const releaseExecutionClaim = publishedRunExecutionClaim(this.store, runId, owner);
 
     const controller = new AbortController();
     this.owners.register({ runId, owner, controller });
@@ -195,6 +196,8 @@ export class WorkflowEngine {
       journal,
       replay,
       leafControllers: new Map(),
+      executionControllers: new Set(),
+      lingeringLeafOperations: new Set(),
       ...(onRecord ? { onRecord } : {}),
     };
     const coordinator = new RunCoordinator(this, root, record, { resolved: source, parsed }, 0, "root", [source.identity]);
@@ -207,12 +210,16 @@ export class WorkflowEngine {
       await releaseResumeClaim?.();
       throw error;
     }
-    const completion = coordinator.execute().finally(async () => {
-      this.owners.finish(runId);
-      this.completions.delete(runId);
+    const releaseOwnership = async (): Promise<void> => {
       this.activeRoots.delete(runId);
       await releaseExecutionClaim?.();
       await releaseResumeClaim?.();
+    };
+    const completion = coordinator.execute().finally(async () => {
+      this.owners.finish(runId);
+      this.completions.delete(runId);
+      if (coordinator.isQuiescent()) await releaseOwnership();
+      else void coordinator.awaitQuiescence().then(releaseOwnership, releaseOwnership).catch(() => {});
     });
     this.completions.set(runId, completion);
     return { runId, record: coordinator.snapshot(), completion };
@@ -285,6 +292,8 @@ export class WorkflowEngine {
       if (uncertain) await this.applyEvent(record.runId, { type: "CleanupChanged", cleanup: { status: "recovery_required", deadlineAt: record.cleanup.deadlineAt, finishedAt: Date.now(), error } });
       await this.applyEvent(record.runId, { type: "RunStatusChanged", status: uncertain ? "recovery_required" : "interrupted", error });
     }
+    await this.artifacts.reconcileCacheIntegrations(async (runId) =>
+      this.activeRoots.has(runId) || await hasLiveRunExecutionClaim(this.store, runId));
   }
 
   async applyEvent(runId: string, event: WorkflowRunEvent): Promise<WorkflowRunRecordV1> {
@@ -299,6 +308,34 @@ export class WorkflowEngine {
     if (!previous.metadata.resumable) throw new WorkflowContractError("RUN_NOT_RESUMABLE", "workflow metadata does not declare resumable:true");
     const script = await readFile(previous.source.copiedPath, "utf8");
     return this.launch({ script, args: previous.args, budgetTokens: previous.budget.total ?? undefined, timeoutMs: Math.max(1_000, previous.deadlineAt - previous.createdAt), resumeFromRunId: runId }, ctx, true, onRecord, invalidateNodeId);
+  }
+
+  private async mergeDescendantReplay(
+    rootRunId: string,
+    replay: Map<string, WorkflowReplayEntry>,
+    journal: WorkflowJournal,
+    invalidateNodeId?: string,
+  ): Promise<void> {
+    const conflicts = new Set<string>();
+    const descendants = (await this.store.scan())
+      .filter((entry) => entry.state === "ok" && entry.record!.rootRunId === rootRunId && entry.record!.runId !== rootRunId && entry.record!.metadata.resumable)
+      .map((entry) => entry.record!)
+      .sort((a, b) => a.createdAt - b.createdAt || a.runId.localeCompare(b.runId));
+    for (const descendant of descendants) {
+      const records = await journal.recover(descendant.runId);
+      const invalidationSequence = invalidateNodeId
+        ? records.find((record) => record.type === "node-intent" && record.nodeId === invalidateNodeId)?.sequence
+        : undefined;
+      const entries = journal.replayIndex(invalidationSequence === undefined ? records : records.filter((record) => record.sequence < invalidationSequence));
+      for (const [nodeId, entry] of entries) {
+        if (conflicts.has(nodeId)) continue;
+        const existing = replay.get(nodeId);
+        if (existing && (existing.fingerprint !== entry.fingerprint || existing.cachePolicy !== entry.cachePolicy)) {
+          replay.delete(nodeId);
+          conflicts.add(nodeId);
+        } else replay.set(nodeId, entry);
+      }
+    }
   }
 
   private resolveTopSource(input: WorkflowInput, ctx: ExtensionContext): ResolvedWorkflowSource {
@@ -321,7 +358,9 @@ class RunCoordinator {
   private mutation: Promise<void> = Promise.resolve();
   private readonly failures: WorkflowLeafFailure[] = [];
   private readonly ids = new Set<string>();
-  private readonly activeLeaves = new Set<Promise<unknown>>();
+  private readonly childIds = new Set<string>();
+  private readonly activeOperations = new Set<Promise<unknown>>();
+  private leafMutationsClosed = false;
   private fatal?: unknown;
   private phase?: string;
   private localAgentsAccepted = 0;
@@ -355,6 +394,7 @@ class RunCoordinator {
 
   async execute(): Promise<WorkflowRunRecordV1> {
     const executionController = new AbortController();
+    this.root.executionControllers.add(executionController);
     const linked = linkSignals(this.root.controller.signal, executionController.signal);
     try {
       const remaining = this.root.deadlineAt - Date.now();
@@ -369,7 +409,7 @@ class RunCoordinator {
         resumable: this.source.parsed.metadata.resumable,
       }, linked.signal);
       if (this.fatal) throw this.fatal;
-      await Promise.allSettled([...this.activeLeaves]);
+      if (!await this.drainActiveOperations()) throw infrastructure("CLEANUP_DEADLINE", "active workflow operations did not settle within cleanup grace");
       if (this.fatal) throw this.fatal;
       if (this.root.controller.signal.aborted) throw abortError(this.root.controller.signal);
       const encoded = encodeWorkflowOutput(output);
@@ -391,12 +431,18 @@ class RunCoordinator {
       await this.transition({ type: "RetentionChanged", pinned: false, expiresAt: Date.now() + this.root.settings.retentionMs });
     } catch (error) {
       executionController.abort(error);
-      await Promise.allSettled([...this.activeLeaves]);
-      await this.interruptUnsettledLeaves(error);
+      for (const controller of this.root.executionControllers) controller.abort(error);
+      for (const controller of this.root.leafControllers.values()) controller.abort(error);
+      let terminalError = error;
+      if (!await this.drainActiveOperations()) {
+        terminalError = infrastructure("CLEANUP_DEADLINE", "active workflow operations did not settle within cleanup grace");
+        this.leafMutationsClosed = true;
+      }
+      await this.interruptUnsettledLeaves(terminalError);
       const cancellation = this.root.controller.signal.aborted;
       const paused = cancellation && (this.root.controller.signal.reason as NodeJS.ErrnoException | undefined)?.code === "WORKFLOW_PAUSE";
-      const workflowError = serializeError(error, cancellation ? "cancellation" : undefined);
-      const recoveryRequired = /^(WORKSPACE|ARTIFACT)/.test(workflowError.code);
+      const workflowError = serializeError(terminalError, cancellation ? "cancellation" : undefined);
+      const recoveryRequired = /^(WORKSPACE|ARTIFACT|CLEANUP)/.test(workflowError.code);
       await this.transition({
         type: "TerminalIntentAccepted",
         intent: { kind: paused ? "pause" : cancellation ? "cancel" : workflowError.code === "WORKFLOW_DEADLINE" ? "timeout" : "fail", requestedAt: Date.now(), reason: workflowError.message, error: workflowError },
@@ -420,6 +466,8 @@ class RunCoordinator {
       }
     } finally {
       linked.dispose();
+      executionController.abort();
+      this.root.executionControllers.delete(executionController);
     }
     const durable = await this.engine.store.readRun(this.record.runId);
     if (!["completed", "failed", "cancelled", "paused", "interrupted", "recovery_required"].includes(durable.status)) {
@@ -475,24 +523,53 @@ class RunCoordinator {
     if (this.source.parsed.metadata.resumable) {
       await this.appendJournal("node-intent", nodeId, { fingerprint: leaf.executionFingerprint, cachePolicy: leaf.cachePolicy });
     }
-    if (leaf.cachePolicy === "pure") {
+    if (leaf.cachePolicy !== "off") {
       await verifyInputManifest(this.root.cwd, options.inputManifest ?? []);
       const cached = this.root.replay.get(nodeId);
-      if (cached?.fingerprint === leaf.executionFingerprint) {
+      if (cached?.fingerprint === leaf.executionFingerprint && cached.cachePolicy === leaf.cachePolicy) {
+        if (leaf.cachePolicy === "workspace-artifact") {
+          const restorationDeadline = deadline.signal(this.root.controller.signal);
+          let restored: boolean;
+          try { restored = await this.restoreCachedWorkspaceArtifacts(leaf, cached.artifactIds ?? [], restorationDeadline.signal); }
+          finally { restorationDeadline.dispose(); }
+          if (!restored) return await this.executeUncachedAgent(leaf, request.task, options, resolved, deadline);
+        }
         await this.transition({ type: "LeafStatusChanged", leafId, status: "cached", at: Date.now(), result: cached.result });
         if (this.source.parsed.metadata.resumable) {
-          await this.appendJournal("node-result", nodeId, { fingerprint: leaf.executionFingerprint, cachePolicy: "pure", result: cached.result });
+          await this.appendJournal("node-result", nodeId, {
+            fingerprint: leaf.executionFingerprint,
+            cachePolicy: leaf.cachePolicy,
+            result: cached.result,
+            ...(cached.artifactIds?.length ? { artifactIds: cached.artifactIds } : {}),
+          });
         }
         return cloneCanonicalJson(cached.result);
       }
     }
 
+    return this.executeUncachedAgent(leaf, request.task, options, resolved, deadline);
+  }
+
+  private async executeUncachedAgent(
+    leaf: WorkflowLeafRecordV1,
+    task: string,
+    options: WorkflowAgentOptions,
+    resolved: ReturnType<typeof resolveAgentExecution>,
+    deadline: AbsoluteDeadline,
+  ): Promise<unknown> {
+    const nodeId = leaf.nodeId;
+
     const leafController = new AbortController();
     this.root.leafControllers.set(nodeId, leafController);
-    const operation = this.runLeaf(leaf, request.task, options, resolved, deadline, leafController.signal);
-    this.activeLeaves.add(operation);
+    const operation = this.runLeaf(leaf, task, options, resolved, deadline, leafController.signal);
+    this.activeOperations.add(operation);
+    this.root.lingeringLeafOperations.add(operation);
     try { return await operation; }
-    finally { this.activeLeaves.delete(operation); this.root.leafControllers.delete(nodeId); }
+    finally {
+      this.activeOperations.delete(operation);
+      this.root.lingeringLeafOperations.delete(operation);
+      this.root.leafControllers.delete(nodeId);
+    }
   }
 
   private async runLeaf(
@@ -553,6 +630,7 @@ class RunCoordinator {
         if (this.source.parsed.metadata.resumable) await this.appendJournal("node-skip", leaf.nodeId, { reason: "user skip" });
         return null;
       }
+      if (leafSignal.aborted) throw abortError(leafSignal);
       if (result.error) {
         const failure = leafFailure(leaf, result.error.reason === "timeout" ? "deadline" : result.structuredOutputOutcome ? "structured-output" : "provider", result.error.message);
         this.failures.push(failure);
@@ -564,8 +642,14 @@ class RunCoordinator {
       const canonical = cloneCanonicalJson(value === undefined ? null : value);
       await this.transition({ type: "LeafStatusChanged", leafId: leaf.leafId, status: "completed", at: Date.now(), result: canonical });
       await this.finishWorkspace(leaf, resolved, leaseId);
-      if (this.source.parsed.metadata.resumable && resolved.cachePolicy === "pure") {
-        await this.appendJournal("node-result", leaf.nodeId, { fingerprint: leaf.executionFingerprint, cachePolicy: "pure", result: canonical });
+      if (this.source.parsed.metadata.resumable && resolved.cachePolicy !== "off") {
+        const current = this.record.leaves.find((item) => item.leafId === leaf.leafId);
+        await this.appendJournal("node-result", leaf.nodeId, {
+          fingerprint: leaf.executionFingerprint,
+          cachePolicy: resolved.cachePolicy,
+          result: canonical,
+          ...(current?.artifactIds.length ? { artifactIds: current.artifactIds } : {}),
+        });
       }
       return canonical;
     } catch (error) {
@@ -613,13 +697,68 @@ class RunCoordinator {
     }
   }
 
+  private async restoreCachedWorkspaceArtifacts(leaf: WorkflowLeafRecordV1, artifactIds: readonly string[], signal: AbortSignal): Promise<boolean> {
+    if (artifactIds.length === 0) return false;
+    const verified = [];
+    try {
+      for (const artifactId of artifactIds) verified.push(await this.engine.artifacts.verifyArtifact(artifactId, signal));
+    } catch (error) {
+      if (signal.aborted) throw infrastructure("WORKSPACE_CACHE_RESTORE", errorMessage(error));
+      return false;
+    }
+    signal.throwIfAborted();
+    for (const artifact of verified) {
+      let integration;
+      try {
+        integration = await this.engine.artifacts.apply(
+          artifact.id,
+          this.root.cwd,
+          "HEAD",
+          this.root.owner.sessionId,
+          signal,
+          { runId: this.record.runId, purpose: "cache-replay" },
+        );
+      } catch (error) {
+        if (signal.aborted || (error as NodeJS.ErrnoException).code === "WORKSPACE_INTEGRATION_RECOVERY") {
+          throw infrastructure("WORKSPACE_CACHE_RESTORE", `cached artifact restore failed: ${errorMessage(error)}`);
+        }
+        return false;
+      }
+      let applied = false;
+      try { applied = integration.state === "applied"; }
+      finally {
+        try {
+          await this.engine.artifacts.releaseApplied(integration.integrationId, this.root.owner.sessionId, this.cleanupSignal());
+        } catch (error) {
+          throw infrastructure("WORKSPACE_CACHE_CLEANUP", `integration ${integration.integrationId} retained: ${errorMessage(error)}`);
+        }
+      }
+      if (!applied) return false;
+      const manifestPath = path.join(artifact.directory, "manifest.json");
+      const manifest = await readFile(manifestPath);
+      if (!this.record.artifacts.some((item) => item.artifactId === artifact.id)) {
+        await this.transition({
+          type: "ArtifactRecorded",
+          artifact: {
+            artifactId: artifact.id, kind: "workspace", path: manifestPath,
+            sha256: createHash("sha256").update(manifest).digest("hex"), bytes: manifest.length,
+            state: "verified", createdAt: Date.now(),
+          },
+        });
+      }
+    }
+    await this.transition({ type: "LeafReferencesChanged", leafId: leaf.leafId, artifactIds: [...artifactIds] });
+    return true;
+  }
+
   private async finishWorkspace(leaf: WorkflowLeafRecordV1, resolved: ReturnType<typeof resolveAgentExecution>, leaseId?: string): Promise<void> {
     if (!leaseId) return;
+    const cleanupSignal = this.cleanupSignal();
     if (resolved.artifactPolicy === "discard") {
-      await this.engine.artifacts.discard(leaseId);
+      await this.engine.artifacts.discard(leaseId, cleanupSignal);
       return;
     }
-    const artifact = await this.engine.artifacts.release(leaseId);
+    const artifact = await this.engine.artifacts.release(leaseId, cleanupSignal);
     if (!artifact) throw infrastructure("ARTIFACT_MISSING", "workspace capture returned no artifact");
     const manifestPath = path.join(artifact.directory, "manifest.json");
     const manifestText = JSON.stringify(artifact.manifest, null, 2) + "\n";
@@ -632,6 +771,15 @@ class RunCoordinator {
     });
     const current = this.record.leaves.find((item) => item.leafId === leaf.leafId);
     await this.transition({ type: "LeafReferencesChanged", leafId: leaf.leafId, artifactIds: [...(current?.artifactIds ?? []), artifact.id] });
+  }
+
+  private cleanupSignal(): AbortSignal {
+    const remaining = this.record.cleanup.deadlineAt - Date.now();
+    if (remaining <= 0) {
+      const error = infrastructure("CLEANUP_DEADLINE", "workflow cleanup grace deadline elapsed");
+      return AbortSignal.abort(error);
+    }
+    return AbortSignal.timeout(remaining);
   }
 
   private async recordLeafUsage(leaf: WorkflowLeafRecordV1, result: SubagentResult): Promise<void> {
@@ -654,6 +802,8 @@ class RunCoordinator {
   }
 
   private async finishChild(request: WorkerChildRequest): Promise<unknown> {
+    if (this.childIds.has(request.reference.id)) throw new WorkflowContractError("CHILD_ID_DUPLICATE", `duplicate child workflow id: ${request.reference.id}`);
+    this.childIds.add(request.reference.id);
     if (this.depth >= 4) throw new WorkflowContractError("CHILD_DEPTH", "workflow nesting depth exceeds 4");
     const childArgs = request.args === undefined ? null : cloneCanonicalJson(request.args);
     const resolved = "name" in request.reference
@@ -681,14 +831,21 @@ class RunCoordinator {
       deadlineAt: this.root.deadlineAt, cleanupDeadlineAt: this.record.cleanup.deadlineAt,
       budgetTotal: this.root.budget.total,
     });
-    await this.engine.store.createRun(record, resolved.source);
+    await this.engine.store.createRun(record, resolved.source, true);
+    const releaseExecutionClaim = publishedRunExecutionClaim(this.engine.store, runId, this.root.owner);
     const child = new RunCoordinator(
       this.engine, this.root, record, { resolved, parsed }, this.depth + 1,
-      `${this.scope}/workflow:${resolved.sha256}`,
+      `${this.scope}/workflow:${request.reference.id}`,
       [...this.sourceStack, resolved.identity],
     );
-    await child.start();
-    const finished = await child.execute();
+    let finished: WorkflowRunRecordV1;
+    try {
+      await child.start();
+      finished = await child.execute();
+    } finally {
+      if (child.isQuiescent()) await releaseExecutionClaim();
+      else void child.awaitQuiescence().then(releaseExecutionClaim, releaseExecutionClaim).catch(() => {});
+    }
     await this.transition({ type: "UsageAdded", usage: finished.usage });
     await this.transition({ type: "BudgetChanged", budget: this.root.budget.snapshot() });
     if (finished.status !== "completed" || !finished.output) throw new Error(finished.error?.message ?? `child workflow ${runId} failed`);
@@ -697,13 +854,15 @@ class RunCoordinator {
   }
 
   private async handleChild(request: WorkerChildRequest) {
+    const operation = this.finishChild(request);
+    this.activeOperations.add(operation);
     try {
-      const value = await this.finishChild(request);
+      const value = await operation;
       return { value, failures: [...this.failures], budget: this.root.budget.snapshot() };
     } catch (error) {
       if (isFatal(error)) this.fatal ??= error;
       throw error;
-    }
+    } finally { this.activeOperations.delete(operation); }
   }
 
   private async appendJournal(type: "node-intent" | "node-result" | "node-skip" | "terminal", nodeId: string, payload: JsonValue): Promise<void> {
@@ -723,7 +882,10 @@ class RunCoordinator {
     return result;
   }
 
-  private async transition(event: WorkflowRunEvent): Promise<void> {
+  private async transition(event: WorkflowRunEvent, allowAfterLeafSeal = false): Promise<void> {
+    if (this.leafMutationsClosed && !allowAfterLeafSeal && ["LeafStatusChanged", "LeafReferencesChanged", "UsageAdded", "BudgetChanged", "ArtifactRecorded"].includes(event.type)) {
+      throw infrastructure("LATE_LEAF_MUTATION", "leaf mutation rejected after cleanup grace expired");
+    }
     let complete!: () => void; let reject!: (error: unknown) => void;
     const result = new Promise<void>((resolve, fail) => { complete = resolve; reject = fail; });
     this.mutation = this.mutation.then(async () => {
@@ -738,10 +900,29 @@ class RunCoordinator {
     return result;
   }
 
+  isQuiescent(): boolean { return this.activeOperations.size === 0 && this.root.lingeringLeafOperations.size === 0; }
+  async awaitQuiescence(): Promise<void> {
+    await Promise.allSettled([...new Set([...this.activeOperations, ...this.root.lingeringLeafOperations])]);
+  }
+
+  private async drainActiveOperations(): Promise<boolean> {
+    const active = [...this.activeOperations];
+    if (active.length === 0) return true;
+    const remaining = this.record.cleanup.deadlineAt - Date.now();
+    if (remaining <= 0) return false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        Promise.allSettled(active).then(() => true),
+        new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), remaining); }),
+      ]);
+    } finally { if (timer) clearTimeout(timer); }
+  }
+
   private async interruptUnsettledLeaves(error: unknown): Promise<void> {
     for (const leaf of this.record.leaves) {
       if (["queued", "running", "backoff"].includes(leaf.status)) {
-        await this.transition({ type: "LeafStatusChanged", leafId: leaf.leafId, status: "interrupted", at: Date.now() }).catch(() => {});
+        await this.transition({ type: "LeafStatusChanged", leafId: leaf.leafId, status: "interrupted", at: Date.now() }, true).catch(() => {});
       }
     }
   }

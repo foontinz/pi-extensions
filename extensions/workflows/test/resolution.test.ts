@@ -28,6 +28,10 @@ test("workspace effects require isolation and default to verified capture", () =
   }, root, available, false);
   assert.equal(result.artifactPolicy, "capture");
   assert.equal(result.workspace, "isolated");
+  const cacheable = resolveAgentExecution("/tmp", {
+    effects: "workspace", workspace: "isolated", artifactPolicy: "capture", cachePolicy: "workspace-artifact", tools: ["write"],
+  }, root, available, false);
+  assert.equal(cacheable.cachePolicy, "workspace-artifact");
   assert.throws(() => resolveAgentExecution("/tmp", {
     effects: "workspace", workspace: "isolated", artifactPolicy: "discard", cachePolicy: "workspace-artifact", tools: ["write"],
   }, root, available, false), /requires.*captured workspace/);

@@ -114,13 +114,8 @@ export function resolveAgentExecution(
   }
   if (effects === "external" && requestedCache !== "off") throw new WorkflowPolicyError("CACHE_EXTERNAL", "external-effect leaves are non-cacheable");
   if (requestedCache === "pure" && effects !== "none") throw new WorkflowPolicyError("CACHE_PURE_EFFECTS", "cachePolicy:\"pure\" requires effects:\"none\"");
-  if (requestedCache === "workspace-artifact") {
-    if (effects !== "workspace" || artifactPolicy !== "capture") {
-      throw new WorkflowPolicyError("CACHE_WORKSPACE_ARTIFACT", "workspace-artifact cache requires an isolated captured workspace");
-    }
-    // Fail closed until fresh-worktree artifact restoration is available; never
-    // advertise a cache mode that would silently skip or duplicate writes.
-    throw new WorkflowPolicyError("CACHE_WORKSPACE_ARTIFACT_UNAVAILABLE", "workspace-artifact replay is not yet available in the local engine");
+  if (requestedCache === "workspace-artifact" && (effects !== "workspace" || artifactPolicy !== "capture")) {
+    throw new WorkflowPolicyError("CACHE_WORKSPACE_ARTIFACT", "workspace-artifact cache requires an isolated captured workspace");
   }
 
   const systemPrompt = input.systemPrompt ?? profile?.systemPrompt;
