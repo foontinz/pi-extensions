@@ -1,5 +1,5 @@
 export const STATE_VERSION = 2;
-export const ANALYZER_PROMPT_VERSION = "skill-forge-analyzer-v4";
+export const ANALYZER_PROMPT_VERSION = "skill-forge-analyzer-v5";
 
 export type Scope = "user" | "project";
 export type InstallKind = "skill" | "prompt";
