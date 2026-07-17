@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
+import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import { emptyUsageStats } from "../../subagents/core/types.js";
 import { pruneWorkflowRuns } from "../core/retention.js";
 import { WorkflowEngine } from "../engine.js";
 
+const execFile = promisify(execFileCallback);
 const metadata = `export const meta = {
   name: "test",
   description: "test workflow",
@@ -143,6 +146,37 @@ test("resumable skip and pause use stable controls without masquerading as leaf 
     assert.equal(pausedResult.status, "paused");
     assert.equal(pausedResult.leaves[0].status, "interrupted");
   } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test("workspace effects capture verified artifacts before cleanup and apply in a fresh tree", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "workflow-engine-workspace-"));
+  let integration: any;
+  try {
+    await execFile("git", ["-C", root, "init", "--initial-branch=main"]);
+    await execFile("git", ["-C", root, "config", "user.name", "Test"]);
+    await execFile("git", ["-C", root, "config", "user.email", "test@example.invalid"]);
+    await fs.writeFile(path.join(root, "base.txt"), "base\n");
+    await execFile("git", ["-C", root, "add", "."]);
+    await execFile("git", ["-C", root, "commit", "-m", "base"]);
+    const executor = async (options: any) => {
+      await fs.writeFile(path.join(options.cwd, "result.txt"), "captured\n");
+      return { output: "done", usage: emptyUsageStats() };
+    };
+    const { engine, ctx } = harness(root, executor);
+    const workspaceMeta = metadata.replace('capabilities: ["read"]', 'capabilities: ["read", "workspace"]');
+    const run = await engine.launch({ script: `${workspaceMeta}\nreturn await agent("write", {id:"write", effects:"workspace", workspace:"isolated", tools:["read"]})` }, ctx, true);
+    const finished = await run.completion;
+    assert.equal(finished.status, "completed");
+    assert.equal(finished.artifacts[0].state, "verified");
+    const lease = await engine.artifacts.getLease(finished.leaves[0].workspaceLeaseId!);
+    assert.equal(lease.state, "cleaned");
+    integration = await engine.artifacts.apply(finished.artifacts[0].artifactId, root);
+    assert.equal(await fs.readFile(path.join(integration.root, "result.txt"), "utf8"), "captured\n");
+    await engine.artifacts.releaseApplied(integration); integration = undefined;
+  } finally {
+    if (integration) await fs.rm(integration.tempParent, { recursive: true, force: true });
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 test("manifest-aware retention prunes only delivered, cleaned, expired, unpinned terminal runs", async () => {

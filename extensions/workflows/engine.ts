@@ -185,7 +185,13 @@ export class WorkflowEngine {
     };
     const coordinator = new RunCoordinator(this, root, record, { resolved: source, parsed }, 0, "root", [source.identity]);
     this.activeRoots.set(runId, root);
-    await coordinator.start();
+    try { await coordinator.start(); }
+    catch (error) {
+      this.activeRoots.delete(runId);
+      this.owners.finish(runId);
+      await releaseResumeClaim?.();
+      throw error;
+    }
     const completion = coordinator.execute().finally(async () => {
       this.owners.finish(runId);
       this.completions.delete(runId);
