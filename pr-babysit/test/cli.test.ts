@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { displayStatus, isTerminalPrState, main, paneLabel, parseInvocation, recoveryHint } from "../src/cli.ts";
+import { displayStatus, isTerminalPrState, main, paneLabel, parseInvocation, recoveryHint, syncIdleBranch } from "../src/cli.ts";
+import type { Config } from "../src/config.ts";
+import { appPaths } from "../src/paths.ts";
 import { createPrState } from "../src/state.ts";
 
 test("CLI parser canonicalizes keys and enforces command-specific syntax", () => {
@@ -95,4 +97,45 @@ test("terminal PR states are identifiable for default status filtering and remai
   state.cursors.prState = "CLOSED";
   assert.equal(displayStatus(state), "closed");
   assert.equal(isTerminalPrState(state), true);
+});
+
+test("idle branch sync is mutually exclusive with pending-event dispatch", async () => {
+  const state = createPrState({ key: "owner/repo#1", baseRefName: "main" });
+  const config: Config = {
+    provider: "test",
+    model: "test",
+    pollIntervalSec: 60,
+    runTimeoutMin: 15,
+    maxConcurrentRuns: 1,
+    baseMergeMessage: "chore: merge base",
+  };
+  let calls = 0;
+  const sync = await syncIdleBranch(state, config, appPaths("/tmp/pr-babysit-idle-sync-test"), async (_state, _app, _runner, options) => {
+    calls += 1;
+    assert.equal(options?.mergeMessage, config.baseMergeMessage);
+    return { dirty: false, reset: false, base: { branch: "main", action: "up_to_date", pushed: false }, detail: "synced" };
+  });
+  assert.equal(sync?.detail, "synced");
+  assert.equal(calls, 1);
+
+  state.pendingEvents.push({
+    id: "comment:1",
+    type: "comment",
+    observedAt: new Date().toISOString(),
+    actor: "alice",
+    summary: "pending",
+    raw: {},
+    runAttempts: 0,
+  });
+  assert.equal(await syncIdleBranch(state, config, appPaths("/tmp/unused"), async () => {
+    calls += 1;
+    throw new Error("must not sync while dispatch is pending");
+  }), null);
+  state.pendingEvents = [];
+  state.cursors.prState = "MERGED";
+  assert.equal(await syncIdleBranch(state, config, appPaths("/tmp/unused"), async () => {
+    calls += 1;
+    throw new Error("must not sync a terminal PR");
+  }), null);
+  assert.equal(calls, 1);
 });

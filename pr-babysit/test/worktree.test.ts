@@ -118,6 +118,48 @@ const pr: PrView = {
   statusCheckRollup: [],
 };
 
+test("sync serializes shared-repository refs across different PR worktrees", async () => {
+  const home = await mkdtemp(join(tmpdir(), "pr-babysit-repo-sync-lock-"));
+  const app = appPaths(home);
+  await ensureAppDirs(app);
+  const repoRoot = repoRootPath("owner", "repo", app);
+  const firstState = createPrState({
+    key: "owner/repo#7",
+    repoRoot,
+    worktreePath: prPaths("owner/repo#7", app).worktreePath,
+    baseRefName: "main",
+  });
+  const secondState = createPrState({
+    key: "owner/repo#8",
+    repoRoot,
+    worktreePath: prPaths("owner/repo#8", app).worktreePath,
+    baseRefName: "main",
+  });
+  let releaseFirst!: () => void;
+  const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  let firstEntered!: () => void;
+  const entered = new Promise<void>((resolve) => { firstEntered = resolve; });
+  const firstRunner: CommandRunner = async () => {
+    firstEntered();
+    await firstGate;
+    return { stdout: "dirty\n", stderr: "" };
+  };
+  let secondEntered = false;
+  const secondRunner: CommandRunner = async () => {
+    secondEntered = true;
+    return { stdout: "dirty\n", stderr: "" };
+  };
+
+  const first = syncWorktreeBeforeRun(firstState, app, firstRunner);
+  await entered;
+  const second = syncWorktreeBeforeRun(secondState, app, secondRunner);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(secondEntered, false, "shared remote refs must not be fetched concurrently");
+  releaseFirst();
+  await Promise.all([first, second]);
+  assert.equal(secondEntered, true);
+});
+
 test("sync automatically merges the base branch into the head branch and pushes it", async () => {
   const home = await mkdtemp(join(tmpdir(), "pr-babysit-base-merge-"));
   const app = appPaths(home);

@@ -3,7 +3,7 @@
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 
-import { loadConfig } from "./config.ts";
+import { type Config, loadConfig } from "./config.ts";
 import { dispatchPendingEvents, recoverInterruptedRun } from "./dispatcher.ts";
 import { acknowledgeEscalation } from "./escalation.ts";
 import { GhClient, GhCommandError } from "./gh.ts";
@@ -19,7 +19,13 @@ import {
   type PrState,
 } from "./state.ts";
 import { ensurePrPane, ensureTmuxAvailable, isPaneLive, killPrPane, resolveOwnPaneRef, setPaneLabel } from "./tmux.ts";
-import { provisionWorktree, removeManagedWorktree, worktreeDirty } from "./worktree.ts";
+import {
+  provisionWorktree,
+  removeManagedWorktree,
+  type SyncResult,
+  syncWorktreeBeforeRun,
+  worktreeDirty,
+} from "./worktree.ts";
 
 const VERSION = "0.1.0";
 const CLI_PATH = fileURLToPath(import.meta.url);
@@ -269,6 +275,22 @@ export function isTerminalPrState(state: Pick<PrState, "cursors">): boolean {
   return state.cursors.prState === "MERGED" || state.cursors.prState === "CLOSED";
 }
 
+export async function syncIdleBranch(
+  state: PrState,
+  config: Config,
+  app = appPaths(),
+  sync: typeof syncWorktreeBeforeRun = syncWorktreeBeforeRun,
+): Promise<SyncResult | null> {
+  // Pending events take the mutually exclusive dispatch path, whose agent run
+  // performs the same synchronization while holding the worktree lock.
+  if (state.pendingEvents.length > 0 || isTerminalPrState(state)) return null;
+  return sync(state, app, undefined, { mergeMessage: config.baseMergeMessage });
+}
+
+function notableSync(result: SyncResult): boolean {
+  return result.dirty || result.reset || (result.base !== null && result.base.action !== "up_to_date");
+}
+
 async function status(io: CliIo, includeTerminal: boolean): Promise<number> {
   const entries = await listPrStates();
   const valid = entries
@@ -423,6 +445,13 @@ async function runPoller(key: string, once: boolean, io: CliIo): Promise<void> {
             if (dispatched.notificationError) io.error(`${key} · notification failed: ${dispatched.notificationError}`);
           }
           if (state.tmux) await setPaneLabel(state.tmux, key, paneLabel(state, "watching"));
+        } else {
+          // This is awaited in the same loop as dispatch, never scheduled on a
+          // timer. The shared worktree lock also excludes duplicate processes.
+          const sync = await syncIdleBranch(state, config, app);
+          if (sync && notableSync(sync)) {
+            io.out(`[${new Date().toISOString()}] ${key} · branch sync: ${sync.detail}`);
+          }
         }
         if (once) return;
         await waitWithAbort(config.pollIntervalSec * 1_000, controller.signal);

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,9 +8,9 @@ import { type Config } from "../src/config.ts";
 import { dispatchPendingEvents, recoverInterruptedRun } from "../src/dispatcher.ts";
 import { appPaths, ensureAppDirs, parsePrKey, prPaths, repoRootPath } from "../src/paths.ts";
 import { type ReplyReceipt } from "../src/replies.ts";
-import { executeAgentRun, parseAgentEndJsonl } from "../src/runner.ts";
+import { executeAgentRun } from "../src/runner.ts";
 import { createPrState, loadPrState, savePrState, type EventRecord, type PrState } from "../src/state.ts";
-import { runCommand } from "../src/worktree.ts";
+import { runCommand, syncWorktreeBeforeRun } from "../src/worktree.ts";
 
 const config: Config = {
   provider: "test-provider",
@@ -52,6 +52,18 @@ async function executable(directory: string, name: string, source: string): Prom
   return path;
 }
 
+async function waitForFile(path: string): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    try {
+      await access(path);
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  throw new Error(`Timed out waiting for ${path}`);
+}
+
 async function fixture(key = "owner/repo#1"): Promise<{ app: ReturnType<typeof appPaths>; state: PrState; scripts: string }> {
   const home = await mkdtemp(join(tmpdir(), "pr-babysit-runner-"));
   const app = appPaths(home);
@@ -77,16 +89,6 @@ async function fixture(key = "owner/repo#1"): Promise<{ app: ReturnType<typeof a
   return { app, state, scripts: await mkdtemp(join(tmpdir(), "pr-babysit-fake-pi-")) };
 }
 
-test("agent_end parser extracts final assistant text", () => {
-  const parsed = parseAgentEndJsonl(`${JSON.stringify({ type: "message_update" })}\n${JSON.stringify({
-    type: "agent_end",
-    messages: [{ role: "assistant", content: [{ type: "text", text: "finished" }] }],
-    usage: { cost: 1 },
-  })}\n`);
-  assert.equal(parsed.finalText, "finished");
-  assert.deepEqual(parsed.usage, { cost: 1 });
-});
-
 test("dry run writes fenced prompt and explicit isolated pi metadata without spawning", async () => {
   const item = await fixture();
   const result = await executeAgentRun(item.state, [event()], config, {
@@ -102,7 +104,7 @@ test("dry run writes fenced prompt and explicit isolated pi metadata without spa
   assert.equal(meta.provider, "test-provider");
   assert.equal(meta.model, "test-model");
   assert.equal(meta.outcome, "dry_run");
-  assert.deepEqual((await readdir(result.artifactDir)).sort(), ["meta.json", "prompt.md", "rules.md", "stderr.log", "stdout.jsonl"]);
+  assert.deepEqual((await readdir(result.artifactDir)).sort(), ["meta.json", "prompt.md", "response.txt", "rules.md", "stderr.log"]);
 });
 
 test("dispatcher dry runs retain queued comments for a later real run", async () => {
@@ -121,12 +123,12 @@ test("dispatcher dry runs retain queued comments for a later real run", async ()
   assert.equal(item.state.lastRun?.outcome, "dry_run");
 });
 
-test("live runner passes every isolation flag and retains JSONL/session artifacts", async () => {
+test("live runner requests compact text output and retains response/session artifacts", async () => {
   const item = await fixture();
   const fake = await executable(item.scripts, "success-pi", `
 const fs = await import('node:fs/promises');
 await fs.writeFile('pi-args.json', JSON.stringify(process.argv.slice(2)));
-console.log(JSON.stringify({type:'agent_end',messages:[{role:'assistant',content:[{type:'text',text:'done'}]}],usage:{tokens:3}}));`);
+console.log('done');`);
   const result = await executeAgentRun(item.state, [event()], config, {
     app: item.app,
     piExecutable: fake,
@@ -140,10 +142,71 @@ console.log(JSON.stringify({type:'agent_end',messages:[{role:'assistant',content
   for (const flag of ["--print", "--mode", "--provider", "--model", "--session-dir", "--no-extensions", "--no-skills", "--no-context-files", "--no-approve", "--tools", "--append-system-prompt"]) {
     assert.ok(args.includes(flag), `missing ${flag}`);
   }
+  assert.equal(args[args.indexOf("--mode") + 1], "text");
   assert.equal(args[args.indexOf("--provider") + 1], "test-provider");
   assert.equal(args[args.indexOf("--model") + 1], "test-model");
   assert.equal(args[args.indexOf("--tools") + 1], "read,bash,edit,write");
-  assert.match(await readFile(join(result.artifactDir, "stdout.jsonl"), "utf8"), /agent_end/);
+  assert.equal(await readFile(join(result.artifactDir, "response.txt"), "utf8"), "done\n");
+});
+
+test("oversized final responses are compacted without failing or retrying completed work", async () => {
+  const item = await fixture();
+  const fake = await executable(item.scripts, "verbose-pi", `
+process.stdout.write('BEGIN\\n' + '🙂'.repeat(800_000) + '\\nEND\\n');`);
+  const result = await executeAgentRun(item.state, [event()], config, {
+    app: item.app,
+    piExecutable: fake,
+    timeoutMs: 5_000,
+    runId: "00000000-0000-4000-8000-000000000021",
+    replyVerifier: verifiedReplies,
+  });
+  assert.equal(result.outcome, "success");
+  const responsePath = join(result.artifactDir, "response.txt");
+  const response = await readFile(responsePath, "utf8");
+  assert.match(response, /^BEGIN/);
+  assert.match(response, /\[final response truncated by pr-babysit\]/);
+  assert.match(response, /END\n$/);
+  assert.doesNotMatch(response, /�/, "UTF-8 boundaries must remain valid after compaction");
+  assert.ok((await stat(responsePath)).size <= 2 * 1024 * 1024);
+  const meta = JSON.parse(await readFile(join(result.artifactDir, "meta.json"), "utf8")) as Record<string, unknown>;
+  assert.equal(meta.responseTruncated, true);
+});
+
+test("periodic branch sync cannot overlap an active agent using the worktree", async () => {
+  const item = await fixture();
+  const startedPath = join(item.state.worktreePath!, "agent-started");
+  const releasePath = join(item.state.worktreePath!, "release-agent");
+  const fake = await executable(item.scripts, "blocking-pi", `
+const fs = await import('node:fs/promises');
+await fs.writeFile(${JSON.stringify(startedPath)}, 'started');
+while (true) {
+  try { await fs.access(${JSON.stringify(releasePath)}); break; }
+  catch { await new Promise((resolve) => setTimeout(resolve, 10)); }
+}
+console.log('done');`);
+  const run = executeAgentRun(item.state, [event()], config, {
+    app: item.app,
+    piExecutable: fake,
+    timeoutMs: 5_000,
+    runId: "00000000-0000-4000-8000-000000000020",
+    replyVerifier: verifiedReplies,
+  });
+  await waitForFile(startedPath);
+
+  let periodicEntered = false;
+  const periodic = syncWorktreeBeforeRun(item.state, item.app, async () => {
+    periodicEntered = true;
+    throw new Error("periodic sync entered");
+  }).catch((error: unknown) => error as Error);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(periodicEntered, false, "periodic git commands must wait while the agent owns the worktree lock");
+
+  await writeFile(releasePath, "release");
+  assert.equal((await run).outcome, "success");
+  const periodicResult = await periodic;
+  assert.equal(periodicEntered, true);
+  assert.ok(periodicResult instanceof Error);
+  assert.match(periodicResult.message, /periodic sync entered/);
 });
 
 test("runner pins GH_HOST to the watched Enterprise host for agent gh commands", async () => {
@@ -151,7 +214,7 @@ test("runner pins GH_HOST to the watched Enterprise host for agent gh commands",
   const fake = await executable(item.scripts, "enterprise-pi", `
 const fs = await import('node:fs/promises');
 await fs.writeFile('pi-host.txt', process.env.GH_HOST ?? '');
-console.log(JSON.stringify({type:'agent_end',messages:[{role:'assistant',content:'done'}]}));`);
+console.log('done');`);
   const result = await executeAgentRun(item.state, [event()], config, {
     app: item.app,
     env: { ...process.env, GH_HOST: "wrong.example.test" },
@@ -168,7 +231,7 @@ test("descendants retaining output pipes cannot hold a run slot after pi exits",
   const fake = await executable(item.scripts, "descendant-pi", `
 const {spawn} = await import('node:child_process');
 spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:['ignore',1,2]});
-process.stdout.write(JSON.stringify({type:'agent_end',messages:[{role:'assistant',content:'done'}]})+'\\n',()=>process.exit(0));`);
+process.stdout.write('done\\n',()=>process.exit(0));`);
   const started = Date.now();
   const result = await executeAgentRun(item.state, [event()], config, {
     app: item.app,
@@ -185,7 +248,7 @@ process.stdout.write(JSON.stringify({type:'agent_end',messages:[{role:'assistant
 test("dispatcher coalesces all queued events and drains them after success", async () => {
   const item = await fixture();
   const fake = await executable(item.scripts, "dispatch-pi", `
-console.log(JSON.stringify({type:'agent_end',messages:[{role:'assistant',content:'done'}]}));`);
+console.log('done');`);
   const second = { ...event(), id: "review:2", type: "review" as const };
   item.state.pendingEvents = [event(), second];
   await savePrState(item.state, item.app);
@@ -205,7 +268,7 @@ console.log(JSON.stringify({type:'agent_end',messages:[{role:'assistant',content
 test("zero-exit agents cannot drain comment events without verified per-source replies", async () => {
   const item = await fixture();
   const fake = await executable(item.scripts, "silent-pi", `
-console.log(JSON.stringify({type:'agent_end',messages:[{role:'assistant',content:'claimed success'}]}));`);
+console.log('claimed success');`);
   item.state.pendingEvents = [event()];
   await savePrState(item.state, item.app);
   const result = await dispatchPendingEvents(item.state, config, {
@@ -372,7 +435,7 @@ test("file and sentinel escalation are detected without treating output as succe
   const filePi = await executable(fileItem.scripts, "file-pi", `
 const fs = await import('node:fs/promises');
 await fs.writeFile(${JSON.stringify(escalationPath)}, JSON.stringify({reason:'Blocked',details:'Cannot verify safely'}));
-console.log(JSON.stringify({type:'agent_end',messages:[{role:'assistant',content:'stopped'}]}));`);
+console.log('stopped');`);
   const fromFile = await executeAgentRun(fileItem.state, [event()], config, {
     app: fileItem.app,
     piExecutable: filePi,
@@ -383,7 +446,7 @@ console.log(JSON.stringify({type:'agent_end',messages:[{role:'assistant',content
 
   const sentinelItem = await fixture();
   const sentinelPi = await executable(sentinelItem.scripts, "sentinel-pi", `
-console.log(JSON.stringify({type:'agent_end',messages:[{role:'assistant',content:'[[BABYSIT_ESCALATE: Need human decision]]'}]}));`);
+console.log('[[BABYSIT_ESCALATE: Need human decision]]');`);
   const fromSentinel = await executeAgentRun(sentinelItem.state, [event()], config, {
     app: sentinelItem.app,
     piExecutable: sentinelPi,

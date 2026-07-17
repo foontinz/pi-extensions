@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { chmod, lstat, mkdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { PrView } from "./gh.ts";
@@ -8,6 +8,7 @@ import {
   type AppPaths,
   appPaths,
   ensureAppDirs,
+  ensurePrDirs,
   normalizeGithubHost,
   parsePrKey,
   prPaths,
@@ -84,6 +85,139 @@ async function withDirectoryLock<T>(path: string, task: () => Promise<T>): Promi
     }
   }
   throw new Error(`Timed out waiting for worktree lock: ${path}`);
+}
+
+interface WorktreeLockOwner {
+  token: string;
+  pid: number;
+  createdAt: string;
+}
+
+const WORKTREE_LOCK_WAIT_MS = 60_000;
+const WORKTREE_LOCK_INITIALIZATION_GRACE_MS = 5_000;
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function readWorktreeLockOwner(lockPath: string): Promise<WorktreeLockOwner | null> {
+  try {
+    const info = await lstat(lockPath);
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`Refusing unsafe worktree operation lock: ${lockPath}`);
+    const value = JSON.parse(await readFile(join(lockPath, "owner.json"), "utf8")) as Partial<WorktreeLockOwner>;
+    if (
+      typeof value.token !== "string" ||
+      !/^[a-f\d-]{36}$/i.test(value.token) ||
+      typeof value.pid !== "number" ||
+      !Number.isSafeInteger(value.pid) ||
+      value.pid < 1 ||
+      typeof value.createdAt !== "string" ||
+      Number.isNaN(Date.parse(value.createdAt))
+    ) {
+      throw new Error(`Invalid worktree operation lock owner: ${lockPath}`);
+    }
+    return { token: value.token, pid: value.pid, createdAt: value.createdAt };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+async function moveAndRemoveLock(lockPath: string, suffix: string): Promise<boolean> {
+  const moved = `${lockPath}.${suffix}-${randomUUID()}`;
+  try {
+    await rename(lockPath, moved);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+  await rm(moved, { recursive: true, force: true });
+  return true;
+}
+
+async function waitForWorktreeLock(signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) throw new Error("Worktree operation cancelled");
+  await new Promise<void>((resolveWait, reject) => {
+    const timer = setTimeout(finish, 100);
+    const abort = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      reject(new Error("Worktree operation cancelled"));
+    };
+    function finish(): void {
+      signal?.removeEventListener("abort", abort);
+      resolveWait();
+    }
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
+/**
+ * Serialize every operation that may mutate one managed PR worktree. The lock
+ * lives outside the worktree, records its owning process, and is reclaimed only
+ * when that process is gone (or creation never finished). Token-checked release
+ * avoids deleting a replacement lock after stale-owner recovery.
+ */
+export async function withWorktreeOperationLock<T>(
+  state: Pick<PrState, "key">,
+  app: AppPaths,
+  task: () => Promise<T>,
+  options: { signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<T> {
+  const paths = prPaths(state.key, app);
+  await ensurePrDirs(paths);
+  const lockPath = join(paths.controlDir, "worktree-operation.lock");
+  const deadline = Date.now() + (options.timeoutMs ?? WORKTREE_LOCK_WAIT_MS);
+
+  while (true) {
+    const token = randomUUID();
+    try {
+      await mkdir(lockPath, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const owner = await readWorktreeLockOwner(lockPath);
+      if (owner !== null && !processAlive(owner.pid)) {
+        await moveAndRemoveLock(lockPath, "stale");
+        continue;
+      }
+      if (owner === null) {
+        let age: number;
+        try {
+          age = Date.now() - (await lstat(lockPath)).mtimeMs;
+        } catch (statError) {
+          if ((statError as NodeJS.ErrnoException).code === "ENOENT") continue;
+          throw statError;
+        }
+        if (age >= WORKTREE_LOCK_INITIALIZATION_GRACE_MS) {
+          await moveAndRemoveLock(lockPath, "incomplete");
+          continue;
+        }
+      }
+      if (Date.now() >= deadline) throw new Error(`Timed out waiting for worktree operation lock: ${state.key}`);
+      await waitForWorktreeLock(options.signal);
+      continue;
+    }
+
+    let published = false;
+    try {
+      const owner: WorktreeLockOwner = { token, pid: process.pid, createdAt: new Date().toISOString() };
+      await writeFile(join(lockPath, "owner.json"), JSON.stringify(owner), { flag: "wx", mode: 0o600 });
+      published = true;
+      return await task();
+    } finally {
+      if (!published) {
+        await rm(lockPath, { recursive: true, force: true });
+      } else {
+        const owner = await readWorktreeLockOwner(lockPath).catch(() => null);
+        if (owner?.token === token) await moveAndRemoveLock(lockPath, "released");
+      }
+    }
+  }
 }
 
 function shellQuote(value: string): string {
@@ -272,13 +406,17 @@ export async function removeManagedWorktree(
   app: AppPaths = appPaths(),
   runner: CommandRunner = runCommand,
 ): Promise<void> {
-  const { repoRoot, worktreePath } = validateManagedPaths(state, app);
-  if (!(await realDirectory(worktreePath))) return;
-  if (!force && (await worktreeDirty(state, app, runner))) {
-    throw new Error(`Worktree for ${state.key} has uncommitted changes; retry unwatch with --force to remove it`);
-  }
-  await runner("git", ["-C", repoRoot, "worktree", "remove", ...(force ? ["--force"] : []), worktreePath]);
-  await runner("git", ["-C", repoRoot, "worktree", "prune"]);
+  return withWorktreeOperationLock(state, app, async () => {
+    const { repoRoot, worktreePath } = validateManagedPaths(state, app);
+    return withDirectoryLock(`${repoRoot}.lock`, async () => {
+      if (!(await realDirectory(worktreePath))) return;
+      if (!force && (await worktreeDirty(state, app, runner))) {
+        throw new Error(`Worktree for ${state.key} has uncommitted changes; retry unwatch with --force to remove it`);
+      }
+      await runner("git", ["-C", repoRoot, "worktree", "remove", ...(force ? ["--force"] : []), worktreePath]);
+      await runner("git", ["-C", repoRoot, "worktree", "prune"]);
+    });
+  });
 }
 
 export interface BaseMergeResult {
@@ -394,35 +532,49 @@ function describeBase(base: BaseMergeResult | null): string {
   }
 }
 
+export async function syncWorktreeWhileLocked(
+  state: Pick<PrState, "key" | "repoRoot" | "worktreePath" | "baseRefName">,
+  app: AppPaths = appPaths(),
+  runner: CommandRunner = runCommand,
+  options: SyncOptions = {},
+): Promise<SyncResult> {
+  const { repoRoot, worktreePath } = validateManagedPaths(state, app);
+  // Linked worktrees share remote-tracking refs in repoRoot. Serialize the
+  // complete fetch/merge/push transaction across every watched PR in that repo,
+  // while the outer per-PR lock excludes an agent using this exact worktree.
+  return withDirectoryLock(`${repoRoot}.lock`, async () => {
+    if (await worktreeDirty(state, app, runner)) {
+      return { dirty: true, reset: false, base: null, detail: "worktree has local changes" };
+    }
+    await runner("git", ["-C", worktreePath, "fetch", "--all", "--prune"]);
+    let counts: CommandResult;
+    try {
+      counts = await runner("git", ["-C", worktreePath, "rev-list", "--left-right", "--count", "HEAD...@{upstream}"]);
+    } catch {
+      return { dirty: false, reset: false, base: null, detail: "clean worktree has no upstream" };
+    }
+    const [aheadText, behindText] = counts.stdout.trim().split(/\s+/);
+    const ahead = Number(aheadText);
+    const behind = Number(behindText);
+    let reset = false;
+    let headDetail: string;
+    if (ahead === 0 && behind > 0) {
+      await runner("git", ["-C", worktreePath, "reset", "--hard", "@{upstream}"]);
+      reset = true;
+      headDetail = `reset to upstream (${behind} commit${behind === 1 ? "" : "s"} behind)`;
+    } else {
+      headDetail = `clean worktree (${ahead || 0} ahead, ${behind || 0} behind)`;
+    }
+    const base = await mergeBaseBranch(state, worktreePath, runner, options);
+    return { dirty: false, reset, base, detail: `${headDetail}${describeBase(base)}` };
+  });
+}
+
 export async function syncWorktreeBeforeRun(
   state: Pick<PrState, "key" | "repoRoot" | "worktreePath" | "baseRefName">,
   app: AppPaths = appPaths(),
   runner: CommandRunner = runCommand,
   options: SyncOptions = {},
 ): Promise<SyncResult> {
-  const { worktreePath } = validateManagedPaths(state, app);
-  if (await worktreeDirty(state, app, runner)) {
-    return { dirty: true, reset: false, base: null, detail: "worktree has local changes" };
-  }
-  await runner("git", ["-C", worktreePath, "fetch", "--all", "--prune"]);
-  let counts: CommandResult;
-  try {
-    counts = await runner("git", ["-C", worktreePath, "rev-list", "--left-right", "--count", "HEAD...@{upstream}"]);
-  } catch {
-    return { dirty: false, reset: false, base: null, detail: "clean worktree has no upstream" };
-  }
-  const [aheadText, behindText] = counts.stdout.trim().split(/\s+/);
-  const ahead = Number(aheadText);
-  const behind = Number(behindText);
-  let reset = false;
-  let headDetail: string;
-  if (ahead === 0 && behind > 0) {
-    await runner("git", ["-C", worktreePath, "reset", "--hard", "@{upstream}"]);
-    reset = true;
-    headDetail = `reset to upstream (${behind} commit${behind === 1 ? "" : "s"} behind)`;
-  } else {
-    headDetail = `clean worktree (${ahead || 0} ahead, ${behind || 0} behind)`;
-  }
-  const base = await mergeBaseBranch(state, worktreePath, runner, options);
-  return { dirty: false, reset, base, detail: `${headDetail}${describeBase(base)}` };
+  return withWorktreeOperationLock(state, app, () => syncWorktreeWhileLocked(state, app, runner, options));
 }

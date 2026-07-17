@@ -161,7 +161,7 @@ const fakePi = `#!/usr/bin/env node
 const {readFile,writeFile} = await import('node:fs/promises');
 const {spawnSync} = await import('node:child_process');
 const {join} = await import('node:path');
-const args=process.argv.slice(2);const prompt=args.at(-1)||'';const rules=await readFile(args[args.indexOf('--append-system-prompt')+1],'utf8');
+const args=process.argv.slice(2);if(args[args.indexOf('--mode')+1]!=='text')throw new Error('pr-babysit must invoke pi in compact text mode');const prompt=args.at(-1)||'';const rules=await readFile(args[args.indexOf('--append-system-prompt')+1],'utf8');
 const runId=/Run ID: ([a-f\\d-]+)/i.exec(prompt)?.[1];const prUrl=/Babysit PR [^ ]+ \\((https:\\/\\/github\\.com\\/[^)]+)\\)/.exec(prompt)?.[1];
 const marker='<!-- pr-babysitter:run='+runId+' -->';const issueIds=[...prompt.matchAll(/^- Issue comment (\\d+):/gm)].map((match)=>match[1]);const reviewCommentIds=[...prompt.matchAll(/^- Review comment (\\d+):/gm)].map((match)=>match[1]);
 function run(exe,a,ok=true){const r=spawnSync(exe,a,{encoding:'utf8'});if(ok&&r.status!==0)throw new Error(exe+' '+a.join(' ')+' failed: '+r.stderr);return {code:r.status,stdout:r.stdout,stderr:r.stderr};}
@@ -178,7 +178,7 @@ if(prompt.includes('Fix the typo')){
 }else if(prompt.includes('Per-comment response A')||prompt.includes('Per-comment response B')){
   const parts=new URL(prUrl).pathname.split('/').filter(Boolean);for(const id of issueIds){const source=prUrl+'#issuecomment-'+id;run('gh',['api','--method','POST','repos/'+parts[0]+'/'+parts[1]+'/issues/'+parts[3]+'/comments','--raw-field','body=Reply to '+source+': handled this source comment separately. '+marker]);}for(const id of reviewCommentIds){run('gh',['api','--method','POST','repos/'+parts[0]+'/'+parts[1]+'/pulls/'+parts[3]+'/comments/'+id+'/replies','--raw-field','body=Handled this inline source comment separately. '+marker]);}
 }else{throw new Error('unexpected E2E prompt');}
-console.log(JSON.stringify({type:'agent_end',messages:[{role:'assistant',content:'E2E action complete'}],usage:{tokens:0}}));
+console.log('E2E action complete');
 `;
 await writeFile(join(bin, "pi"), fakePi, { mode: 0o700 });
 await chmod(join(bin, "pi"), 0o700);
