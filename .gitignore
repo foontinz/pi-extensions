@@ -42,6 +42,9 @@ usage-cache.json.bak
 # Workflow inline-script run artifacts
 /workflows/
 
+# Local recovery and incident records
+/incident-reports/
+
 # Playwright MCP local state
 .playwright-mcp/
 mcp-npx-cache.json
