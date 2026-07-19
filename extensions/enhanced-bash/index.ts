@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createBashTool,
+  createLocalBashOperations,
   getAgentDir,
   SettingsManager,
   truncateHead,
@@ -14,6 +15,14 @@ import {
 import { Type, type Static } from "typebox";
 import { BoundedBackgroundLog } from "./background-log";
 import { MonitorLineFramer } from "./monitor-lines";
+import {
+  createRmGuard,
+  disposeRmGuard,
+  explicitRmBypassReason,
+  rmGuardCommandPrefix,
+  withRmGuardPath,
+  type RmGuard,
+} from "./command-safety";
 
 // enhanced-bash: overrides the built-in `bash` tool with safe foreground
 // defaults and Claude-style background tasks. A separate `monitor` tool turns
@@ -325,6 +334,7 @@ export default function (pi: ExtensionAPI) {
   let configuredShellPath: string | undefined;
   let configuredCommandPrefix: string | undefined;
   let resolvedBash = resolveBackgroundBash();
+  let rmGuard: RmGuard | undefined;
   const jobs = new Map<string, BgJob>();
   let bgSeq = 0;
   let monitorSeq = 0;
@@ -332,13 +342,30 @@ export default function (pi: ExtensionAPI) {
   let shuttingDown = false;
   let sessionGeneration = 0;
 
+  const ensureRmGuard = (): RmGuard | undefined => {
+    if (process.platform === "win32") return undefined;
+    rmGuard ??= createRmGuard();
+    return rmGuard;
+  };
+
+  const assertSafeCommand = (command: string): void => {
+    const bypass = explicitRmBypassReason(command);
+    if (bypass) throw new Error(`Blocked: ${bypass}.`);
+    // Guard creation is deliberately fail-closed: if final-argv validation
+    // cannot be installed, no enhanced-bash command is allowed to start.
+    ensureRmGuard();
+  };
+
   const makeBashOptions = () => ({
     shellPath: configuredShellPath,
-    commandPrefix: [configuredCommandPrefix, "exec </dev/null"].filter(Boolean).join("\n"),
+    commandPrefix: [configuredCommandPrefix, rmGuard ? rmGuardCommandPrefix(rmGuard) : undefined, "exec </dev/null"].filter(Boolean).join("\n"),
     spawnHook: ({ command, cwd, env }: { command: string; cwd: string; env: NodeJS.ProcessEnv }) => ({
       command,
       cwd,
-      env: { ...env, ...NONINTERACTIVE_ENV },
+      env: {
+        ...(rmGuard ? withRmGuardPath(env, rmGuard) : env),
+        ...NONINTERACTIVE_ENV,
+      },
     }),
   });
   // This instance supplies the stock bash metadata/renderers. Foreground
@@ -576,6 +603,8 @@ export default function (pi: ExtensionAPI) {
     cwd: string,
     options: { kind: "bash" | "monitor"; description?: string; timeoutMs?: number; signal?: AbortSignal },
   ): Promise<BgJob> => {
+    assertSafeCommand(command);
+    const guard = ensureRmGuard();
     const number = options.kind === "bash" ? ++bgSeq : ++monitorSeq;
     const id = `${options.kind === "bash" ? "bg" : "mon"}_${number.toString().padStart(3, "0")}`;
     const dir = mkdtempSync(join(tmpdir(), options.kind === "bash" ? "pi-bg-" : "pi-monitor-"));
@@ -600,7 +629,7 @@ export default function (pi: ExtensionAPI) {
     jobs.set(id, job);
 
     try {
-      const preparedCommand = [configuredCommandPrefix, "exec </dev/null", command].filter(Boolean).join("\n");
+      const preparedCommand = [configuredCommandPrefix, guard ? rmGuardCommandPrefix(guard) : undefined, "exec </dev/null", command].filter(Boolean).join("\n");
       const child = spawn(
         resolvedBash.shell,
         resolvedBash.commandFromStdin ? resolvedBash.args : [...resolvedBash.args, preparedCommand],
@@ -608,7 +637,10 @@ export default function (pi: ExtensionAPI) {
           cwd,
           detached: true,
           stdio: [resolvedBash.commandFromStdin ? "pipe" : "ignore", "pipe", "pipe"],
-          env: { ...process.env, ...NONINTERACTIVE_ENV },
+          env: {
+            ...(guard ? withRmGuardPath(process.env, guard) : process.env),
+            ...NONINTERACTIVE_ENV,
+          },
           windowsHide: true,
         },
       );
@@ -765,6 +797,7 @@ export default function (pi: ExtensionAPI) {
       "Use monitor when individual stdout lines should wake the agent. Never poll a background task yourself.",
     async execute(id: string, params: Params, signal: AbortSignal | undefined, onUpdate: any, ctx: ExtensionContext) {
       currentCtx = ctx;
+      assertSafeCommand(params.command);
       if (params.background) {
         // Print and JSON runs exit as soon as the turn is complete. Their
         // inherited stream descriptors could otherwise keep that process alive.
@@ -825,6 +858,7 @@ export default function (pi: ExtensionAPI) {
       `The default deadline is ${DEFAULT_MONITOR_TIMEOUT_MS}ms; set persistent:true to run until stopped or session shutdown. UI modes only.`,
     async execute(_id: string, params: MonitorParams, signal: AbortSignal | undefined, _onUpdate: any, ctx: ExtensionContext) {
       currentCtx = ctx;
+      assertSafeCommand(params.command);
       if (!ctx.hasUI) {
         throw new Error("monitor is unavailable in print and JSON modes; run a finite command in the foreground instead.");
       }
@@ -905,6 +939,35 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // Apply the same final-argv rm guard to user `!` / `!!` commands, which do
+  // not execute through the registered bash tool.
+  pi.on("user_bash", () => {
+    const local = createLocalBashOperations({ shellPath: configuredShellPath });
+    return {
+      operations: {
+        async exec(command, cwd, options) {
+          try {
+            assertSafeCommand(command);
+            const guard = ensureRmGuard();
+            const wrapped = [
+              configuredCommandPrefix,
+              guard ? rmGuardCommandPrefix(guard) : undefined,
+              command,
+            ].filter(Boolean).join("\n");
+            return local.exec(wrapped, cwd, {
+              ...options,
+              env: guard ? withRmGuardPath(options.env ?? process.env, guard) : options.env,
+            });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            options.onData(Buffer.from(`enhanced-bash: ${message}\n`));
+            return { exitCode: 64 };
+          }
+        },
+      },
+    };
+  });
+
   // Append live background-job state to the system prompt each turn. Command
   // text is neutralized so it cannot break the fence or impersonate markup.
   pi.on("before_agent_start", (event: { systemPrompt: string }, ctx: ExtensionContext) => {
@@ -932,6 +995,9 @@ export default function (pi: ExtensionAPI) {
     configuredCommandPrefix = settings.getShellCommandPrefix();
     resolvedBash = resolveBackgroundBash(configuredShellPath);
     if (jobs.size > 0) stopAndDisposeJobs();
+    disposeRmGuard(rmGuard);
+    rmGuard = undefined;
+    ensureRmGuard();
     pendingFinished.length = 0;
     pendingMonitorEvents.clear();
     if (flushTimer) { clearTimeout(flushTimer); flushTimer = undefined; }
@@ -959,5 +1025,7 @@ export default function (pi: ExtensionAPI) {
     nextMonitorWakeAt = 0;
     if (flushTimer) { clearTimeout(flushTimer); flushTimer = undefined; }
     stopAndDisposeJobs();
+    disposeRmGuard(rmGuard);
+    rmGuard = undefined;
   });
 }

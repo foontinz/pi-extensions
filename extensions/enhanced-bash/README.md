@@ -29,6 +29,25 @@ Both background Bash and Monitor are rejected in Pi print (`-p`) and JSON modes.
 Those modes exit after the turn, and a background process that inherits a pipe
 could keep the Pi process alive.
 
+## Home-deletion guard
+
+Foreground Bash, background Bash, monitors, and user `!` commands prepend a
+private `rm` shim to `PATH`. The shim validates `rm`'s final shell-expanded
+arguments against the operating-system account home (not `$HOME`) and rejects:
+
+- the account home, its parent, `/`, and critical system roots;
+- recursive deletion of any top-level home entry, including expanded forms
+  such as `rm -rf "$HOME"/*`;
+- explicit `/bin/rm` and `/usr/bin/rm` commands that bypass the shim;
+- common PATH bypasses including `PATH=... rm`, `command -p rm`, `env -i rm`,
+  and `sudo ... rm`.
+
+Guard creation is fail-closed and each session's private shim is removed during
+shutdown. This protects commands executed through enhanced-bash; it is not an
+OS sandbox and cannot intercept deletion performed through unrelated tools,
+programming-language filesystem APIs, or scripts that invoke an absolute `rm`
+internally.
+
 ## Lifecycle and output
 
 Background output is written to capped log files. Completion and monitor output

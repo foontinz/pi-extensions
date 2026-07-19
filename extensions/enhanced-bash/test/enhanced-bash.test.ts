@@ -223,6 +223,43 @@ test("shell exit with inherited pipes kills the residual process group before co
   }
 });
 
+test("foreground and user bash commands receive the rm guard and explicit bypasses fail closed", { skip: process.platform === "win32" }, async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-enhanced-bash-rm-guard-"));
+  const harness = createHarness(cwd);
+  let guardDir: string | undefined;
+
+  try {
+    await startHarness(harness);
+    const bash = harness.tools.get("bash");
+    const foreground = await bash.execute("guard-path", { command: "command -v rm" }, undefined, undefined, harness.ctx);
+    const match = foreground.content[0].text.match(/(\/[^\s]*pi-rm-guard-[^\s/]+)\/rm/);
+    const detectedGuardDir = match?.[1];
+    assert.ok(detectedGuardDir, `guarded rm was not first in PATH: ${foreground.content[0].text}`);
+    guardDir = detectedGuardDir;
+    assert.equal(existsSync(detectedGuardDir), true);
+
+    await assert.rejects(
+      () => bash.execute("bypass", { command: "/bin/rm -rf ./build" }, undefined, undefined, harness.ctx),
+      /explicit \/bin\/rm.*bypasses/,
+    );
+
+    const userBash = await harness.handlers.get("user_bash")?.(
+      { type: "user_bash", command: "command -v rm", cwd, excludeFromContext: false },
+      harness.ctx,
+    ) as any;
+    let output = "";
+    const userResult = await userBash.operations.exec("command -v rm", cwd, {
+      onData(data: Buffer) { output += data.toString("utf8"); },
+    });
+    assert.equal(userResult.exitCode, 0);
+    assert.match(output, /pi-rm-guard-[^\s/]+\/rm/);
+  } finally {
+    await shutdownHarness(harness);
+    if (guardDir) assert.equal(existsSync(guardDir), false, "shutdown removes the private rm guard");
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("foreground and background commands use invocation cwd and completion wakes an idle agent", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-enhanced-bash-cwd-"));
   const harness = createHarness(cwd);
@@ -233,11 +270,12 @@ test("foreground and background commands use invocation cwd and completion wakes
     const foreground = await bash.execute("fg", { command: "pwd", timeout: 5 }, undefined, undefined, harness.ctx);
     assert.match(foreground.content[0].text, new RegExp(cwd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 
-    const started = await bash.execute("bg", { command: "pwd", background: true }, undefined, undefined, harness.ctx);
+    const started = await bash.execute("bg", { command: "pwd; command -v rm", background: true }, undefined, undefined, harness.ctx);
     const logPath = started.details.logFile;
     await waitFor(() => harness.messages.length === 1);
 
     assert.match(readFileSync(logPath, "utf8"), new RegExp(cwd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(readFileSync(logPath, "utf8"), /pi-rm-guard-[^\s/]+\/rm/);
     assert.equal(harness.messages[0].message.customType, "enhanced-bash-background");
     assert.equal(harness.messages[0].options.triggerTurn, true);
     assert.equal(harness.messages[0].options.deliverAs, "followUp");
