@@ -8,7 +8,6 @@ Included extensions/packages:
 - `extensions/exa-search` — registers the `exa` handle (web search, URL fetching, cited answers)
 - `extensions/playwright-browser` — registers the `playwright` handle (browser automation, page scripting, screenshots)
 - `extensions/envvars` — macOS Keychain-backed env var management (`/envvars`)
-- `extensions/openrouter-provider` — OpenRouter model provider
 - `extensions/fast-mode` — per-model request acceleration toggle
 - `extensions/usage` — `/usage` command for cross-session token/cost heatmap and per-model totals
 - `extensions/subagents` — non-blocking background Pi subagents (`run_agent`, `poll_agent`, `stop_agent` tools), with repo-root `.pi/worktree.json` copy/setup support, normalized postCopy confirmation/env hardening, and guarded symlink copies

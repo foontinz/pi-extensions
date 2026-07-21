@@ -15,9 +15,9 @@
     ]
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "^0.80.9",
-    "@earendil-works/pi-coding-agent": "^0.80.9",
-    "@earendil-works/pi-tui": "^0.80.9",
+    "@earendil-works/pi-ai": "^0.81.1",
+    "@earendil-works/pi-coding-agent": "^0.81.1",
+    "@earendil-works/pi-tui": "^0.81.1",
     "@modelcontextprotocol/sdk": "^1.25.1",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",

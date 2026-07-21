@@ -1,5 +1,5 @@
 import * as os from "node:os";
-import type { AssistantMessage, ToolResultMessage } from "@earendil-works/pi-ai/compat";
+import type { AssistantMessage, ToolResultMessage } from "@earendil-works/pi-ai";
 import { truncateOneLine } from "../platform/text.js";
 
 export function formatToolCall(toolName: string, args: Record<string, unknown> | undefined): string {

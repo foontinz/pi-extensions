@@ -4,7 +4,7 @@
  * Replaces the built-in three-line footer with a two-line layout:
  *
  *   ~/.pi/agent (main)                                  gpt-5.6-sol · low
- *   ↑77k ↓8.7k R1.3M $1.31 (sub) · 17%/372k                 MCP: 0/2
+ *   ↑77k ↓8.7k R1.3M $1.31 · 17%/372k                       MCP: 0/2
  *   forge 0 ready · caught up · on
  *
  * Differences from the built-in footer:
@@ -146,10 +146,7 @@ class CompactFooterComponent {
 		if (totalOutput) statsParts.push(dim(`↓${formatTokens(totalOutput)}`));
 		if (totalCacheRead) statsParts.push(dim(`R${formatTokens(totalCacheRead)}`));
 		if (totalCacheWrite) statsParts.push(dim(`W${formatTokens(totalCacheWrite)}`));
-		const usingSubscription = ctx.model ? ctx.modelRegistry.isUsingOAuth(ctx.model) : false;
-		if (totalCost || usingSubscription) {
-			statsParts.push(dim(`$${totalCost.toFixed(2)}${usingSubscription ? " (sub)" : ""}`));
-		}
+		if (totalCost) statsParts.push(dim(`$${totalCost.toFixed(2)}`));
 
 		const contextUsage = ctx.getContextUsage();
 		const contextWindow = contextUsage?.contextWindow ?? ctx.model?.contextWindow ?? 0;

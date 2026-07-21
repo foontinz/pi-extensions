@@ -29,7 +29,7 @@
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { getAgentDir, ModelRuntime, SettingsManager } from "@earendil-works/pi-coding-agent";
-import type { Api, Model } from "@earendil-works/pi-ai/compat";
+import type { Api, Model } from "@earendil-works/pi-ai";
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 

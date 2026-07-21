@@ -20,7 +20,7 @@
     ]
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.80.9"
+    "@earendil-works/pi-coding-agent": "^0.81.1"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",

@@ -75,6 +75,7 @@ test("prompt encodes untrusted dynamic data, omits absolute paths, sanitizes ski
   assert.throws(() => validateAnalyzerResponse([{ type: "text", text: "hi" }, call], tool), /unsupported prose/);
   assert.throws(() => validateAnalyzerResponse([{ ...call, name: "other" }], tool), /matching/);
   assert.deepEqual(forcedToolChoice("anthropic-messages", tool.name), { type: "tool", name: tool.name });
+  assert.deepEqual(forcedToolChoice("azure-openai-responses", tool.name), { type: "function", name: tool.name });
   assert.equal(forcedToolChoice("google-generative-ai", tool.name), "any");
   assert.throws(() => forcedToolChoice("custom-stream-simple", tool.name), /does not support/);
 });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { validateToolArguments } from "@earendil-works/pi-ai/compat";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 import { __testing as analyzerTesting } from "../analyzer.ts";
 import { canonicalSkillMd, editProposal, invalidateSessionEvidence, mergeCandidate, safeSlug, setScopeOverride, validateInstallableSkill } from "../proposals.ts";
 import { __testing as storageTesting, sha256 } from "../storage.ts";
