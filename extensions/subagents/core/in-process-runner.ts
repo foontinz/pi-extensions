@@ -16,6 +16,7 @@ import {
 import { getSharedMcpGateway } from "../mcp/gateway.js";
 import { createMcpProxyTool } from "../mcp/proxy-tool.js";
 import { formatToolCall, previewToolResult } from "../output/message-format.js";
+import { createProviderPayloadBridgeExtension } from "./provider-payload-bridge.js";
 import {
   createStructuredOutputCapability,
   STRUCTURED_OUTPUT_TOOL_NAME,
@@ -144,8 +145,10 @@ export interface InProcessSubagentOptions {
 }
 
 export function createBareResourceLoader(systemPrompt?: string, appendSystemPrompt: readonly string[] = []): ResourceLoader {
+  const runtime = createExtensionRuntime();
+  const providerPayloadBridge = createProviderPayloadBridgeExtension();
   return {
-    getExtensions: () => ({ extensions: [], errors: [], runtime: createExtensionRuntime() }),
+    getExtensions: () => ({ extensions: [providerPayloadBridge], errors: [], runtime }),
     getSkills: () => ({ skills: [], diagnostics: [] }),
     getPrompts: () => ({ prompts: [], diagnostics: [] }),
     getThemes: () => ({ themes: [], diagnostics: [] }),

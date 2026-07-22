@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { CreateAgentSessionResult } from "@earendil-works/pi-coding-agent";
 import { __inProcessRunnerTest, createBareResourceLoader, resolveModelPattern, runSubagentInProcess } from "../../core/in-process-runner.js";
+import { providerPayloadTransformRegistry } from "../../core/provider-payload-bridge.js";
 
 type ResolverRegistry = NonNullable<Parameters<typeof resolveModelPattern>[1]>;
 
@@ -26,6 +27,7 @@ function nextTurn(): Promise<void> {
 
 test.beforeEach(() => {
   __inProcessRunnerTest.setModelRuntime(async () => ({}) as never);
+  providerPayloadTransformRegistry().clear();
 });
 
 test.afterEach(() => {
@@ -523,9 +525,29 @@ test("bare resource loader keeps pi's default system prompt (undefined) by defau
   const loader = createBareResourceLoader();
   assert.equal(loader.getSystemPrompt(), undefined);
   assert.deepEqual(loader.getAppendSystemPrompt(), []);
-  assert.deepEqual(loader.getExtensions().extensions, []);
+  const extensions = loader.getExtensions().extensions;
+  assert.equal(extensions.length, 1);
+  assert.equal(extensions[0]?.path, "<provider-payload-bridge>");
+  assert.equal(extensions[0]?.tools.size, 0);
   assert.deepEqual(loader.getSkills().skills, []);
   assert.deepEqual(loader.getPrompts().prompts, []);
+});
+
+test("bare resource loader bridges registered provider payload transforms without loading normal extensions", async () => {
+  providerPayloadTransformRegistry().set("test", (payload, model) => {
+    if (model?.provider !== "test-provider") return undefined;
+    return { ...(payload as Record<string, unknown>), bridged: true };
+  });
+  const extension = createBareResourceLoader().getExtensions().extensions[0];
+  const handler = extension?.handlers.get("before_provider_request")?.[0];
+  assert.ok(handler);
+  const original = { input: [] };
+  const result = await handler(
+    { type: "before_provider_request", payload: original },
+    { model: { provider: "test-provider", api: "openai-responses" } },
+  );
+  assert.deepEqual(result, { input: [], bridged: true });
+  assert.deepEqual(original, { input: [] });
 });
 
 test("bare resource loader composes an override prompt and append list", () => {

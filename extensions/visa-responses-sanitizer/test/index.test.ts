@@ -17,6 +17,33 @@ function registeredHandler(): RequestHandler {
 }
 
 const visaResponses = { model: { provider: "visa-openai", api: "openai-responses" } };
+const transformRegistrySymbol = Symbol.for("@pi/provider-payload-transforms/v1");
+type Transform = (payload: unknown, model: { provider?: string; api?: string } | undefined) => unknown;
+
+function transformRegistry(): Map<string, Transform> {
+  const root = globalThis as typeof globalThis & { [transformRegistrySymbol]?: Map<string, Transform> };
+  const registry = root[transformRegistrySymbol];
+  assert.ok(registry);
+  return registry;
+}
+
+test("registers the sanitizer for bare workflow children and removes only its own registration on shutdown", () => {
+  const handlers = new Map<string, (...args: any[]) => unknown>();
+  sanitizer({
+    on(event: string, handler: unknown) {
+      handlers.set(event, handler as (...args: any[]) => unknown);
+    },
+  } as unknown as ExtensionAPI);
+
+  const transform = transformRegistry().get("visa-responses-sanitizer");
+  assert.ok(transform);
+  assert.deepEqual(
+    transform({ input: [{ status: "completed", keep: true }] }, visaResponses.model),
+    { input: [{ keep: true }] },
+  );
+  handlers.get("session_shutdown")?.();
+  assert.equal(transformRegistry().has("visa-responses-sanitizer"), false);
+});
 
 test("sanitizes only visa-openai openai-responses input and does not mutate the original payload", () => {
   const handler = registeredHandler();

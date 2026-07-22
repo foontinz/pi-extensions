@@ -11,6 +11,27 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+const PROVIDER_PAYLOAD_TRANSFORMS_SYMBOL = Symbol.for("@pi/provider-payload-transforms/v1");
+const TRANSFORM_ID = "visa-responses-sanitizer";
+
+type ProviderPayloadTransform = (
+  payload: unknown,
+  model: { provider?: string; api?: string } | undefined,
+) => unknown | undefined | Promise<unknown | undefined>;
+
+type ProviderPayloadTransformRegistry = Map<string, ProviderPayloadTransform>;
+
+function providerPayloadTransformRegistry(): ProviderPayloadTransformRegistry {
+  const root = globalThis as typeof globalThis & {
+    [PROVIDER_PAYLOAD_TRANSFORMS_SYMBOL]?: ProviderPayloadTransformRegistry;
+  };
+  const existing = root[PROVIDER_PAYLOAD_TRANSFORMS_SYMBOL];
+  if (existing instanceof Map) return existing;
+  const created: ProviderPayloadTransformRegistry = new Map();
+  root[PROVIDER_PAYLOAD_TRANSFORMS_SYMBOL] = created;
+  return created;
+}
+
 // Keep this minimal: add fields only after VISA reports them as unknown.
 const STRIP_FIELDS = new Set<string>(["status", "phase"]);
 
@@ -73,10 +94,20 @@ export function sanitizeResponsesPayload(payload: unknown): (Record<string, unkn
 }
 
 export default function (pi: ExtensionAPI) {
-  pi.on("before_provider_request", (event, ctx) => {
+  const transform: ProviderPayloadTransform = (payload, model) => {
     // This is intentionally narrow. Other OpenAI-compatible Responses
     // providers may accept or require these fields, so leave them untouched.
-    if (ctx.model?.provider !== "visa-openai" || ctx.model.api !== "openai-responses") return;
-    return sanitizeResponsesPayload(event.payload);
+    if (model?.provider !== "visa-openai" || model.api !== "openai-responses") return;
+    return sanitizeResponsesPayload(payload);
+  };
+
+  // Normal parent sessions use the extension hook directly. In-process workflow
+  // agents deliberately load no regular extensions (to avoid recursive tools),
+  // so they consume this transform through the narrow process-wide bridge.
+  providerPayloadTransformRegistry().set(TRANSFORM_ID, transform);
+  pi.on("before_provider_request", (event, ctx) => transform(event.payload, ctx.model));
+  pi.on("session_shutdown", () => {
+    const registry = providerPayloadTransformRegistry();
+    if (registry.get(TRANSFORM_ID) === transform) registry.delete(TRANSFORM_ID);
   });
 }
