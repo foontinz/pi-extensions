@@ -5,7 +5,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { emptyUsageStats, type UsageStats } from "../subagents/core/types.js";
 import { pruneWorkflowRuns, type WorkflowInput, type WorkflowRunRecordV1, type WorkflowRunStatus } from "./core/index.js";
-import { WorkflowEngine } from "./engine.js";
+import { WorkflowEngine, type WorkflowRuntimeSnapshot } from "./engine.js";
 import { WorkflowDashboard } from "./ui/dashboard.js";
 import { renderWorkflowNotification, type WorkflowNotificationDetails } from "./ui/notification.js";
 import { renderWorkflowCall, renderWorkflowResult } from "./ui/tool-render.js";
@@ -86,16 +86,18 @@ export default function workflowsExtension(pi: ExtensionAPI) {
       const background = params.background ?? true;
       let view: WorkflowView | undefined;
       let latest: WorkflowRunRecordV1 | undefined;
-      const launch = await engine.launch(params as WorkflowInput, ctx, false, (record) => {
+      let latestRuntime: WorkflowRuntimeSnapshot | undefined;
+      const launch = await engine.launch(params as WorkflowInput, ctx, false, (record, runtime) => {
         latest = record;
-        view?.onState(projectSnapshot(record));
+        latestRuntime = runtime;
+        view?.onState(projectSnapshot(record, runtime));
       });
       view = createWorkflowView(ctx, launch.runId, sourceLabel(params));
-      if (latest) view.onState(projectSnapshot(latest));
+      if (latest) view.onState(projectSnapshot(latest, latestRuntime));
       view.start();
 
       const finish = async (record: WorkflowRunRecordV1): Promise<void> => {
-        view?.finish(projectSnapshot(record));
+        view?.finish(projectSnapshot(record, latestRuntime));
         await deliverNotification(pi, engine, record);
       };
       if (background) {
@@ -315,25 +317,42 @@ function notificationDetails(record: WorkflowRunRecordV1): WorkflowNotificationD
 function usageStats(record: WorkflowRunRecordV1): UsageStats {
   return { input: record.usage.input, output: record.usage.output, cacheRead: record.usage.cacheRead, cacheWrite: record.usage.cacheWrite, cost: record.usage.cost ?? 0, contextTokens: record.usage.contextTokens, turns: record.usage.turns };
 }
-function projectSnapshot(record: WorkflowRunRecordV1): WorkflowSnapshot {
+export function projectSnapshot(record: WorkflowRunRecordV1, runtime?: WorkflowRuntimeSnapshot): WorkflowSnapshot {
   const status = record.status === "completed" ? "completed" : record.status === "cancelled" || record.status === "paused" || record.status === "interrupted" ? "cancelled" : record.status === "failed" || record.status === "recovery_required" ? "failed" : "running";
   const phases = (record.metadata.phases ?? []).map((phase) => phase.id);
-  const current = [...record.leaves].reverse().find((leaf) => leaf.phase)?.phase;
-  const agents = record.leaves.map((leaf, index): WorkflowAgentView => ({
-    index, label: leaf.label ?? leaf.agentId, ...(leaf.phase ? { phase: leaf.phase } : {}),
-    status: leaf.status === "backoff" ? "retrying" : leaf.status === "interrupted" || leaf.status === "skipped" ? "cancelled" : leaf.status === "cached" ? "completed" : leaf.status,
-    attempt: 1, maxRetries: 0,
-    ...(leaf.startedAt ? { startedAt: leaf.startedAt } : {}), ...(leaf.finishedAt ? { finishedAt: leaf.finishedAt } : {}),
-    ...(leaf.failure ? { reason: leaf.failure.reason } : {}),
-  }));
+  const records = runtime?.records ?? [record];
+  const allLeaves = records.flatMap((run) => run.leaves.map((leaf) => ({ run, leaf })));
+  const current = runtime?.phases.root ?? [...record.leaves].reverse().find((leaf) => leaf.phase)?.phase;
+  const agents = allLeaves.map(({ run, leaf }, index): WorkflowAgentView => {
+    const leafLabel = leaf.label ?? leaf.agentId;
+    const label = run.runId === record.runId ? leafLabel : `${run.metadata.name}/${leafLabel}`;
+    return {
+      index, label, ...(leaf.phase ? { phase: leaf.phase } : {}),
+      status: leaf.status === "backoff" ? "retrying" : leaf.status === "interrupted" || leaf.status === "skipped" ? "cancelled" : leaf.status === "cached" ? "completed" : leaf.status,
+      attempt: 1, maxRetries: 0,
+      ...(leaf.startedAt ? { startedAt: leaf.startedAt } : {}), ...(leaf.finishedAt ? { finishedAt: leaf.finishedAt } : {}),
+      ...(leaf.failure ? { reason: leaf.failure.reason } : {}),
+    };
+  });
+  const liveUsageRecords = records.filter((run) => run.runId === record.runId || run.status === "running");
+  const usage = liveUsageRecords.reduce<WorkflowSnapshot["usage"]>((sum, run) => ({
+    input: sum.input + run.usage.input,
+    output: sum.output + run.usage.output,
+    cacheRead: sum.cacheRead + run.usage.cacheRead,
+    cacheWrite: sum.cacheWrite + run.usage.cacheWrite,
+    contextTokens: sum.contextTokens + run.usage.contextTokens,
+    turns: sum.turns + run.usage.turns,
+    ...((sum.cost !== undefined || run.usage.cost !== null) ? { cost: (sum.cost ?? 0) + (run.usage.cost ?? 0) } : {}),
+  }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0, turns: 0 });
   return {
     runId: record.runId, origin: record.metadata.name, startedAt: record.startedAt ?? record.createdAt,
     ...(record.finishedAt ? { finishedAt: record.finishedAt } : {}), status, ...(current ? { phase: current } : {}), phases, agents,
-    active: record.leaves.filter((leaf) => leaf.status === "running").length,
-    queued: record.leaves.filter((leaf) => leaf.status === "queued").length,
-    launched: record.leaves.length,
-    usage: { ...usageStats(record), ...(record.usage.cost === null ? { cost: undefined } : { cost: record.usage.cost }) },
-    failures: record.failures.length, rateLimited: record.leaves.some((leaf) => leaf.status === "backoff"),
+    active: allLeaves.filter(({ leaf }) => leaf.status === "running").length,
+    queued: allLeaves.filter(({ leaf }) => leaf.status === "queued").length,
+    launched: allLeaves.length,
+    usage,
+    failures: records.reduce((sum, run) => sum + run.failures.length, 0),
+    rateLimited: allLeaves.some(({ leaf }) => leaf.status === "backoff"),
   };
 }
 interface WorkflowView { onState(snapshot: WorkflowSnapshot): void; start(): void; finish(snapshot: WorkflowSnapshot): void }

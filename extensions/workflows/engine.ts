@@ -46,6 +46,12 @@ export interface WorkflowEngineOptions {
   leafExecutor?: typeof runSubagentInProcess;
 }
 interface PreparedSource { resolved: ResolvedWorkflowSource; parsed: ReturnType<typeof parseWorkflowMetadata> }
+export interface WorkflowRuntimeSnapshot {
+  records: WorkflowRunRecordV1[];
+  phases: Record<string, string>;
+}
+type WorkflowRecordListener = (record: WorkflowRunRecordV1, runtime: WorkflowRuntimeSnapshot) => void;
+
 interface RootState {
   runId: string;
   cwd: string;
@@ -68,7 +74,9 @@ interface RootState {
   leafControllers: Map<string, AbortController>;
   executionControllers: Set<AbortController>;
   lingeringLeafOperations: Set<Promise<unknown>>;
-  onRecord?: (record: WorkflowRunRecordV1) => void;
+  runtimeRecords: Map<string, WorkflowRunRecordV1>;
+  runtimePhases: Map<string, string>;
+  onRecord?: WorkflowRecordListener;
 }
 
 export class WorkflowEngine {
@@ -90,7 +98,7 @@ export class WorkflowEngine {
     this.leafExecutor = options.leafExecutor ?? runSubagentInProcess;
   }
 
-  async launch(rawInput: WorkflowInput, ctx: ExtensionContext, explicitlyAuthorized = false, onRecord?: (record: WorkflowRunRecordV1) => void, invalidateNodeId?: string): Promise<WorkflowLaunch> {
+  async launch(rawInput: WorkflowInput, ctx: ExtensionContext, explicitlyAuthorized = false, onRecord?: WorkflowRecordListener, invalidateNodeId?: string): Promise<WorkflowLaunch> {
     const input = validateWorkflowInput(rawInput);
     const settings = readWorkflowSettings();
     const source = this.resolveTopSource(input, ctx);
@@ -198,6 +206,8 @@ export class WorkflowEngine {
       leafControllers: new Map(),
       executionControllers: new Set(),
       lingeringLeafOperations: new Set(),
+      runtimeRecords: new Map(),
+      runtimePhases: new Map(),
       ...(onRecord ? { onRecord } : {}),
     };
     const coordinator = new RunCoordinator(this, root, record, { resolved: source, parsed }, 0, "root", [source.identity]);
@@ -302,7 +312,7 @@ export class WorkflowEngine {
     return next;
   }
 
-  async resume(runId: string, ctx: ExtensionContext, onRecord?: (record: WorkflowRunRecordV1) => void, invalidateNodeId?: string): Promise<WorkflowLaunch> {
+  async resume(runId: string, ctx: ExtensionContext, onRecord?: WorkflowRecordListener, invalidateNodeId?: string): Promise<WorkflowLaunch> {
     const previous = await this.store.readRun(runId);
     if (previous.owner.sessionId !== this.owners.bind(ctx).sessionId) throw new WorkflowContractError("RUN_OWNER", "cannot resume another session owner's workflow");
     if (!previous.metadata.resumable) throw new WorkflowContractError("RUN_NOT_RESUMABLE", "workflow metadata does not declare resumable:true");
@@ -376,14 +386,29 @@ class RunCoordinator {
     private readonly sourceStack: readonly string[],
   ) {
     this.record = structuredClone(initialRecord);
+    this.root.runtimeRecords.set(this.record.runId, this.snapshot());
     this.worker = new CanonicalWorkflowWorker({
       agent: (request) => this.handleAgent(request),
       workflow: (request) => this.handleChild(request),
-      phase: (id) => { this.phase = id; },
+      phase: (id) => {
+        this.phase = id;
+        this.root.runtimePhases.set(this.scope, id);
+        this.publishRuntime();
+      },
       log: () => { /* bounded durable logs are added by the UI projection later */ },
     });
   }
   snapshot(): WorkflowRunRecordV1 { return structuredClone(this.record); }
+
+  private publishRuntime(): void {
+    this.root.runtimeRecords.set(this.record.runId, this.snapshot());
+    const rootRecord = this.root.runtimeRecords.get(this.root.runId);
+    if (!rootRecord || !this.root.onRecord) return;
+    this.root.onRecord(structuredClone(rootRecord), {
+      records: [...this.root.runtimeRecords.values()].map((record) => structuredClone(record)),
+      phases: Object.fromEntries(this.root.runtimePhases),
+    });
+  }
 
   async start(): Promise<void> {
     await this.transition({
@@ -875,7 +900,7 @@ class RunCoordinator {
         await this.root.journal.append(this.record.runId, { sequence, attemptId, nodeId, type, payload });
         const event: WorkflowRunEvent = { type: "JournalAdvanced", sequence };
         this.record = await this.engine.store.reduceAndCommit(this.record.runId, event);
-        if (this.depth === 0) this.root.onRecord?.(this.snapshot());
+        this.publishRuntime();
         complete();
       } catch (error) { reject(error); throw error; }
     }).catch((error) => { this.fatal ??= error; });
@@ -893,7 +918,7 @@ class RunCoordinator {
         const next = await this.engine.store.reduceAndCommit(this.record.runId, event);
         if (next.recordRevision === this.record.recordRevision) { complete(); return; }
         this.record = next;
-        if (this.depth === 0) this.root.onRecord?.(this.snapshot());
+        this.publishRuntime();
         complete();
       } catch (error) { reject(error); throw error; }
     }).catch((error) => { this.fatal ??= error; });

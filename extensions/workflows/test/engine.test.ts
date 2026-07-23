@@ -83,6 +83,23 @@ test("child workflows resolve explicit relative references with independent dura
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 
+test("runtime updates expose root phases and nested child leaves", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "workflow-engine-runtime-view-"));
+  try {
+    const { engine, ctx } = harness(root);
+    const child = path.join(root, "child.js");
+    await fs.writeFile(child, `${metadata.replace('name: "test"', 'name: "child"')}\nphase("review")\nreturn await agent("nested", {id:"nested", tools:["read"]})`);
+    const parent = path.join(root, "parent.js");
+    await fs.writeFile(parent, `${metadata}\nphase("review")\nreturn await workflow({id:"child",scriptPath:"./child.js"}, null)`);
+    const updates: any[] = [];
+    const launch = await engine.launch({ scriptPath: parent }, ctx, true, (_record, runtime) => updates.push(runtime));
+    await launch.completion;
+    const nested = updates.find((runtime) => runtime.phases.root === "review"
+      && runtime.records.some((record: any) => record.parentRunId === launch.runId && record.leaves.some((leaf: any) => leaf.agentId === "nested")));
+    assert.ok(nested, "runtime projection should include the active root phase and nested agent records");
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
 test("live child executor claims prevent restart reconciliation from stealing nested runs", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "workflow-engine-child-claim-"));
   try {

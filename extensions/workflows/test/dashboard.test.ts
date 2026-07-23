@@ -3,7 +3,7 @@ import test from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type Component, visibleWidth } from "@earendil-works/pi-tui";
 import type { UsageStats } from "../../subagents/core/types.js";
-import { createWorkflowView, type WorkflowSnapshot } from "../index.js";
+import { createWorkflowView, projectSnapshot, type WorkflowSnapshot } from "../index.js";
 import { WorkflowDashboard } from "../ui/dashboard.js";
 
 const plainTheme = { fg: (_role: string, text: string) => text, bold: (text: string) => text };
@@ -33,6 +33,25 @@ function snap(overrides: Partial<WorkflowSnapshot> = {}): WorkflowSnapshot {
     ...overrides,
   };
 }
+
+test("projects the parent phase and nested child agents into the dashboard", () => {
+  const zeroUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: null, contextTokens: 0, turns: 0 };
+  const root = {
+    runId: "root", rootRunId: "root", metadata: { name: "pipeline", phases: [{ id: "create" }, { id: "review" }] },
+    status: "running", createdAt: Date.now(), startedAt: Date.now(), leaves: [], failures: [], usage: zeroUsage,
+  } as any;
+  const child = {
+    runId: "child", rootRunId: "root", parentRunId: "root", metadata: { name: "tc-create", phases: [{ id: "create" }] },
+    status: "running", createdAt: Date.now(), startedAt: Date.now(), failures: [], usage: zeroUsage,
+    leaves: [{ agentId: "draft-test-cases", status: "running", phase: "create", acceptedAt: Date.now(), startedAt: Date.now() }],
+  } as any;
+  const projected = projectSnapshot(root, { records: [root, child], phases: { root: "create", "root/workflow:create": "create" } });
+  const text = new WorkflowDashboard(projected, plainTheme, 0).render(120).join("\n");
+  assert.match(text, /WORKFLOW {2}PHASE 1\/2 {2}create/);
+  assert.match(text, /RUN 0\/1/);
+  assert.match(text, /tc-create\/draft-test-ca/);
+  assert.doesNotMatch(text, /waiting for agents/);
+});
 
 test("every rendered line fits within the requested width", () => {
   for (const width of [40, 56, 76, 96, 120]) {
