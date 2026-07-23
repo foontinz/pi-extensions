@@ -11,11 +11,14 @@ const available: AvailableTool[] = [
 ];
 const root = { provider: "provider", model: "model", thinking: "high" as const };
 
-test("none effects enforce read-only tools and inherit concrete root execution", () => {
+test("none effects permit inspection tools including bash and inherit concrete root execution", () => {
   const result = resolveAgentExecution("/tmp", { tools: ["read", "grep"] }, root, available, false);
   assert.deepEqual([result.provider, result.model, result.thinking, result.effects], ["provider", "model", "high", "none"]);
   assert.equal(result.appendSystemPrompt.at(-1)?.startsWith("Your final assistant text"), true);
-  assert.throws(() => resolveAgentExecution("/tmp", { tools: ["bash"] }, root, available, false), /cannot use tool bash/);
+  const shellInspection = resolveAgentExecution("/tmp", { tools: ["bash"], effects: "none" }, root, available, false);
+  assert.deepEqual(shellInspection.tools, ["bash"]);
+  assert.equal(shellInspection.effects, "none");
+  assert.throws(() => resolveAgentExecution("/tmp", { tools: ["write"] }, root, available, false), /cannot use tool write/);
   assert.throws(() => resolveAgentExecution("/tmp", { tools: ["missing"] }, root, available, false), /unknown or inactive/);
 });
 

@@ -52,7 +52,10 @@ export interface ResolvedAgentExecution {
 }
 
 const THINKING = new Set<SubagentThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
-const READ_ONLY = new Set(["read", "grep", "find", "ls"]);
+// Bash is permitted for inspection-oriented local commands under effects:"none".
+// This is a declaration boundary, not shell-command sandboxing; workflow authors
+// remain responsible for avoiding mutations when selecting bash with no effects.
+const NO_EFFECT_TOOLS = new Set(["read", "grep", "find", "ls", "bash"]);
 const LOCAL_BUILTINS = new Set(["read", "grep", "find", "ls", "bash", "edit", "write"]);
 const RETURN_TEXT = "Your final assistant text is returned verbatim to the workflow. Return the result itself, not a completion confirmation. Be concise.";
 
@@ -78,7 +81,7 @@ export function resolveAgentExecution(
   const mcp = input.mcp === true;
   if (mcp && effects !== "external") throw new WorkflowPolicyError("EFFECTS_MCP", "MCP requires effects:\"external\"");
 
-  const requested = input.tools ?? profile?.tools ?? [...READ_ONLY].filter((name) => availableTools.some((tool) => tool.name === name));
+  const requested = input.tools ?? profile?.tools ?? ["read", "grep", "find", "ls"].filter((name) => availableTools.some((tool) => tool.name === name));
   if (!Array.isArray(requested) || requested.some((name) => typeof name !== "string" || !name)) {
     throw new WorkflowPolicyError("TOOLS_INVALID", "agent tools must be an array of non-empty names");
   }
@@ -87,7 +90,7 @@ export function resolveAgentExecution(
   for (const name of tools) {
     const definition = byName.get(name);
     if (!definition) throw new WorkflowPolicyError("TOOL_UNKNOWN", `unknown or inactive tool: ${name}`);
-    if (effects === "none" && !READ_ONLY.has(name)) {
+    if (effects === "none" && !NO_EFFECT_TOOLS.has(name)) {
       throw new WorkflowPolicyError("EFFECTS_READ_ONLY", `effects:\"none\" cannot use tool ${name}`);
     }
     if (effects !== "external" && !LOCAL_BUILTINS.has(name)) {

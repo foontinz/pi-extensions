@@ -62,7 +62,7 @@ Operational leaf failures return `null` and appear in `failures()`. Script, cont
 
 ## Effects
 
-- `effects:"none"` — enforced read-only tools only; no bash, MCP, or unknown custom tools.
+- `effects:"none"` — inspection-oriented local tools, including `bash`; no MCP, write/edit tools, or unknown custom tools. Bash commands are not sandboxed, so authors remain responsible for keeping them non-mutating.
 - `effects:"workspace", workspace:"isolated"` — dedicated Git worktree; verified artifact capture by default or explicit recorded discard.
 - `effects:"external"` — MCP/network/custom effects; non-cacheable.
 
