@@ -1,6 +1,13 @@
 import type { ExtensionAPI, ExtensionCommandContext, Skill } from "@earendil-works/pi-coding-agent";
-import { formatSkillsForPrompt, getAgentDir, getSettingsListTheme, loadSkillsFromDir } from "@earendil-works/pi-coding-agent";
-import { Container, type SettingItem, SettingsList, truncateToWidth } from "@earendil-works/pi-tui";
+import { formatSkillsForPrompt, getAgentDir, getSettingsListTheme, loadSkillsFromDir, stripFrontmatter } from "@earendil-works/pi-coding-agent";
+import {
+  type AutocompleteItem,
+  type AutocompleteProvider,
+  Container,
+  type SettingItem,
+  SettingsList,
+  truncateToWidth,
+} from "@earendil-works/pi-tui";
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { access, lstat, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
@@ -19,6 +26,15 @@ const SKILLS_UI_COMMAND_NAME = "skills-ui";
 const LOCK_RETRY_DELAY_MS = 25;
 const LOCK_TIMEOUT_MS = 10_000;
 const LOCK_STALE_MS = 60_000;
+const SKILL_COMMAND_PREFIX = "skill:";
+const MAX_TAG_SUGGESTIONS = 20;
+
+export type InlineSkill = {
+  name: string;
+  description?: string;
+  filePath: string;
+  baseDir: string;
+};
 
 export type Registry = {
   version: 1;
@@ -460,6 +476,257 @@ export function rewriteSkillsInPrompt(systemPrompt: string, allSkills: Skill[], 
     : `${systemPrompt}${selectedSection}`;
 }
 
+function skillCommands(pi: Pick<ExtensionAPI, "getCommands">): InlineSkill[] {
+  return pi.getCommands().flatMap((command) => {
+    if (command.source !== "skill" || !command.name.startsWith(SKILL_COMMAND_PREFIX)) return [];
+    const name = command.name.slice(SKILL_COMMAND_PREFIX.length);
+    if (!name) return [];
+    return [{
+      name,
+      description: command.description,
+      filePath: command.sourceInfo.path,
+      // Pi's native skill expansion resolves references from the SKILL.md
+      // directory, including for package-provided and root .md skills.
+      baseDir: dirname(command.sourceInfo.path),
+    }];
+  });
+}
+
+type TextRange = { start: number; end: number };
+
+type ParsedInlineTags = {
+  skills: InlineSkill[];
+  text: string;
+};
+
+function rangeContains(ranges: TextRange[], index: number): boolean {
+  return ranges.some((range) => index >= range.start && index < range.end);
+}
+
+/** Markdown code and URLs are literal text, not invocation syntax. */
+function protectedTagRanges(text: string): TextRange[] {
+  const ranges: TextRange[] = [];
+  let fence: { marker: "`" | "~"; length: number; start: number } | undefined;
+  let lineStart = 0;
+
+  while (lineStart < text.length) {
+    const newline = text.indexOf("\n", lineStart);
+    const lineEnd = newline === -1 ? text.length : newline + 1;
+    const line = text.slice(lineStart, newline === -1 ? text.length : newline);
+    if (!fence) {
+      const opening = line.match(/^ {0,3}(`{3,}|~{3,})/);
+      if (opening) {
+        const run = opening[1]!;
+        fence = { marker: run[0] as "`" | "~", length: run.length, start: lineStart };
+      } else if (/^(?: {4}|\t)/.test(line)) {
+        // Treat Markdown indented-code lines as literal input too.
+        ranges.push({ start: lineStart, end: lineEnd });
+      }
+    } else {
+      const closing = line.match(/^ {0,3}(`+|~+)[ \t]*$/);
+      const run = closing?.[1];
+      if (run && run[0] === fence.marker && run.length >= fence.length) {
+        ranges.push({ start: fence.start, end: lineEnd });
+        fence = undefined;
+      }
+    }
+    lineStart = lineEnd;
+  }
+  if (fence) ranges.push({ start: fence.start, end: text.length });
+
+  // Protect inline code spans outside fenced blocks. Matching the same backtick
+  // run follows Markdown's delimiter rule closely enough for prompt syntax.
+  for (let index = 0; index < text.length;) {
+    if (text[index] !== "`" || rangeContains(ranges, index)) {
+      index++;
+      continue;
+    }
+    let endOfRun = index + 1;
+    while (text[endOfRun] === "`") endOfRun++;
+    const delimiter = text.slice(index, endOfRun);
+    const close = text.indexOf(delimiter, endOfRun);
+    if (close === -1) {
+      index = endOfRun;
+      continue;
+    }
+    ranges.push({ start: index, end: close + delimiter.length });
+    index = close + delimiter.length;
+  }
+
+  for (const match of text.matchAll(/(?:https?:\/\/|www\.)[^\s<>]+/gi)) {
+    ranges.push({ start: match.index, end: match.index + match[0].length });
+  }
+  return ranges;
+}
+
+function isTagBoundary(text: string, atIndex: number, slashCount = 0): boolean {
+  const precedingIndex = atIndex - slashCount - 1;
+  if (precedingIndex < 0) return true;
+  // Reject email addresses, paths, URLs, identifiers, and chained @ syntax.
+  return !/[a-zA-Z0-9_@./:=?&%#+-]/.test(text[precedingIndex]!);
+}
+
+function parseInlineSkillTags(text: string, available: InlineSkill[]): ParsedInlineTags {
+  const byName = new Map(available.map((skill) => [skill.name, skill]));
+  const protectedRanges = protectedTagRanges(text);
+  const found: InlineSkill[] = [];
+  const seen = new Set<string>();
+  const escapesToRemove = new Set<number>();
+
+  for (let index = 0; index < text.length; index++) {
+    if (text[index] !== "@" || rangeContains(protectedRanges, index)) continue;
+
+    let slashCount = 0;
+    for (let cursor = index - 1; cursor >= 0 && text[cursor] === "\\"; cursor--) slashCount++;
+    if (!isTagBoundary(text, index, slashCount)) continue;
+
+    let end = index + 1;
+    while (end < text.length && /[a-z0-9-]/.test(text[end]!)) end++;
+    if (end === index + 1) continue;
+    // Do not partially interpret @skill in @skill.ext, @skill/path, or an
+    // invalid mixed-case token. A terminal period remains normal punctuation.
+    const next = text[end];
+    if (
+      next !== undefined && (
+        /[a-zA-Z0-9_@/]/.test(next) ||
+        (next === "." && /[a-zA-Z0-9]/.test(text[end + 1] ?? ""))
+      )
+    ) continue;
+
+    if (slashCount % 2 === 1) {
+      escapesToRemove.add(index - 1);
+      continue;
+    }
+
+    const skill = byName.get(text.slice(index + 1, end));
+    if (skill && !seen.has(skill.name)) {
+      seen.add(skill.name);
+      found.push(skill);
+    }
+    index = end - 1;
+  }
+
+  let normalized = text;
+  if (escapesToRemove.size > 0) {
+    normalized = "";
+    // String indexes elsewhere in this parser are UTF-16 offsets. Build by
+    // those same offsets so an emoji before an escape cannot shift removal.
+    for (let index = 0; index < text.length; index++) {
+      if (!escapesToRemove.has(index)) normalized += text[index];
+    }
+  }
+  return { skills: found, text: normalized };
+}
+
+function nativeSkillBlock(skill: InlineSkill, content: string): string {
+  const body = stripFrontmatter(content).trim();
+  return `<skill name="${skill.name}" location="${skill.filePath}">\nReferences are relative to ${skill.baseDir}.\n\n${body}\n</skill>`;
+}
+
+/**
+ * Convert inline @skill tags into Pi's native skill-command pipeline.
+ *
+ * The first unique skill is emitted as /skill:name so Pi remains responsible
+ * for its file loading, argument placement, relative paths, and invocation UI.
+ * Additional unique skills use the exact same block format because Pi expands
+ * only one leading skill command per prompt.
+ */
+export async function expandInlineSkillTags(
+  text: string,
+  available: InlineSkill[],
+  readSkill: (path: string) => Promise<string> = (path) => readFile(path, "utf8"),
+): Promise<{ text: string; failed: InlineSkill[] } | undefined> {
+  const parsed = parseInlineSkillTags(text, available);
+  if (parsed.skills.length === 0) {
+    return parsed.text === text ? undefined : { text: parsed.text, failed: [] };
+  }
+
+  const [first, ...additional] = parsed.skills;
+  const blocks: string[] = [];
+  const failed: InlineSkill[] = [];
+  for (const skill of additional) {
+    try {
+      blocks.push(nativeSkillBlock(skill, await readSkill(skill.filePath)));
+    } catch {
+      failed.push(skill);
+    }
+  }
+
+  const argumentsText = [...blocks, parsed.text].filter(Boolean).join("\n\n");
+  return {
+    text: `/skill:${first!.name}${argumentsText ? ` ${argumentsText}` : ""}`,
+    failed,
+  };
+}
+
+function completionQuery(textBeforeCursor: string): string | undefined {
+  const match = textBeforeCursor.match(/(?:^|[\s([{,'"“‘;])@([a-z0-9-]*)$/);
+  return match?.[1];
+}
+
+function skillCompletionItems(skills: InlineSkill[], query: string): AutocompleteItem[] {
+  const normalized = query.toLowerCase();
+  return skills
+    .map((skill) => {
+      const name = skill.name.toLowerCase();
+      const prefix = name.startsWith(normalized) ? 0 : 1;
+      const position = name.indexOf(normalized);
+      return { skill, score: prefix * 10_000 + (position < 0 ? 100_000 : position) + name.length / 100 };
+    })
+    .filter(({ score }) => score < 100_000)
+    .sort((a, b) => a.score - b.score || a.skill.name.localeCompare(b.skill.name))
+    .slice(0, MAX_TAG_SUGGESTIONS)
+    .map(({ skill }) => ({
+      value: `@${skill.name}`,
+      label: `@${skill.name}`,
+      description: skill.description ? `Skill · ${skill.description}` : "Skill",
+    }));
+}
+
+export function createSkillAutocompleteProvider(
+  current: AutocompleteProvider,
+  getSkills: () => InlineSkill[],
+): AutocompleteProvider {
+  return {
+    triggerCharacters: [...new Set([...(current.triggerCharacters ?? []), "@"])],
+    async getSuggestions(lines, cursorLine, cursorCol, options) {
+      const beforeCursor = (lines[cursorLine] ?? "").slice(0, cursorCol);
+      const query = completionQuery(beforeCursor);
+      if (query === undefined) return current.getSuggestions(lines, cursorLine, cursorCol, options);
+
+      const skillItems = skillCompletionItems(getSkills(), query);
+      if (skillItems.length === 0) return current.getSuggestions(lines, cursorLine, cursorCol, options);
+
+      // Keep Pi's existing @file suggestions after skills, rather than stealing
+      // the native path-reference syntax.
+      const native = await current.getSuggestions(lines, cursorLine, cursorCol, options);
+      if (options.signal.aborted) return null;
+      const values = new Set(skillItems.map((item) => item.value));
+      const nativeItems = (native?.items ?? []).map((item) => {
+        if (!values.has(item.value)) return item;
+        // A bare exact match intentionally invokes the skill. Preserve access
+        // to a same-named @file by completing it with the documented escape;
+        // the input hook removes that escape without loading the skill.
+        return {
+          ...item,
+          value: `\\${item.value}`,
+          description: item.description ? `File · ${item.description}` : "File · literal @ reference",
+        };
+      });
+      return {
+        prefix: `@${query}`,
+        items: [...skillItems, ...nativeItems],
+      };
+    },
+    applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+      return current.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
+    },
+    shouldTriggerFileCompletion(lines, cursorLine, cursorCol) {
+      return current.shouldTriggerFileCompletion?.(lines, cursorLine, cursorCol) ?? true;
+    },
+  };
+}
+
 export function reconcileSourceSkills(
   registry: Registry,
   source: Pick<InstalledSkill, "sourceId" | "sourceUrl">,
@@ -686,6 +953,24 @@ export default function skillLoader(pi: ExtensionAPI) {
     return { skillPaths };
   });
 
+  pi.on("input", async (event, ctx) => {
+    // pi.sendUserMessage() deliberately disables command expansion. Turning an
+    // extension-owned @tag into /skill:name there would send the slash command
+    // literally, so only transform direct interactive/RPC user prompts.
+    if (event.source === "extension") return { action: "continue" };
+    // A leading native command is already exact and should remain untouched.
+    if (event.text.startsWith("/skill:")) return { action: "continue" };
+    const expanded = await expandInlineSkillTags(event.text, skillCommands(pi));
+    if (!expanded) return { action: "continue" };
+    if (expanded.failed.length > 0) {
+      ctx.ui.notify(
+        `Could not load inline skill(s): ${expanded.failed.map((skill) => skill.name).join(", ")}`,
+        "warning",
+      );
+    }
+    return { action: "transform", text: expanded.text, images: event.images };
+  });
+
   pi.on("before_agent_start", async (event) => {
     const allSkills = event.systemPromptOptions.skills ?? [];
     const selectedTools = event.systemPromptOptions.selectedTools;
@@ -697,6 +982,8 @@ export default function skillLoader(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    ctx.ui.addAutocompleteProvider((current) => createSkillAutocompleteProvider(current, () => skillCommands(pi)));
+
     const url = pi.getFlag("install-skill");
     if (typeof url !== "string" || !url.trim()) return;
     try {

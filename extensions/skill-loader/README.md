@@ -32,13 +32,26 @@ pi --install-skill https://github.com/daytona/skills --install-skill-enabled
 Every newly discovered skill defaults to **user-only**. The two states are:
 
 - `enabled`: advertised in the system prompt so the model may load it automatically;
-- `user-only`: omitted from the system prompt but still available explicitly with:
+- `user-only`: omitted from the system prompt but still available explicitly with either syntax:
 
 ```text
 /skill:<name> optional arguments
+Use @<name> anywhere in a prompt.
 ```
 
-The extension keeps every skill in Pi's normal discovery pipeline so Pi owns command expansion and relative-path behavior. It filters only the generated system-prompt skill catalog. User-owned `SKILL.md` files are never rewritten.
+Examples:
+
+```text
+@code-review review the current diff
+Review the current diff with @code-review.
+Use @research and @code-review for this task.
+```
+
+In the TUI, typing `@` offers skill completions alongside Pi's existing `@file` completions. A tag must exactly match a discovered skill name. Email addresses, URLs, path-like tokens, and tags inside Markdown code spans, fenced blocks, or indented code are left unchanged. A bare exact name prefers the skill; when a file has the same `@name`, its file completion automatically inserts the escape form. Escape a known tag as `\@name` to send it literally.
+
+The first inline skill is routed through Pi's native `/skill:name` expansion, preserving native argument placement, invocation rendering, provenance, and relative-path behavior. Additional unique tags use the same native skill block format because Pi expands only one leading skill command per prompt; only the first therefore receives Pi's collapsed invocation row. The original prompt remains after the loaded instructions, and duplicate tags load a skill only once. Native `/skill:name` behavior is unchanged.
+
+The extension keeps every skill in Pi's normal discovery pipeline so both explicit syntaxes work for user-only skills too. It filters only the generated system-prompt skill catalog. User-owned `SKILL.md` files are never rewritten.
 
 ## Storage
 

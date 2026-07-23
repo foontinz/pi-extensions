@@ -6,18 +6,29 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
-import {
+import skillLoader, {
   cloneOrUpdate,
+  createSkillAutocompleteProvider,
   discoverSkills,
+  expandInlineSkillTags,
   reconcileSourceSkills,
   reconcileUserSkillPreferences,
   rewriteSkillsInPrompt,
   selectSkillsForPrompt,
   splitTreePath,
   withDirectoryLock,
+  type InlineSkill,
   type Registry,
 } from "../index";
-import { formatSkillsForPrompt, type Skill } from "@earendil-works/pi-coding-agent";
+import {
+  formatSkillsForPrompt,
+  type ExtensionAPI,
+  type ExtensionContext,
+  type InputEvent,
+  type InputEventResult,
+  type Skill,
+} from "@earendil-works/pi-coding-agent";
+import type { AutocompleteProvider } from "@earendil-works/pi-tui";
 
 const execFileAsync = promisify(execFile);
 
@@ -29,6 +40,171 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
 async function tempDir(prefix: string): Promise<string> {
   return mkdtemp(join(tmpdir(), prefix));
 }
+
+const inlineSkills: InlineSkill[] = [
+  {
+    name: "alpha-skill",
+    description: "Alpha instructions",
+    filePath: "/skills/alpha/SKILL.md",
+    baseDir: "/skills/alpha",
+  },
+  {
+    name: "beta-skill",
+    description: "Beta instructions",
+    filePath: "/skills/beta/SKILL.md",
+    baseDir: "/skills/beta",
+  },
+];
+
+const inlineSkillFiles: Record<string, string> = {
+  "/skills/alpha/SKILL.md": "---\nname: alpha-skill\ndescription: Alpha instructions\n---\n# Alpha\n",
+  "/skills/beta/SKILL.md": "---\nname: beta-skill\ndescription: Beta instructions\n---\n# Beta\n",
+};
+
+const readInlineSkill = async (path: string): Promise<string> => {
+  const content = inlineSkillFiles[path];
+  if (!content) throw new Error(`missing ${path}`);
+  return content;
+};
+
+test("expands a known @skill at the beginning, middle, or end through Pi's native command", async () => {
+  for (const prompt of [
+    "@alpha-skill review this",
+    "Please use @alpha-skill to review this",
+    "Review this with @alpha-skill.",
+  ]) {
+    const expanded = await expandInlineSkillTags(prompt, inlineSkills, readInlineSkill);
+    assert.equal(expanded?.text, `/skill:alpha-skill ${prompt}`);
+    assert.deepEqual(expanded?.failed, []);
+  }
+});
+
+test("loads multiple unique @skills once while retaining the original user prompt", async () => {
+  const prompt = "Combine @alpha-skill, @beta-skill, and @beta-skill for this task.";
+  const expanded = await expandInlineSkillTags(prompt, inlineSkills, readInlineSkill);
+
+  assert.ok(expanded);
+  assert.match(expanded.text, /^\/skill:alpha-skill /);
+  assert.match(expanded.text, /<skill name="beta-skill" location="\/skills\/beta\/SKILL\.md">/);
+  assert.match(expanded.text, /References are relative to \/skills\/beta\./);
+  assert.match(expanded.text, /# Beta/);
+  assert.equal(expanded.text.match(/<skill name="beta-skill"/g)?.length, 1);
+  assert.ok(expanded.text.endsWith(prompt));
+});
+
+test("ignores unknown, email, URL, path-like, and Markdown code @tokens", async () => {
+  const prompt = [
+    "unknown @missing-skill",
+    "email dev@alpha-skill.com",
+    "url https://example.test/@alpha-skill",
+    "parenthesized URL https://example.test/path(@alpha-skill)",
+    "path ./@alpha-skill/file",
+    "inline `@alpha-skill`",
+    "    @alpha-skill",
+    "```text\n@alpha-skill\n```",
+    "```text\n```not-a-close\n@alpha-skill\n```",
+  ].join("\n");
+
+  assert.equal(await expandInlineSkillTags(prompt, inlineSkills, readInlineSkill), undefined);
+});
+
+test("supports escaping a literal skill tag and leaves native slash commands unchanged", async () => {
+  assert.deepEqual(
+    await expandInlineSkillTags("Use 😀 \\@alpha-skill literally", inlineSkills, readInlineSkill),
+    { text: "Use 😀 @alpha-skill literally", failed: [] },
+  );
+  assert.equal(await expandInlineSkillTags("/skill:alpha-skill arguments", inlineSkills, readInlineSkill), undefined);
+});
+
+test("reports an unreadable additional inline skill without replacing the native first skill", async () => {
+  const expanded = await expandInlineSkillTags(
+    "Use @alpha-skill and @beta-skill",
+    inlineSkills,
+    async (path) => {
+      if (path.includes("beta")) throw new Error("gone");
+      return readInlineSkill(path);
+    },
+  );
+  assert.equal(expanded?.text, "/skill:alpha-skill Use @alpha-skill and @beta-skill");
+  assert.deepEqual(expanded?.failed.map((skill) => skill.name), ["beta-skill"]);
+});
+
+test("does not rewrite extension-injected messages whose command expansion Pi disables", async () => {
+  type InputHandler = (
+    event: InputEvent,
+    ctx: ExtensionContext,
+  ) => InputEventResult | void | Promise<InputEventResult | void>;
+  let inputHandler: InputHandler | undefined;
+  const pi = {
+    registerFlag() {},
+    registerCommand() {},
+    getFlag() { return undefined; },
+    getCommands() {
+      return [{
+        name: "skill:alpha-skill",
+        source: "skill" as const,
+        description: "Alpha instructions",
+        sourceInfo: {
+          path: "/skills/alpha/SKILL.md",
+          source: "local",
+          scope: "user" as const,
+          origin: "top-level" as const,
+        },
+      }];
+    },
+    on(event: string, handler: InputHandler) {
+      if (event === "input") inputHandler = handler;
+    },
+  } as unknown as ExtensionAPI;
+  skillLoader(pi);
+  assert.ok(inputHandler);
+
+  const result = await inputHandler(
+    { type: "input", text: "Use @alpha-skill", source: "extension" },
+    {} as ExtensionContext,
+  );
+  assert.deepEqual(result, { action: "continue" });
+});
+
+test("offers @skill completion without discarding Pi's native @file suggestions", async () => {
+  const native: AutocompleteProvider = {
+    triggerCharacters: ["/"],
+    async getSuggestions() {
+      return {
+        prefix: "@al",
+        items: [
+          { value: "@alpha-skill", label: "@alpha-skill", description: "same-named file" },
+          { value: "@alpha.ts", label: "@alpha.ts", description: "other file" },
+        ],
+      };
+    },
+    applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+      const line = lines[cursorLine] ?? "";
+      lines[cursorLine] = `${line.slice(0, cursorCol - prefix.length)}${item.value}${line.slice(cursorCol)}`;
+      return { lines, cursorLine, cursorCol: cursorCol - prefix.length + item.value.length };
+    },
+    shouldTriggerFileCompletion() {
+      return true;
+    },
+  };
+  const provider = createSkillAutocompleteProvider(native, () => inlineSkills);
+  const input = "Use @al";
+  const suggestions = await provider.getSuggestions(
+    [input],
+    0,
+    input.length,
+    { signal: new AbortController().signal },
+  );
+
+  assert.deepEqual(provider.triggerCharacters, ["/", "@"]);
+  assert.equal(suggestions?.prefix, "@al");
+  assert.deepEqual(
+    suggestions?.items.map((item) => item.value),
+    ["@alpha-skill", "\\@alpha-skill", "@alpha.ts"],
+  );
+  assert.match(suggestions?.items[0]?.description ?? "", /^Skill/);
+  assert.match(suggestions?.items[1]?.description ?? "", /^File/);
+});
 
 test("discovers skills with Pi's YAML parser and reconciles removed source skills", async () => {
   const root = await tempDir("pi-skill-loader-yaml-");
