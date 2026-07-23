@@ -37,6 +37,7 @@ interface RawServerEntry {
   url?: string;
   auth?: string;
   bearerToken?: string;
+  bearerTokenEnv?: string;
   headers?: Record<string, string>;
   disabled?: boolean;
 }
@@ -67,6 +68,17 @@ function readConfig(filePath: string): RawConfig | undefined {
   }
 }
 
+function interpolateEnv(value: string): string {
+  return value
+    .replace(/\$\{(\w+)\}/g, (_match, envName: string) => process.env[envName] ?? "")
+    .replace(/\$env:(\w+)/g, (_match, envName: string) => process.env[envName] ?? "");
+}
+
+function resolveBearerToken(entry: RawServerEntry): string | undefined {
+  if (entry.bearerToken !== undefined) return interpolateEnv(entry.bearerToken);
+  return entry.bearerTokenEnv ? process.env[entry.bearerTokenEnv] : undefined;
+}
+
 function normalizeEntry(name: string, entry: RawServerEntry): McpServerDef | undefined {
   if (!entry || typeof entry !== "object" || entry.disabled) return undefined;
   if (typeof entry.command === "string" && entry.command.trim()) {
@@ -80,8 +92,11 @@ function normalizeEntry(name: string, entry: RawServerEntry): McpServerDef | und
     };
   }
   if (typeof entry.url === "string" && entry.url.trim()) {
-    const headers: Record<string, string> = { ...(entry.headers ?? {}) };
-    if (entry.auth === "bearer" && entry.bearerToken) headers.Authorization = `Bearer ${entry.bearerToken}`;
+    const headers = Object.fromEntries(
+      Object.entries(entry.headers ?? {}).map(([key, value]) => [key, interpolateEnv(value)]),
+    );
+    const bearerToken = resolveBearerToken(entry);
+    if (entry.auth === "bearer" && bearerToken) headers.Authorization = `Bearer ${bearerToken}`;
     return { transport: "http", name, url: entry.url, headers: Object.keys(headers).length ? headers : undefined };
   }
   return undefined;

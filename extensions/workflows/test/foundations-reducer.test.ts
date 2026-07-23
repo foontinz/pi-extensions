@@ -61,6 +61,29 @@ test("cleanup can upgrade terminal outcome without erasing original intent", () 
   assert.equal(upgraded.firstTerminalIntent?.kind, "complete");
 });
 
+test("workspace artifact lifecycle is monotonic and explicit", () => {
+  const verified = reduceWorkflowEvent(running(), {
+    type: "ArtifactRecorded",
+    artifact: {
+      artifactId: "artifact-1",
+      kind: "workspace",
+      path: "/artifacts/manifest.json",
+      sha256: hash,
+      bytes: 100,
+      state: "verified",
+      createdAt: 3,
+    },
+  }, { now: 3 }).next;
+  const explicitlyReleased = reduceWorkflowEvent(verified, { type: "ArtifactStateChanged", artifactId: "artifact-1", state: "released" }, { now: 4 }).next;
+  assert.equal(explicitlyReleased.artifacts[0]?.state, "released");
+  const applied = reduceWorkflowEvent(verified, { type: "ArtifactStateChanged", artifactId: "artifact-1", state: "applied" }, { now: 4 }).next;
+  assert.equal(applied.artifacts[0]?.state, "applied");
+  const released = reduceWorkflowEvent(applied, { type: "ArtifactStateChanged", artifactId: "artifact-1", state: "released" }, { now: 5 }).next;
+  assert.equal(released.artifacts[0]?.state, "released");
+  assert.throws(() => reduceWorkflowEvent(released, { type: "ArtifactStateChanged", artifactId: "artifact-1", state: "applied" }, { now: 6 }), /invalid artifact transition/);
+  assert.throws(() => reduceWorkflowEvent(verified, { type: "ArtifactStateChanged", artifactId: "missing", state: "released" }, { now: 6 }), /unknown artifact/);
+});
+
 test("notification delivery cannot alter execution outcome", () => {
   const base = running();
   const changed = reduceWorkflowEvent(base, { type: "NotificationChanged", notification: { state: "failed", attempts: 1, updatedAt: 3, lastError: "offline" } }, { now: 3 }).next;

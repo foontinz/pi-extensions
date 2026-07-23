@@ -1,9 +1,11 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
+import { readFile } from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { emptyUsageStats, type UsageStats } from "../subagents/core/types.js";
+import type { UsageStats } from "../subagents/core/types.js";
 import { pruneWorkflowRuns, type WorkflowInput, type WorkflowRunRecordV1, type WorkflowRunStatus } from "./core/index.js";
 import { WorkflowEngine, type WorkflowRuntimeSnapshot } from "./engine.js";
 import { WorkflowDashboard } from "./ui/dashboard.js";
@@ -133,7 +135,7 @@ export default function workflowsExtension(pi: ExtensionAPI) {
       statuses: Type.Optional(Type.Array(Type.String(), { maxItems: 16 })),
       limit: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_STATUS_LIMIT })),
       cursor: Type.Optional(Type.String()),
-      include: Type.Optional(Type.Array(StringEnum(["agents", "failures", "artifacts", "output", "notification"] as const), { maxItems: 5 })),
+      include: Type.Optional(Type.Array(StringEnum(["agents", "failures", "artifacts", "output", "notification", "logs"] as const), { maxItems: 6 })),
     }),
     async execute(_id, params, _signal, _update, ctx) {
       const owner = engine.owners.bind(ctx);
@@ -152,6 +154,7 @@ export default function workflowsExtension(pi: ExtensionAPI) {
         const detail = {
           ...statusProjection(record, include),
           ...(include.has("artifacts") ? { integrations: await engine.artifacts.integrationsForRun(record.runId) } : {}),
+          ...(include.has("logs") ? { logs: await engine.store.readLogs(record.runId) } : {}),
         };
         return textResult(JSON.stringify(detail, null, 2), detail);
       }
@@ -227,8 +230,21 @@ export default function workflowsExtension(pi: ExtensionAPI) {
     parameters: Type.Object({ artifactId: Type.String(), repositoryRoot: Type.Optional(Type.String()), targetRef: Type.Optional(Type.String()) }),
     async execute(_id, params, signal, _update, ctx) {
       const owner = engine.owners.bind(ctx);
-      await assertOwnerArtifact(engine, params.artifactId, owner.sessionId);
-      const applied = await engine.artifacts.apply(params.artifactId, path.resolve(ctx.cwd, params.repositoryRoot ?? "."), params.targetRef ?? "HEAD", owner.sessionId, signal);
+      const owningRun = await assertOwnerArtifact(engine, params.artifactId, owner.sessionId);
+      const projection = owningRun.artifacts.find((artifact) => artifact.artifactId === params.artifactId)!;
+      if (projection.state === "released") throw new Error("workflow artifact was explicitly released");
+      if (projection.state !== "verified" && projection.state !== "applied") {
+        throw new Error(`workflow artifact is not applyable in state ${projection.state}`);
+      }
+      const applied = await engine.artifacts.apply(
+        params.artifactId,
+        path.resolve(ctx.cwd, params.repositoryRoot ?? "."),
+        params.targetRef ?? "HEAD",
+        owner.sessionId,
+        signal,
+        { runId: owningRun.runId, purpose: "artifact-apply" },
+      );
+      if (applied.state === "applied") await transitionArtifactForOwner(engine, params.artifactId, owner.sessionId, "applied");
       return textResult(`${applied.state === "applied" ? "Applied" : "Conflicted"} in integration worktree ${applied.root}${applied.conflicts.length ? `\nConflicts: ${applied.conflicts.join(", ")}` : ""}`, applied);
     },
   });
@@ -236,16 +252,39 @@ export default function workflowsExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "workflow_release_workspace",
     label: "Release Workflow Workspace",
-    description: "Idempotently release a retained source workspace lease or integration worktree after durable cleanup.",
-    parameters: Type.Object({ leaseId: Type.Optional(Type.String()), integrationId: Type.Optional(Type.String()) }),
+    description: "Idempotently release a retained source workspace lease, integration worktree, or explicitly consumed artifact after durable cleanup.",
+    parameters: Type.Object({
+      leaseId: Type.Optional(Type.String()),
+      integrationId: Type.Optional(Type.String()),
+      artifactId: Type.Optional(Type.String({ description: "Explicitly acknowledge that an artifact is no longer needed for recovery." })),
+    }),
     async execute(_id, params, signal, _update, ctx) {
-      if ((params.leaseId ? 1 : 0) + (params.integrationId ? 1 : 0) !== 1) throw new Error("exactly one of leaseId or integrationId is required");
+      if ((params.leaseId ? 1 : 0) + (params.integrationId ? 1 : 0) + (params.artifactId ? 1 : 0) !== 1) {
+        throw new Error("exactly one of leaseId, integrationId, or artifactId is required");
+      }
       const owner = engine.owners.bind(ctx);
       if (params.leaseId) {
-        await assertOwnerLease(engine, params.leaseId, owner.sessionId);
-        await engine.artifacts.release(params.leaseId, signal);
-      } else await engine.artifacts.releaseApplied(params.integrationId!, owner.sessionId, signal);
-      return textResult("Workspace released.", { released: true });
+        const owned = await assertOwnerLease(engine, params.leaseId, owner.sessionId);
+        const artifact = await engine.artifacts.release(params.leaseId, signal);
+        if (artifact) await linkReleasedLeaseArtifact(engine, owned.record, owned.leaf.leafId, artifact);
+      } else if (params.integrationId) {
+        const integration = await engine.artifacts.getIntegration(params.integrationId);
+        if (integration.ownerSessionId !== owner.sessionId) throw new Error("integration workspace belongs to another owner");
+        await engine.artifacts.releaseApplied(params.integrationId, owner.sessionId, signal);
+      } else {
+        await assertOwnerArtifact(engine, params.artifactId!, owner.sessionId);
+        if (!ctx.hasUI) throw new Error("explicit artifact release requires interactive confirmation");
+        const confirmed = await ctx.ui.confirm(
+          "Release workflow artifact?",
+          `Acknowledge that ${params.artifactId} is no longer needed for recovery. This makes its owning run eligible for retention pruning.`,
+        );
+        if (!confirmed) return textResult("Artifact release declined.", { released: false, artifactId: params.artifactId });
+        const active = (await engine.artifacts.integrationsForArtifact(params.artifactId!))
+          .filter((integration) => integration.state !== "cleaned");
+        if (active.length > 0) throw new Error(`artifact still owns ${active.length} integration workspace(s); release them first`);
+        await transitionArtifactForOwner(engine, params.artifactId!, owner.sessionId, "released");
+      }
+      return textResult("Workflow workspace/artifact released.", { released: true });
     },
   });
 
@@ -270,17 +309,67 @@ export default function workflowsExtension(pi: ExtensionAPI) {
   });
 }
 
-async function assertOwnerArtifact(engine: WorkflowEngine, artifactId: string, ownerSessionId: string): Promise<void> {
-  const owned = (await engine.store.scan()).some((entry) => entry.state === "ok"
+async function assertOwnerArtifact(engine: WorkflowEngine, artifactId: string, ownerSessionId: string): Promise<WorkflowRunRecordV1> {
+  const owned = (await engine.store.scan()).find((entry) => entry.state === "ok"
     && entry.record!.owner.sessionId === ownerSessionId
     && entry.record!.artifacts.some((artifact) => artifact.artifactId === artifactId));
-  if (!owned) throw new Error("unknown owner-scoped workflow artifact");
+  if (!owned?.record) throw new Error("unknown owner-scoped workflow artifact");
+  return owned.record;
 }
-async function assertOwnerLease(engine: WorkflowEngine, leaseId: string, ownerSessionId: string): Promise<void> {
-  const owned = (await engine.store.scan()).some((entry) => entry.state === "ok"
+async function assertOwnerLease(engine: WorkflowEngine, leaseId: string, ownerSessionId: string) {
+  for (const entry of await engine.store.scan()) {
+    if (entry.state !== "ok" || entry.record!.owner.sessionId !== ownerSessionId) continue;
+    const leaf = entry.record!.leaves.find((candidate) => candidate.workspaceLeaseId === leaseId);
+    if (leaf) return { record: entry.record!, leaf };
+  }
+  throw new Error("unknown owner-scoped workspace lease");
+}
+async function transitionArtifactForOwner(
+  engine: WorkflowEngine,
+  artifactId: string,
+  ownerSessionId: string,
+  state: "applied" | "released",
+): Promise<void> {
+  const records = (await engine.store.scan()).filter((entry) => entry.state === "ok"
     && entry.record!.owner.sessionId === ownerSessionId
-    && entry.record!.leaves.some((leaf) => leaf.workspaceLeaseId === leaseId));
-  if (!owned) throw new Error("unknown owner-scoped workspace lease");
+    && entry.record!.artifacts.some((artifact) => artifact.artifactId === artifactId));
+  if (records.length === 0) throw new Error("unknown owner-scoped workflow artifact");
+  for (const entry of records) {
+    const current = entry.record!.artifacts.find((artifact) => artifact.artifactId === artifactId)!;
+    if (current.state === state || current.state === "released") continue;
+    if (current.state === "pending" || current.state === "recovery_required") {
+      if (state === "released") throw new Error(`artifact cannot be released while run ${entry.runId} is in state ${current.state}`);
+      continue;
+    }
+    await engine.applyEvent(entry.runId, { type: "ArtifactStateChanged", artifactId, state });
+  }
+}
+async function linkReleasedLeaseArtifact(
+  engine: WorkflowEngine,
+  record: WorkflowRunRecordV1,
+  leafId: string,
+  artifact: Awaited<ReturnType<WorkflowEngine["artifacts"]["release"]>> & {},
+): Promise<void> {
+  if (!record.artifacts.some((item) => item.artifactId === artifact.id)) {
+    const manifestPath = path.join(artifact.directory, "manifest.json");
+    const manifest = await readFile(manifestPath);
+    record = await engine.applyEvent(record.runId, {
+      type: "ArtifactRecorded",
+      artifact: {
+        artifactId: artifact.id,
+        kind: "workspace",
+        path: manifestPath,
+        sha256: createHash("sha256").update(manifest).digest("hex"),
+        bytes: manifest.length,
+        state: "verified",
+        createdAt: Date.now(),
+      },
+    });
+  }
+  const leaf = record.leaves.find((candidate) => candidate.leafId === leafId);
+  if (leaf && !leaf.artifactIds.includes(artifact.id)) {
+    await engine.applyEvent(record.runId, { type: "LeafReferencesChanged", leafId, artifactIds: [...leaf.artifactIds, artifact.id] });
+  }
 }
 
 async function deliverNotification(pi: ExtensionAPI, engine: WorkflowEngine, record: WorkflowRunRecordV1): Promise<void> {
@@ -296,26 +385,36 @@ async function deliverNotification(pi: ExtensionAPI, engine: WorkflowEngine, rec
     await engine.applyEvent(record.runId, { type: "NotificationChanged", notification: { state: "failed", attempts: record.notification.attempts + 1, updatedAt: Date.now(), lastError: errorMessage(error) } }).catch(() => {});
   }
 }
-async function retryPendingNotifications(pi: ExtensionAPI, engine: WorkflowEngine, ctx: ExtensionContext): Promise<void> {
+export async function retryPendingNotifications(pi: ExtensionAPI, engine: WorkflowEngine, ctx: ExtensionContext): Promise<void> {
   const owner = engine.owners.owner(ctx);
   for (const entry of await engine.store.scan()) {
     if (entry.state !== "ok" || entry.record!.owner.sessionId !== owner.sessionId) continue;
-    if (entry.record!.notification.state !== "delivered" && isTerminal(entry.record!.status)) await deliverNotification(pi, engine, entry.record!);
+    if (entry.record!.notification.state !== "delivered" && isNotifiableWorkflowStatus(entry.record!.status)) await deliverNotification(pi, engine, entry.record!);
   }
 }
-function isTerminal(status: WorkflowRunStatus): boolean { return ["completed", "failed", "cancelled", "interrupted", "recovery_required"].includes(status); }
+export function isNotifiableWorkflowStatus(status: WorkflowRunStatus): boolean {
+  return ["completed", "failed", "cancelled", "paused", "interrupted", "recovery_required"].includes(status);
+}
 function notificationDetails(record: WorkflowRunRecordV1): WorkflowNotificationDetails {
   return {
     runId: record.runId,
     status: record.status === "completed" ? "completed" : record.status === "cancelled" || record.status === "paused" || record.status === "interrupted" ? "cancelled" : "failed",
     agents: record.leaves.length,
     failures: record.failures.length,
-    usage: usageStats(record),
+    usage: workflowUsageStats(record),
     ...(record.error ? { error: record.error.message } : {}),
   };
 }
-function usageStats(record: WorkflowRunRecordV1): UsageStats {
-  return { input: record.usage.input, output: record.usage.output, cacheRead: record.usage.cacheRead, cacheWrite: record.usage.cacheWrite, cost: record.usage.cost ?? 0, contextTokens: record.usage.contextTokens, turns: record.usage.turns };
+export function workflowUsageStats(record: WorkflowRunRecordV1): Omit<UsageStats, "cost"> & { cost?: number } {
+  return {
+    input: record.usage.input,
+    output: record.usage.output,
+    cacheRead: record.usage.cacheRead,
+    cacheWrite: record.usage.cacheWrite,
+    ...(record.usage.cost === null ? {} : { cost: record.usage.cost }),
+    contextTokens: record.usage.contextTokens,
+    turns: record.usage.turns,
+  };
 }
 export function projectSnapshot(record: WorkflowRunRecordV1, runtime?: WorkflowRuntimeSnapshot): WorkflowSnapshot {
   const status = record.status === "completed" ? "completed" : record.status === "cancelled" || record.status === "paused" || record.status === "interrupted" ? "cancelled" : record.status === "failed" || record.status === "recovery_required" ? "failed" : "running";
@@ -404,7 +503,7 @@ function statusProjection(record: WorkflowRunRecordV1, include: Set<string>) {
     error: record.error,
   };
 }
-function resultDetails(record: WorkflowRunRecordV1) { return { runId: record.runId, status: record.status, agents: record.leaves.length, failures: record.failures, usage: usageStats(record), runDir: path.dirname(record.source.copiedPath), artifacts: record.artifacts }; }
+function resultDetails(record: WorkflowRunRecordV1) { return { runId: record.runId, status: record.status, agents: record.leaves.length, failures: record.failures, usage: workflowUsageStats(record), runDir: path.dirname(record.source.copiedPath), artifacts: record.artifacts }; }
 function formatRunSummary(record: WorkflowRunRecordV1): string { return `Workflow ${record.runId} ${record.status}.\nagents: ${record.leaves.length}, failures: ${record.failures.length}\nusage: ↑${record.usage.input} ↓${record.usage.output} cost=${record.usage.costState}${record.error ? `\nerror: ${record.error.message}` : ""}\nexpires: ${record.expiresAt ?? "not scheduled"}; pin/apply/release via Workflow tools.`; }
 function sourceLabel(params: { script?: string; scriptPath?: string; name?: string }): string { return params.name ? `name ${params.name}` : params.scriptPath ? `scriptPath ${params.scriptPath}` : "inline"; }
 function textResult(text: string, details: unknown) {

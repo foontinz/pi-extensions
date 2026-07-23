@@ -158,6 +158,18 @@ export function reduceWorkflowEvent(record: WorkflowRunRecordV1, event: Workflow
       if (next.artifacts.some((item) => item.artifactId === event.artifact.artifactId)) throw invariant("duplicate artifact id");
       next.artifacts.push(structuredClone(event.artifact));
       break;
+    case "ArtifactStateChanged": {
+      const artifact = next.artifacts.find((item) => item.artifactId === event.artifactId);
+      if (!artifact) throw invariant(`unknown artifact ${event.artifactId}`);
+      const allowed = artifact.state === "verified" && (event.state === "applied" || event.state === "released")
+        || artifact.state === "applied" && event.state === "released";
+      if (!allowed) {
+        if (artifact.state === event.state) break;
+        throw invariant(`invalid artifact transition ${artifact.state} -> ${event.state}`);
+      }
+      artifact.state = event.state;
+      break;
+    }
     case "OutputRecorded":
       if (next.output && !isDeepStrictEqual(next.output, event.output)) throw invariant("workflow output is immutable once recorded");
       next.output = structuredClone(event.output);
@@ -265,6 +277,15 @@ export function assertWorkflowRunInvariants(value: unknown): asserts value is Wo
     finite(leaf.acceptedAt, "leaf.acceptedAt"); finite(leaf.deadlineAt, "leaf.deadlineAt");
     if (!Array.isArray(leaf.artifactIds)) throw invariant("leaf artifacts invalid");
     if (TERMINAL_LEAF_STATUSES.has(leaf.status) && leaf.finishedAt === undefined) throw invariant("terminal leaf missing finishedAt");
+  }
+  const artifactIds = new Set<string>();
+  for (const artifact of value.artifacts as WorkflowRunRecordV1["artifacts"]) {
+    if (!plain(artifact) || !new Set(["pending", "verified", "applied", "released", "recovery_required"]).has(artifact.state)) {
+      throw invariant("invalid artifact");
+    }
+    nonempty(artifact.artifactId, "artifact.artifactId");
+    if (artifactIds.has(artifact.artifactId)) throw invariant("duplicate artifact id");
+    artifactIds.add(artifact.artifactId);
   }
   if (value.leaves.length > Math.min(value.metadata.maxAgents, MAX_WORKFLOW_AGENTS)) throw invariant("agent cap exceeded");
   if (isTerminalRunStatus(value.status)) {

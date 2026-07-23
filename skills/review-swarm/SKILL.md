@@ -17,9 +17,9 @@ Use when the user requests a broad or repeated review of code or documentation u
 
 4. **Constrain each agent.** Give the exact target and one primary focus. State the review is read-only; restrict tools to read-only when supported, and prohibit edits and command execution. Request concise findings with severity, evidence, impact, and a suggested fix — and an explicit "no issue found" rather than invented concerns.
 
-5. **Launch in parallel**, with labels encoding each focus. Record job identifiers so every reviewer can be polled.
+5. **Launch in parallel**, with labels encoding each focus. Record job identifiers and transcript paths for attribution and troubleshooting.
 
-6. **Poll in parallel.** Prefer bounded output and final results over repeatedly retrieving full logs. If some agents are still running, report partial status accurately and poll again later.
+6. **Wait for completion callbacks.** Do not poll or block the parent turn. If some agents are still running, report partial status accurately and continue synthesis when their callbacks arrive. Read a persisted transcript only when detailed inspection is needed.
 
 7. **Validate before presenting.** Deduplicate findings by root cause; convergence across independent reviewers raises confidence. Distinguish confirmed defects from plausible risks. Check high-severity claims against the source — agent completion is not proof its findings are correct.
 

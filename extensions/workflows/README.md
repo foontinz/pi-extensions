@@ -9,7 +9,7 @@ Production local workflow orchestration with durable ownership, canonical metada
 - `workflow_output` — bounded read of tagged `output.json`.
 - `workflow_control` — `stop`, `pause`, `resume`, `skip`, `retry`, `pin`, `unpin`.
 - `workflow_apply` — verify/apply a workspace artifact into a fresh integration worktree.
-- `workflow_release_workspace` — idempotently release retained source/integration workspaces.
+- `workflow_release_workspace` — idempotently release retained source/integration workspaces or explicitly consumed artifacts.
 
 Commands:
 
@@ -82,18 +82,19 @@ script.js
 output.json
 events.jsonl
 notification.json
+logs.jsonl
 agents/*.jsonl
 artifacts/*
 journal.jsonl       # resumable only
 ```
 
-Snapshots use flushed temp-file replacement plus parent-directory flush where supported. Event/journal streams are append-only and bounded. Runtime controllers/workers/promises never enter persisted records. Output uses a bounded tagged encoding for cycles, aliases, BigInt, undefined, non-finite numbers, Date, Error, Map/Set, and binary values.
+Snapshots use flushed temp-file replacement plus parent-directory flush where supported. Event, journal, and workflow-log streams are append-only and bounded; a torn final event record is repaired while interior corruption remains fatal. Runtime controllers/workers/promises never enter persisted records. Output uses a bounded tagged encoding for cycles, aliases, BigInt, undefined, non-finite numbers, Date, Error, Map/Set, and binary values.
 
 The reducer is the sole lifecycle owner. First terminal intent wins, terminal state is sticky, every accepted leaf settles/interrupts, cleanup can upgrade to failure/recovery without erasing intent, and notification delivery never changes execution outcome.
 
 ## Resume and controls
 
-`resumable:true` enables checksummed journaling, exact source/args/execution-fingerprint validation, reclaimable concurrent resume claims, torn-tail repair, pure-node replay across nested workflows, verified workspace-artifact replay in fresh worktrees, stable node controls, pause, skip, and conservative retry invalidation. Changed source, args, model, prompts, tools, schema, or engine fingerprint refuses resume. Effectful uncertain work becomes `recovery_required`; it is never rerun automatically. Missing, corrupt, or conflicting cached workspace artifacts become cache misses or recovery outcomes rather than direct effects in the caller's tree.
+`resumable:true` enables checksummed journaling, exact source/args/execution-fingerprint validation, reclaimable concurrent resume claims, torn-tail repair, pure-node replay across nested workflows, verified workspace-artifact replay in fresh worktrees, stable node controls, pause, skip, and conservative retry invalidation. Pure replay is intentionally restricted to `tools:[]`: exposing even read-only tools would allow undeclared repository reads and stale cache hits. Its required `inputManifest` is therefore an invalidation declaration, not a filesystem sandbox. Changed source, args, model, prompts, tools, schema, or engine fingerprint refuses resume. Effectful uncertain work becomes `recovery_required`; it is never rerun automatically. Missing, corrupt, or conflicting cached workspace artifacts become cache misses or recovery outcomes rather than direct effects in the caller's tree.
 
 ## Activation and trust
 

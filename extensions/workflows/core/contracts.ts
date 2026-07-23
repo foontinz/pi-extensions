@@ -240,6 +240,7 @@ export type WorkflowRunEvent =
   | { type: "LeafReferencesChanged"; leafId: string; transcriptPath?: string; workspaceLeaseId?: string; artifactIds?: string[] }
   | { type: "UsageAdded"; usage: WorkflowUsage }
   | { type: "ArtifactRecorded"; artifact: WorkflowArtifactRecordV1 }
+  | { type: "ArtifactStateChanged"; artifactId: string; state: "applied" | "released" }
   | { type: "OutputRecorded"; output: WorkflowOutputDescriptorV1 }
   | { type: "CleanupChanged"; cleanup: WorkflowCleanupOutcomeV1 }
   | { type: "NotificationChanged"; notification: WorkflowNotificationRecordV1 }

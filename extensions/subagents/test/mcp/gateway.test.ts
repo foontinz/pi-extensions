@@ -33,6 +33,27 @@ test("loadMcpServers merges global + project with project winning", () => {
   }
 });
 
+test("loadMcpServers resolves bearerTokenEnv and bearer placeholders without persisting secrets", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-env-"));
+  const previous = process.env.TEST_MCP_BEARER_TOKEN;
+  process.env.TEST_MCP_BEARER_TOKEN = "secret-value";
+  try {
+    fs.writeFileSync(path.join(dir, "mcp.json"), JSON.stringify({
+      mcpServers: {
+        byName: { url: "https://example.test", auth: "bearer", bearerTokenEnv: "TEST_MCP_BEARER_TOKEN" },
+        byPlaceholder: { url: "https://example.test", auth: "bearer", bearerToken: "$env:TEST_MCP_BEARER_TOKEN" },
+      },
+    }));
+    const servers = loadMcpServers(dir, dir);
+    assert.equal((servers.get("byName") as { headers?: Record<string, string> }).headers?.Authorization, "Bearer secret-value");
+    assert.equal((servers.get("byPlaceholder") as { headers?: Record<string, string> }).headers?.Authorization, "Bearer secret-value");
+  } finally {
+    if (previous === undefined) delete process.env.TEST_MCP_BEARER_TOKEN;
+    else process.env.TEST_MCP_BEARER_TOKEN = previous;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("gateway connects to a stdio MCP server once and calls a tool", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-gw-"));
   writeConfig(dir);

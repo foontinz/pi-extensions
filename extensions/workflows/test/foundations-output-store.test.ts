@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { appendFile, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -10,6 +10,7 @@ import { encodeWorkflowOutput } from "../core/output-encoder.js";
 import { WorkflowRunStore } from "../core/run-store.js";
 
 const runId = "22222222-2222-4222-8222-222222222222";
+const hashOf = (value: string) => createHash("sha256").update(value).digest("hex");
 
 test("tagged output preserves special values, cycles, aliases, and built-ins", () => {
   const shared = { answer: 42 };
@@ -50,7 +51,7 @@ test("run store durably creates canonical layout, provenance, snapshots, streams
       deadlineAt: 1000, cleanupDeadlineAt: 1100, createdAt: 100,
     });
     const paths = await store.createRun(record, source);
-    assert.deepEqual((await readdir(paths.runDir)).sort(), ["agents", "artifacts", "events.jsonl", "journal.jsonl", "notification.json", "run.json", "script.js"]);
+    assert.deepEqual((await readdir(paths.runDir)).sort(), ["agents", "artifacts", "events.jsonl", "journal.jsonl", "logs.jsonl", "notification.json", "run.json", "script.js"]);
     assert.deepEqual(await store.readRun(runId), record);
     assert.equal(await readFile(paths.script, "utf8"), source);
 
@@ -74,6 +75,13 @@ test("run store durably creates canonical layout, provenance, snapshots, streams
     await Promise.all(Array.from({ length: 20 }, (_, index) => store.appendJournal(runId, { index })));
     assert.deepEqual((await store.readJournal(runId)).map((entry) => (entry as any).index), Array.from({ length: 20 }, (_, index) => index));
 
+    await store.appendLog(runId, "first", 201);
+    await store.appendLog(runId, "second", 202);
+    assert.deepEqual(await store.readLogs(runId), [
+      { timestamp: 201, message: "first", truncated: false },
+      { timestamp: 202, message: "second", truncated: false },
+    ]);
+
     const output = encodeWorkflowOutput({ ok: true });
     await store.writeOutput(runId, output);
     assert.deepEqual(await store.readOutput(runId), output);
@@ -84,6 +92,39 @@ test("run store durably creates canonical layout, provenance, snapshots, streams
     await assert.rejects(() => store.appendJournal(runId, { bad: Infinity } as never), /non-finite/);
     assert.throws(() => store.paths("../escape"), /full UUID/);
     await assert.rejects(() => store.createRun(record, source), /EEXIST/);
+  } finally { await rm(temporary, { recursive: true, force: true }); }
+});
+
+test("event WAL repairs only a torn final append and rejects interior corruption", async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), "workflow-store-torn-event-"));
+  try {
+    const store = new WorkflowRunStore(path.join(temporary, "runs"));
+    const source = `export const meta={name:"x",description:"x",resumable:false,maxAgents:1,capabilities:["read"]}\nreturn 1`;
+    const sourceHash = createHash("sha256").update(source).digest("hex");
+    const record = createWorkflowRunRecord({
+      runId,
+      owner: { sessionId: "session", instanceId: "instance", parentPid: 1 },
+      source: { kind: "inline", copiedPath: store.paths(runId).script, sourceDirectory: temporary, sha256: sourceHash, resolverIdentity: `inline:${sourceHash}` },
+      metadata: { name: "x", description: "x", resumable: false, maxAgents: 1, capabilities: ["read"] },
+      args: null, argsSha256: hashOf("args"), executionFingerprint: hashOf("execution"), activationIdentity: hashOf("activation"),
+      deadlineAt: 1000, cleanupDeadlineAt: 1100, createdAt: 100,
+    });
+    const paths = await store.createRun(record, source);
+    await store.appendEvent({
+      schemaVersion: 1,
+      runId,
+      sequence: 1,
+      timestamp: 101,
+      event: { type: "RunStarted", attempt: { attemptId: "attempt", runId, startedAt: 101, status: "running" } },
+    });
+    await appendFile(paths.events, "{torn");
+    assert.equal((await store.readRun(runId)).recordRevision, 1);
+    assert.equal(await readFile(paths.events, "utf8").then((text) => text.endsWith("\n")), true);
+
+    const valid = await readFile(paths.events, "utf8");
+    const [first] = valid.split("\n");
+    await writeFile(paths.events, `${first}\n{broken}\n`);
+    await assert.rejects(store.readRun(runId), /invalid workflow event record 2/);
   } finally { await rm(temporary, { recursive: true, force: true }); }
 });
 

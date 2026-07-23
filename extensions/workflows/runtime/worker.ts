@@ -28,7 +28,7 @@ export interface WorkerRuntimeHooks {
   agent(request: WorkerAgentRequest): Promise<{ value: unknown; failures: readonly unknown[]; budget: WorkerBudgetSnapshot }>;
   workflow(request: WorkerChildRequest): Promise<{ value: unknown; failures: readonly unknown[]; budget: WorkerBudgetSnapshot }>;
   phase?(id: string): void;
-  log?(message: string): void;
+  log?(message: string, truncated: boolean): void;
 }
 
 export interface WorkerBudgetSnapshot {
@@ -76,7 +76,7 @@ interface RpcFailure {
 type WorkerToParent =
   | WorkerRpcRequest
   | { version: 1; type: "phase"; id: string }
-  | { version: 1; type: "log"; message: string }
+  | { version: 1; type: "log"; message: string; truncated: boolean }
   | { version: 1; type: "complete"; value: unknown }
   | { version: 1; type: "failed"; error: SerializedError };
 
@@ -282,7 +282,13 @@ function safeLog(value) {
   try { const encoded = JSON.stringify(value); return encoded === undefined ? String(value) : encoded; }
   catch { return String(value); }
 }
-function log(...values) { parentPort.postMessage({ version: 1, type: "log", message: values.map(safeLog).join(" ") }); }
+function log(...values) {
+  const message = values.map(safeLog).join(" ");
+  const bytes = Buffer.from(message, "utf8");
+  const truncated = bytes.length > 16384;
+  const bounded = truncated ? bytes.subarray(0, 16384).toString("utf8").replace(/\uFFFD$/u, "") : message;
+  parentPort.postMessage({ version: 1, type: "log", message: bounded, truncated });
+}
 function failures() { return cloneFailureSnapshot(failureSnapshot); }
 const budget = Object.freeze({
   get total() { return budgetState.total; },
@@ -355,7 +361,7 @@ export class CanonicalWorkflowWorker {
           return;
         }
         if (message.type === "log") {
-          try { this.hooks.log?.(message.message); } catch (error) { finish(error); }
+          try { this.hooks.log?.(message.message, message.truncated); } catch (error) { finish(error); }
           return;
         }
         if (message.type === "agent" || message.type === "workflow") {

@@ -117,6 +117,12 @@ export function resolveAgentExecution(
   }
   if (effects === "external" && requestedCache !== "off") throw new WorkflowPolicyError("CACHE_EXTERNAL", "external-effect leaves are non-cacheable");
   if (requestedCache === "pure" && effects !== "none") throw new WorkflowPolicyError("CACHE_PURE_EFFECTS", "cachePolicy:\"pure\" requires effects:\"none\"");
+  if (requestedCache === "pure" && tools.length > 0) {
+    throw new WorkflowPolicyError(
+      "CACHE_PURE_TOOLS",
+      "cachePolicy:\"pure\" cannot expose tools because undeclared reads would make replay unsound; use tools:[] or cachePolicy:\"off\"",
+    );
+  }
   if (requestedCache === "workspace-artifact" && (effects !== "workspace" || artifactPolicy !== "capture")) {
     throw new WorkflowPolicyError("CACHE_WORKSPACE_ARTIFACT", "workspace-artifact cache requires an isolated captured workspace");
   }

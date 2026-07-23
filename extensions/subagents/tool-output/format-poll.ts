@@ -180,13 +180,13 @@ export function formatCompactPollResult<TLog extends PollLogEntryView>(
   if (job.status === "running") {
     const latest = job.latestAssistantText || latestLogPreview(job) || "waiting for output";
     lines.push(`progress: ${compactPreview(latest, 220, 2)}`);
-    lines.push(`next: poll again in ~15-30s or use waitMs:${options.suggestedPollIntervalMs}; verbosity:"logs" for details.`);
+    lines.push("next: wait for the completion callback; read the persisted transcript for details if needed.");
     return lines.join("\n");
   }
 
   if (job.errorMessage) lines.push(`error: ${compactPreview(job.errorMessage, 220, 2)}`);
   lines.push(`result: ${job.finalOutput ? compactPreview(job.finalOutput, 260, 3) : "(no final assistant output)"}`);
-  if (job.finalOutput && job.finalOutput.length > 260) lines.push(`full: poll_agent({ id: "${job.id}", verbosity: "full" })`);
+  if (job.finalOutput && job.finalOutput.length > 260) lines.push("full: read the persisted transcript path reported by run_agent.");
   return lines.join("\n");
 }
 
@@ -226,7 +226,7 @@ export function formatPollResult<TLog extends PollLogEntryView>(
         : "(no final assistant output)",
     );
     if (!includeFullOutput && job.finalOutput && job.finalOutput.length > 1_000) {
-      lines.push(`Use poll_agent({ id: "${job.id}", verbosity: "full" }) for the full final output.`);
+      lines.push("Read the persisted transcript path reported by run_agent for full detail.");
     }
   }
 

@@ -234,7 +234,7 @@ export class WorkspaceArtifactStore {
     base = "HEAD",
     ownerSessionId?: string,
     signal?: AbortSignal,
-    ownership?: { runId: string; purpose: "cache-replay" },
+    ownership?: { runId: string; purpose: "artifact-apply" | "cache-replay" },
   ): Promise<AppliedWorkspace> {
     if (signal && this.operationSignal.getStore() !== signal) return this.operationSignal.run(signal, () => this.apply(id, repositoryRoot, base, ownerSessionId, undefined, ownership));
     signal?.throwIfAborted();
@@ -319,15 +319,22 @@ export class WorkspaceArtifactStore {
   }
 
   async integrationsForRun(runId: string): Promise<IntegrationWorkspaceRecord[]> {
+    return (await this.integrationRecords()).filter((record) => record.ownerRunId === runId);
+  }
+
+  async integrationsForArtifact(artifactId: string): Promise<IntegrationWorkspaceRecord[]> {
+    this.assertId(artifactId);
+    return (await this.integrationRecords()).filter((record) => record.artifactId === artifactId);
+  }
+
+  private async integrationRecords(): Promise<IntegrationWorkspaceRecord[]> {
     await this.initialize();
     const names = await fs.readdir(path.join(this.root, "integrations"));
     const records: IntegrationWorkspaceRecord[] = [];
     for (const name of names) {
       if (!ID_PATTERN.test(name)) continue;
-      try {
-        const record = await this.getIntegration(name);
-        if (record.ownerRunId === runId) records.push(record);
-      } catch { /* corrupt records remain on disk for manual recovery */ }
+      try { records.push(await this.getIntegration(name)); }
+      catch { /* corrupt records remain on disk for manual recovery */ }
     }
     return records.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }

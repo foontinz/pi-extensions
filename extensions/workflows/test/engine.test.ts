@@ -1,16 +1,48 @@
 import assert from "node:assert/strict";
-import { execFile as execFileCallback } from "node:child_process";
+import { execFile as execFileCallback, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import { emptyUsageStats } from "../../subagents/core/types.js";
 import { pruneWorkflowRuns } from "../core/retention.js";
 import { WorkflowEngine } from "../engine.js";
 
 const execFile = promisify(execFileCallback);
+const crashFixture = fileURLToPath(new URL("./fixtures/crash-running-workflow.ts", import.meta.url));
+
+async function crashRunningWorkflow(root: string, mode: "pure" | "external"): Promise<string> {
+  const child = spawn(process.execPath, ["--import", "tsx", crashFixture, root, mode], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const runId = await new Promise<string>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`crash fixture did not start: ${stderr}`)), 10_000);
+    const inspect = () => {
+      const match = /([0-9a-f]{8}-[0-9a-f-]{27})\n/i.exec(stdout);
+      if (!match) return;
+      clearTimeout(timer);
+      resolve(match[1]!);
+    };
+    child.stdout.on("data", inspect);
+    child.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      reject(new Error(`crash fixture exited before acknowledgement (${code ?? signal}): ${stderr}`));
+    });
+  });
+  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  child.kill("SIGKILL");
+  await exited;
+  return runId;
+}
 const metadata = `export const meta = {
   name: "test",
   description: "test workflow",
@@ -60,6 +92,17 @@ test("production engine executes only the canonical worker and persists terminal
     assert.ok(finished.output);
     assert.equal((await engine.store.readEvents(launch.runId)).length > 5, true);
     assert.deepEqual((await engine.store.scan())[0].record?.status, "completed");
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test("workflow log and console.log entries are durable before completion", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "workflow-engine-logs-"));
+  try {
+    const { engine, ctx } = harness(root);
+    const run = await engine.launch({ script: `${metadata}\nlog("first", {answer:42})\nconsole.log("second")\nreturn 1` }, ctx, true);
+    assert.equal((await run.completion).status, "completed");
+    const logs = await engine.store.readLogs(run.runId);
+    assert.deepEqual(logs.map((entry) => entry.message), ["first {\"answer\":42}", "second"]);
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 
@@ -123,6 +166,21 @@ test("live child executor claims prevent restart reconciliation from stealing ne
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 
+test("restart reconciliation after SIGKILL settles pure work and quarantines uncertain effects", { skip: process.platform === "win32" }, async () => {
+  for (const mode of ["pure", "external"] as const) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), `workflow-engine-crash-${mode}-`));
+    try {
+      const runId = await crashRunningWorkflow(root, mode);
+      const { engine } = harness(root);
+      await engine.reconcileInterruptedRuns();
+      const recovered = await engine.store.readRun(runId);
+      assert.equal(recovered.leaves[0]?.status, "interrupted");
+      assert.equal(recovered.status, mode === "external" ? "recovery_required" : "interrupted");
+      assert.equal(recovered.error?.code, mode === "external" ? "UNCERTAIN_EFFECTS" : "OWNER_INTERRUPTED");
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  }
+});
+
 test("parent failure aborts and drains nested child coordinators before terminalization", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "workflow-engine-child-abort-"));
   try {
@@ -173,7 +231,7 @@ test("exact resumable pure replay invokes zero executors for cached nodes", asyn
     let calls = 0;
     const { engine, ctx } = harness(root, async () => { calls++; return { output: "cached value", usage: emptyUsageStats() }; });
     const resumableMeta = metadata.replace("resumable: false", "resumable: true");
-    const script = `${resumableMeta}\nreturn await agent("x", {id:"x", tools:["read"], cachePolicy:"pure", inputManifest:[{path:"input.txt",sha256:"${inputHash}"}]})`;
+    const script = `${resumableMeta}\nreturn await agent("x", {id:"x", tools:[], cachePolicy:"pure", inputManifest:[{path:"input.txt",sha256:"${inputHash}"}]})`;
     const first = await engine.launch({ script }, ctx, true);
     assert.equal((await first.completion).status, "completed");
     const resumed = await engine.resume(first.runId, ctx);
@@ -184,6 +242,35 @@ test("exact resumable pure replay invokes zero executors for cached nodes", asyn
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 
+test("pure replay rejects reader tools and manifest symlink escapes before executor dispatch", { skip: process.platform === "win32" }, async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "workflow-engine-pure-boundary-"));
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), "workflow-engine-pure-outside-"));
+  try {
+    const secret = "outside";
+    const outsidePath = path.join(outside, "outside.txt");
+    await fs.writeFile(outsidePath, secret);
+    await fs.symlink(outsidePath, path.join(root, "linked.txt"));
+    const inputHash = createHash("sha256").update(secret).digest("hex");
+    let calls = 0;
+    const { engine, ctx } = harness(root, async () => { calls++; return { output: "unsafe", usage: emptyUsageStats() }; });
+    const resumableMeta = metadata.replace("resumable: false", "resumable: true");
+
+    const reader = await engine.launch({ script: `${resumableMeta}\nreturn await agent("x", {id:"x", tools:["read"], cachePolicy:"pure", inputManifest:[{path:"linked.txt",sha256:"${inputHash}"}]})` }, ctx, true);
+    const readerResult = await reader.completion;
+    assert.equal(readerResult.status, "failed");
+    assert.equal(readerResult.error?.code, "CACHE_PURE_TOOLS");
+
+    const escaped = await engine.launch({ script: `${resumableMeta}\nreturn await agent("x", {id:"x", tools:[], cachePolicy:"pure", inputManifest:[{path:"linked.txt",sha256:"${inputHash}"}]})` }, ctx, true);
+    const escapedResult = await escaped.completion;
+    assert.equal(escapedResult.status, "failed");
+    assert.equal(escapedResult.error?.code, "INPUT_MANIFEST_ESCAPE");
+    assert.equal(calls, 0);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(outside, { recursive: true, force: true });
+  }
+});
+
 test("nested resumable children replay pure leaves without invoking executors", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "workflow-engine-child-resume-"));
   try {
@@ -192,7 +279,7 @@ test("nested resumable children replay pure leaves without invoking executors", 
     const resumableMeta = metadata.replace("resumable: false", "resumable: true");
     await fs.writeFile(path.join(root, "input.txt"), "stable");
     const inputHash = createHash("sha256").update("stable").digest("hex");
-    await fs.writeFile(path.join(root, "child.js"), `${resumableMeta.replace('name: "test"', 'name: "child"')}\nreturn await agent("child", {id:"child", tools:["read"], cachePolicy:"pure", inputManifest:[{path:"input.txt",sha256:"${inputHash}"}]})`);
+    await fs.writeFile(path.join(root, "child.js"), `${resumableMeta.replace('name: "test"', 'name: "child"')}\nreturn await agent("child", {id:"child", tools:[], cachePolicy:"pure", inputManifest:[{path:"input.txt",sha256:"${inputHash}"}]})`);
     const parent = path.join(root, "parent.js");
     await fs.writeFile(parent, `${resumableMeta}\nreturn await workflow({id:"child",scriptPath:"./child.js"}, null)`);
     const first = await engine.launch({ scriptPath: parent }, ctx, true);
@@ -298,9 +385,25 @@ test("workspace effects capture verified artifacts before cleanup and apply in a
     assert.equal(finished.artifacts[0].state, "verified");
     const lease = await engine.artifacts.getLease(finished.leaves[0].workspaceLeaseId!);
     assert.equal(lease.state, "cleaned");
-    integration = await engine.artifacts.apply(finished.artifacts[0].artifactId, root);
+    await engine.applyEvent(run.runId, { type: "NotificationChanged", notification: { state: "delivered", attempts: 1, updatedAt: Date.now(), deliveredAt: Date.now() } });
+    await engine.applyEvent(run.runId, { type: "RetentionChanged", pinned: false, expiresAt: 1 });
+    const blocked = await pruneWorkflowRuns(engine.store, Date.now());
+    assert.equal(blocked.retained.find((entry) => entry.runId === run.runId)?.reason, "unapplied workspace artifact");
+
+    integration = await engine.artifacts.apply(
+      finished.artifacts[0].artifactId,
+      root,
+      "HEAD",
+      "session",
+      undefined,
+      { runId: run.runId, purpose: "artifact-apply" },
+    );
     assert.equal(await fs.readFile(path.join(integration.root, "result.txt"), "utf8"), "captured\n");
-    await engine.artifacts.releaseApplied(integration.integrationId); integration = undefined;
+    await engine.applyEvent(run.runId, { type: "ArtifactStateChanged", artifactId: finished.artifacts[0].artifactId, state: "applied" });
+    const pruned = await pruneWorkflowRuns(engine.store, Date.now());
+    assert.deepEqual(pruned.pruned, [run.runId]);
+    assert.equal((await engine.artifacts.getIntegration(integration.integrationId)).ownerRunId, run.runId);
+    await engine.artifacts.releaseApplied(integration.integrationId, "session"); integration = undefined;
   } finally {
     if (integration) await fs.rm(integration.tempParent, { recursive: true, force: true });
     await fs.rm(root, { recursive: true, force: true });

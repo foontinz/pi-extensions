@@ -8,7 +8,7 @@ export interface WorkflowNotificationDetails {
   status: "completed" | "failed" | "cancelled";
   agents?: number;
   failures?: number;
-  usage?: UsageStats;
+  usage?: Omit<UsageStats, "cost"> & { cost?: number };
   error?: string;
 }
 
@@ -48,7 +48,7 @@ export function renderWorkflowNotification(
   if (details?.agents != null) bits.push(theme.fg("muted", `${details.agents} agent${details.agents === 1 ? "" : "s"}`));
   if (details?.failures) bits.push(theme.fg("error", `${details.failures} failed`));
   if (details?.usage) bits.push(theme.fg("muted", `↑${compact(details.usage.input)} ↓${compact(details.usage.output)}`));
-  if (details?.usage?.cost) bits.push(theme.fg("muted", `$${details.usage.cost.toFixed(details.usage.cost < 1 ? 3 : 2)}`));
+  if (details?.usage?.cost != null) bits.push(theme.fg("muted", `$${details.usage.cost.toFixed(details.usage.cost < 1 ? 3 : 2)}`));
   // On failure/cancellation, surface the reason inline so it stays visible even
   // when the notice is collapsed (minimized/medium tool-view mode).
   if (status !== "completed" && details?.error) {

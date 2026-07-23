@@ -40,6 +40,18 @@ test("workspace effects require isolation and default to verified capture", () =
   }, root, available, false), /requires.*captured workspace/);
 });
 
+test("pure replay is tool-free so undeclared reads cannot create stale cache entries", () => {
+  assert.throws(
+    () => resolveAgentExecution("/tmp", { cachePolicy: "pure", tools: ["read"] }, root, available, false),
+    /undeclared reads would make replay unsound/,
+  );
+  assert.throws(
+    () => resolveAgentExecution("/tmp", { cachePolicy: "pure" }, root, available, false),
+    /undeclared reads would make replay unsound/,
+  );
+  assert.equal(resolveAgentExecution("/tmp", { cachePolicy: "pure", tools: [] }, root, available, false).cachePolicy, "pure");
+});
+
 test("external effects disable caching and schema mode delegates mandatory-last prompt to shared runtime", () => {
   assert.throws(() => resolveAgentExecution("/tmp", { mcp: true }, root, available, false), /MCP requires/);
   assert.throws(() => resolveAgentExecution("/tmp", { effects: "external", tools: ["network"], cachePolicy: "pure" }, root, available, false), /non-cacheable/);

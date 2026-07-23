@@ -395,7 +395,7 @@ class RunCoordinator {
         this.root.runtimePhases.set(this.scope, id);
         this.publishRuntime();
       },
-      log: () => { /* bounded durable logs are added by the UI projection later */ },
+      log: (message, truncated) => this.persistLog(message, truncated),
     });
   }
   snapshot(): WorkflowRunRecordV1 { return structuredClone(this.record); }
@@ -408,6 +408,18 @@ class RunCoordinator {
       records: [...this.root.runtimeRecords.values()].map((record) => structuredClone(record)),
       phases: Object.fromEntries(this.root.runtimePhases),
     });
+  }
+
+  private persistLog(message: string, truncated: boolean): void {
+    let operation: Promise<void>;
+    operation = this.engine.store.appendLog(this.record.runId, message, Date.now(), truncated).catch((error) => {
+      this.fatal ??= infrastructure("LOG_PERSISTENCE", `workflow log persistence failed: ${errorMessage(error)}`);
+    }).finally(() => {
+      this.activeOperations.delete(operation);
+      this.root.lingeringLeafOperations.delete(operation);
+    });
+    this.activeOperations.add(operation);
+    this.root.lingeringLeafOperations.add(operation);
   }
 
   async start(): Promise<void> {
@@ -960,6 +972,10 @@ async function verifyInputManifest(cwd: string, manifest: WorkflowAgentOptions["
     const relative = path.relative(root, requested);
     if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new WorkflowContractError("INPUT_MANIFEST_ESCAPE", `input path escapes cwd: ${entry.path}`);
     const file = await realpath(requested);
+    const canonicalRelative = path.relative(root, file);
+    if (canonicalRelative === ".." || canonicalRelative.startsWith(`..${path.sep}`) || path.isAbsolute(canonicalRelative)) {
+      throw new WorkflowContractError("INPUT_MANIFEST_ESCAPE", `input path resolves outside cwd: ${entry.path}`);
+    }
     const info = await stat(file);
     if (!info.isFile()) throw new WorkflowContractError("INPUT_MANIFEST_FILE", `input is not a regular file: ${entry.path}`);
     const digest = createHash("sha256").update(await readFile(file)).digest("hex");

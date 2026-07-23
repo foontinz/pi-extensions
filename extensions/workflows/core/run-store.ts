@@ -10,7 +10,10 @@ import {
   MAX_EVENT_RECORDS,
   MAX_JOURNAL_BYTES,
   MAX_JOURNAL_RECORD_BYTES,
+  MAX_LOG_BYTES,
+  MAX_FAILURE_DETAIL_BYTES,
   MAX_OUTPUT_BYTES,
+  MAX_STATUS_RESPONSE_BYTES,
   WORKFLOW_EVENT_SCHEMA_VERSION,
   WORKFLOW_RUN_SCHEMA_VERSION,
 } from "./limits.js";
@@ -23,6 +26,7 @@ export interface WorkflowRunPaths {
   output: string;
   events: string;
   notification: string;
+  logs: string;
   agents: string;
   artifacts: string;
   journal?: string;
@@ -52,6 +56,7 @@ export class WorkflowRunStore {
       output: path.join(runDir, "output.json"),
       events: path.join(runDir, "events.jsonl"),
       notification: path.join(runDir, "notification.json"),
+      logs: path.join(runDir, "logs.jsonl"),
       agents: path.join(runDir, "agents"),
       artifacts: path.join(runDir, "artifacts"),
       ...(resumable ? { journal: path.join(runDir, "journal.jsonl") } : {}),
@@ -81,7 +86,7 @@ export class WorkflowRunStore {
         if (copiedHash !== record.source.sha256) throw new Error("copied workflow source hash does not match run provenance");
         await atomicWrite(paths.run, jsonLine(record));
         await atomicWrite(paths.notification, jsonLine(record.notification));
-        await Promise.all([createEmpty(paths.events), ...(paths.journal ? [createEmpty(paths.journal)] : [])]);
+        await Promise.all([createEmpty(paths.events), createEmpty(paths.logs), ...(paths.journal ? [createEmpty(paths.journal)] : [])]);
         await syncDirectory(paths.runDir);
         return paths;
       } catch (error) {
@@ -145,7 +150,9 @@ export class WorkflowRunStore {
       await appendDurable(this.paths(event.runId).events, snapshot);
     });
   }
-  async readEvents(runId: string): Promise<DurableWorkflowEvent[]> { return readJsonLines<DurableWorkflowEvent>(this.paths(runId).events, MAX_EVENT_FILE_BYTES); }
+  async readEvents(runId: string): Promise<DurableWorkflowEvent[]> {
+    return this.withRunWriter(runId, async () => readEventLogWithTailRepair(this.paths(runId).events));
+  }
 
   async writeOutput(runId: string, output: EncodedWorkflowOutput): Promise<void> {
     const snapshot = jsonLine(output);
@@ -158,6 +165,33 @@ export class WorkflowRunStore {
 
   async writeNotification(runId: string, notification: WorkflowNotificationRecordV1): Promise<void> {
     await this.withRunWriter(runId, async () => atomicWrite(this.paths(runId).notification, jsonLine(notification)));
+  }
+
+  async appendLog(runId: string, message: string, timestamp = Date.now(), sourceTruncated = false): Promise<void> {
+    validateRunId(runId);
+    const bounded = truncateUtf8(message, MAX_FAILURE_DETAIL_BYTES);
+    const snapshot = jsonLine({ timestamp, message: bounded, truncated: sourceTruncated || bounded !== message });
+    await this.withRunWriter(runId, async () => {
+      const logs = this.paths(runId).logs;
+      await ensureAppendFile(logs);
+      await assertAppendCapacity(logs, snapshot, MAX_LOG_BYTES);
+      await appendDurable(logs, snapshot);
+    });
+  }
+  async readLogs(runId: string): Promise<Array<{ timestamp: number; message: string; truncated: boolean }>> {
+    let logs: Array<{ timestamp: number; message: string; truncated: boolean }>;
+    try { logs = await readJsonLines(this.paths(runId).logs, MAX_LOG_BYTES); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
+    const tail: typeof logs = [];
+    let bytes = 2;
+    for (let index = logs.length - 1; index >= 0; index--) {
+      const entry = logs[index]!;
+      const entryBytes = Buffer.byteLength(JSON.stringify(entry)) + 1;
+      if (bytes + entryBytes > MAX_STATUS_RESPONSE_BYTES) break;
+      tail.unshift(entry);
+      bytes += entryBytes;
+    }
+    return tail;
   }
 
   async appendJournal(runId: string, entry: JsonValue): Promise<void> {
@@ -196,7 +230,7 @@ export class WorkflowRunStore {
     }
     assertWorkflowRunInvariants(value);
     let record = value as WorkflowRunRecordV1;
-    const events = await readJsonLines<DurableWorkflowEvent>(this.paths(runId).events, MAX_EVENT_FILE_BYTES);
+    const events = await readEventLogWithTailRepair(this.paths(runId).events);
     for (const durable of events) {
       if (durable.sequence <= record.recordRevision) continue;
       if (durable.sequence !== record.recordRevision + 1) throw new Error(`workflow event sequence gap at ${durable.sequence}`);
@@ -263,6 +297,10 @@ async function createEmpty(destination: string): Promise<void> {
   const handle = await open(destination, "wx", 0o600);
   try { await handle.sync(); } finally { await handle.close(); }
 }
+async function ensureAppendFile(destination: string): Promise<void> {
+  try { await createEmpty(destination); await syncDirectory(path.dirname(destination)); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+}
 async function syncDirectory(directory: string): Promise<void> {
   let handle;
   try { handle = await open(directory, "r"); await handle.sync(); }
@@ -277,11 +315,40 @@ async function assertAppendCapacity(file: string, addition: string, maxBytes: nu
     if (current.split("\n").filter(Boolean).length >= maxRecords) throw new Error("workflow event count limit exceeded");
   }
 }
+function truncateUtf8(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.length <= maxBytes) return value;
+  return bytes.subarray(0, maxBytes).toString("utf8").replace(/\uFFFD$/u, "");
+}
 async function requireRunDirectory(directory: string): Promise<void> { if (!(await stat(directory)).isDirectory()) throw new Error(`workflow run path is not a directory: ${directory}`); }
 async function readBounded(file: string, maxBytes: number): Promise<string> {
   const info = await stat(file);
   if (!info.isFile() || info.size > maxBytes) throw new Error(`workflow file is unsafe or exceeds ${maxBytes} bytes: ${file}`);
   return readFile(file, "utf8");
+}
+async function readEventLogWithTailRepair(file: string): Promise<DurableWorkflowEvent[]> {
+  const contents = await readBounded(file, MAX_EVENT_FILE_BYTES);
+  if (!contents) return [];
+  const terminated = contents.endsWith("\n");
+  const lines = contents.split("\n");
+  if (terminated) lines.pop();
+  const events: DurableWorkflowEvent[] = [];
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index]!;
+    if (!line) throw new Error(`empty interior workflow event record ${index + 1} in ${file}`);
+    try { events.push(JSON.parse(line) as DurableWorkflowEvent); }
+    catch (error) {
+      const tornTail = !terminated && index === lines.length - 1;
+      if (!tornTail) throw new Error(`invalid workflow event record ${index + 1} in ${file}: ${error instanceof Error ? error.message : String(error)}`);
+      const prefix = contents.slice(0, contents.lastIndexOf("\n") + 1);
+      const handle = await open(file, "r+");
+      try { await handle.truncate(Buffer.byteLength(prefix)); await handle.sync(); }
+      finally { await handle.close(); }
+      return events;
+    }
+  }
+  if (!terminated) await appendDurable(file, "\n");
+  return events;
 }
 async function readJsonLines<T>(file: string, maxBytes: number): Promise<T[]> {
   const contents = await readBounded(file, maxBytes);
