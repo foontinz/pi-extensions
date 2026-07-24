@@ -10,7 +10,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { access, lstat, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
@@ -21,6 +21,7 @@ const ROOT = join(getAgentDir(), "skill-loader");
 const SOURCES_DIR = join(ROOT, "sources");
 const REGISTRY_PATH = join(ROOT, "registry.json");
 const REGISTRY_LOCK_PATH = join(ROOT, "registry.lock");
+const LEASES_DIR = join(ROOT, "leases");
 const USER_SKILLS_DIR = join(getAgentDir(), "skills");
 const SKILLS_UI_COMMAND_NAME = "skills-ui";
 const LOCK_RETRY_DELAY_MS = 25;
@@ -68,8 +69,20 @@ export type GitHubSpec = {
 
 type DiscoveredSkill = Pick<InstalledSkill, "name" | "description" | "path">;
 
+function isValidSkillName(name: string): boolean {
+  return name.length >= 1 && name.length <= 64 && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name);
+}
+
 function emptyRegistry(): Registry {
-  return { version: 1, skills: {}, userSkills: {} };
+  return {
+    version: 1,
+    skills: Object.create(null) as Record<string, InstalledSkill>,
+    userSkills: Object.create(null) as Record<string, UserSkillPreference>,
+  };
+}
+
+function ownValue<T>(record: Record<string, T>, key: string): T | undefined {
+  return Object.prototype.hasOwnProperty.call(record, key) ? record[key] : undefined;
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -90,29 +103,93 @@ async function lstatIfExists(path: string) {
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function parseRegistry(content: string): Registry {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch (error) {
+    throw new Error(`Invalid skill-loader registry JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!isRecord(parsed) || parsed.version !== 1 || !isRecord(parsed.skills)) {
+    throw new Error("Invalid skill-loader registry: expected version 1 with a skills object");
+  }
+  const skills = Object.create(null) as Record<string, InstalledSkill>;
+  for (const [key, value] of Object.entries(parsed.skills)) {
+    if (
+      !isRecord(value) ||
+      typeof value.name !== "string" || value.name !== key ||
+      typeof value.description !== "string" ||
+      typeof value.path !== "string" ||
+      typeof value.sourceUrl !== "string" ||
+      typeof value.sourceId !== "string" ||
+      typeof value.enabled !== "boolean" ||
+      typeof value.installedAt !== "string" ||
+      typeof value.updatedAt !== "string"
+    ) {
+      throw new Error(`Invalid skill-loader registry skill record: ${key}`);
+    }
+    skills[key] = value as unknown as InstalledSkill;
+  }
+
+  const rawUserSkills = parsed.userSkills ?? {};
+  if (!isRecord(rawUserSkills)) throw new Error("Invalid skill-loader registry: userSkills must be an object");
+  const userSkills = Object.create(null) as Record<string, UserSkillPreference>;
+  for (const [key, value] of Object.entries(rawUserSkills)) {
+    if (
+      !isRecord(value) ||
+      typeof value.enabled !== "boolean" ||
+      typeof value.discoveredAt !== "string" ||
+      typeof value.updatedAt !== "string"
+    ) {
+      throw new Error(`Invalid skill-loader user-skill preference: ${key}`);
+    }
+    userSkills[key] = value as unknown as UserSkillPreference;
+  }
+  return { version: 1, skills, userSkills };
+}
+
 async function loadRegistry(): Promise<Registry> {
   try {
-    const parsed = JSON.parse(await readFile(REGISTRY_PATH, "utf8"));
-    if (parsed?.version === 1 && parsed.skills && typeof parsed.skills === "object") {
-      return {
-        version: 1,
-        skills: parsed.skills,
-        // Registry v1 originally tracked only downloaded skills. Missing local
-        // preferences migrate safely: user-directory skills default to user-only.
-        userSkills: parsed.userSkills && typeof parsed.userSkills === "object" ? parsed.userSkills : {},
-      };
-    }
-  } catch {
-    // First run or corrupt file. Start clean rather than crashing pi startup.
+    return parseRegistry(await readFile(REGISTRY_PATH, "utf8"));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyRegistry();
+    throw error;
   }
-  return emptyRegistry();
 }
 
 async function saveRegistry(registry: Registry): Promise<void> {
-  await mkdir(dirname(REGISTRY_PATH), { recursive: true });
-  const tmp = `${REGISTRY_PATH}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(tmp, JSON.stringify(registry, null, 2) + "\n", "utf8");
-  await rename(tmp, REGISTRY_PATH);
+  const directory = dirname(REGISTRY_PATH);
+  await mkdir(directory, { recursive: true });
+  const tmp = `${REGISTRY_PATH}.${process.pid}.${randomUUID()}.tmp`;
+  let handle;
+  try {
+    handle = await open(tmp, "wx", 0o600);
+    await handle.writeFile(JSON.stringify(registry, null, 2) + "\n", "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(tmp, REGISTRY_PATH);
+    // The registry is committed once rename succeeds. Directory fsync improves
+    // crash durability where supported, but must not turn a committed write
+    // into an apparent failure whose caller deletes referenced artifacts.
+    try {
+      const directoryHandle = await open(directory, "r");
+      try {
+        await directoryHandle.sync();
+      } finally {
+        await directoryHandle.close();
+      }
+    } catch {
+      // Some platforms/filesystems do not support opening or syncing dirs.
+    }
+  } finally {
+    await handle?.close().catch(() => undefined);
+    await rm(tmp, { force: true }).catch(() => undefined);
+  }
 }
 
 type LockOwner = { token: string; pid: number; createdAt: number };
@@ -121,8 +198,9 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
 }
 
-function isAlreadyExists(error: unknown): boolean {
-  return (error as NodeJS.ErrnoException | undefined)?.code === "EEXIST";
+function isLockCollision(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "EEXIST" || code === "ENOTEMPTY";
 }
 
 async function processIsAlive(pid: number): Promise<boolean> {
@@ -160,13 +238,16 @@ async function releaseDirectoryLock(lockPath: string, owner: LockOwner): Promise
 
 async function reclaimStaleLock(lockPath: string): Promise<boolean> {
   try {
-    const lockStat = await stat(lockPath);
-    if (Date.now() - lockStat.mtimeMs < LOCK_STALE_MS) return false;
     const owner = await readLockOwner(lockPath);
-    if (owner && (await processIsAlive(owner.pid))) return false;
+    if (owner) {
+      if (await processIsAlive(owner.pid)) return false;
+    } else {
+      const lockStat = await stat(lockPath);
+      if (Date.now() - lockStat.mtimeMs < LOCK_STALE_MS) return false;
+    }
 
-    // Rename claims this stale lock before removing it, so contenders cannot
-    // accidentally remove a newly acquired lock.
+    // Rename claims this dead/legacy partial lock before removing it, so a
+    // contender can never delete a newly acquired replacement.
     const stalePath = `${lockPath}.stale-${process.pid}-${randomUUID()}`;
     await rename(lockPath, stalePath);
     await rm(stalePath, { recursive: true, force: true });
@@ -180,34 +261,33 @@ async function reclaimStaleLock(lockPath: string): Promise<boolean> {
 export async function withDirectoryLock<T>(lockPath: string, task: () => Promise<T>): Promise<T> {
   await mkdir(dirname(lockPath), { recursive: true });
   const owner: LockOwner = { token: randomUUID(), pid: process.pid, createdAt: Date.now() };
-  const deadline = Date.now() + LOCK_TIMEOUT_MS;
-
-  while (true) {
-    try {
-      await mkdir(lockPath);
-    } catch (error) {
-      // Only a collision from mkdir means another process owns the lock. Do
-      // not treat an EEXIST thrown by owner setup or the task as contention.
-      if (!isAlreadyExists(error)) throw error;
-      if (await reclaimStaleLock(lockPath)) continue;
-      if (Date.now() >= deadline) {
-        throw new Error(`Timed out waiting for skill-loader lock: ${lockPath}`);
+  const candidate = `${lockPath}.candidate-${process.pid}-${owner.token}`;
+  await mkdir(candidate);
+  try {
+    await writeFile(join(candidate, "owner.json"), JSON.stringify(owner), "utf8");
+    const deadline = Date.now() + LOCK_TIMEOUT_MS;
+    while (true) {
+      try {
+        // Directory rename atomically publishes both the lock and its owner.
+        await rename(candidate, lockPath);
+      } catch (error) {
+        if (!isLockCollision(error)) throw error;
+        if (await reclaimStaleLock(lockPath)) continue;
+        if (Date.now() >= deadline) {
+          throw new Error(`Timed out waiting for skill-loader lock: ${lockPath}`);
+        }
+        await delay(LOCK_RETRY_DELAY_MS);
+        continue;
       }
-      await delay(LOCK_RETRY_DELAY_MS);
-      continue;
-    }
 
-    try {
-      await writeFile(join(lockPath, "owner.json"), JSON.stringify(owner), "utf8");
-    } catch (error) {
-      await rm(lockPath, { recursive: true, force: true });
-      throw error;
+      try {
+        return await task();
+      } finally {
+        await releaseDirectoryLock(lockPath, owner);
+      }
     }
-    try {
-      return await task();
-    } finally {
-      await releaseDirectoryLock(lockPath, owner);
-    }
+  } finally {
+    await rm(candidate, { recursive: true, force: true }).catch(() => undefined);
   }
 }
 
@@ -336,10 +416,127 @@ function sourceLockPathFor(sourcesDir: string, sourceId: string): string {
   return `${target}.lock`;
 }
 
+function immutableGenerationPrefix(sourceId: string): string {
+  return `${sourceId}.generation-`;
+}
+
+function checkoutRootForInstalledSkill(skill: Pick<InstalledSkill, "path" | "sourceId">): string {
+  sourcePathFor(SOURCES_DIR, skill.sourceId); // Validate the logical source ID.
+  const relativePath = relative(resolve(SOURCES_DIR), resolve(skill.path));
+  const firstSegment = relativePath.split(sep)[0];
+  const prefix = immutableGenerationPrefix(skill.sourceId);
+  const generationSuffix = firstSegment?.startsWith(prefix) ? firstSegment.slice(prefix.length) : undefined;
+  const isPublishedGeneration = generationSuffix !== undefined && /^\d+-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(generationSuffix);
+  if (
+    !firstSegment ||
+    firstSegment === ".." ||
+    (firstSegment !== skill.sourceId && !isPublishedGeneration)
+  ) {
+    throw new Error(`Skill path is outside its source checkout: ${skill.path}`);
+  }
+  return resolve(SOURCES_DIR, firstSegment);
+}
+
+type GenerationLease = { pid: number; createdAt: number; checkoutRoots: string[] };
+
+function generationRootForInstalledSkill(skill: InstalledSkill): string | undefined {
+  const root = checkoutRootForInstalledSkill(skill);
+  return basename(root).startsWith(immutableGenerationPrefix(skill.sourceId)) ? root : undefined;
+}
+
+async function writeGenerationLease(path: string, checkoutRoots: string[]): Promise<void> {
+  await mkdir(LEASES_DIR, { recursive: true });
+  const tmp = `${path}.${randomUUID()}.tmp`;
+  const lease: GenerationLease = {
+    pid: process.pid,
+    createdAt: Date.now(),
+    checkoutRoots: [...new Set(checkoutRoots.map((root) => resolve(root)))],
+  };
+  try {
+    await writeFile(tmp, JSON.stringify(lease), { encoding: "utf8", flag: "wx", mode: 0o600 });
+    await rename(tmp, path);
+  } finally {
+    await rm(tmp, { force: true }).catch(() => undefined);
+  }
+}
+
+async function liveGenerationLeaseRoots(): Promise<Set<string>> {
+  const roots = new Set<string>();
+  let entries: string[];
+  try {
+    entries = await readdir(LEASES_DIR);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return roots;
+    throw error;
+  }
+  for (const entry of entries) {
+    if (!entry.endsWith(".json")) continue;
+    const path = join(LEASES_DIR, entry);
+    try {
+      const parsed = JSON.parse(await readFile(path, "utf8")) as Partial<GenerationLease>;
+      if (!Number.isInteger(parsed.pid) || !Array.isArray(parsed.checkoutRoots)) throw new Error("invalid lease");
+      if (!(await processIsAlive(parsed.pid!))) {
+        await rm(path, { force: true });
+        continue;
+      }
+      for (const root of parsed.checkoutRoots) {
+        if (typeof root === "string" && isPathWithin(SOURCES_DIR, root)) roots.add(resolve(root));
+      }
+    } catch {
+      await rm(path, { force: true }).catch(() => undefined);
+    }
+  }
+  return roots;
+}
+
+async function removeSourceStaging(sourceId: string): Promise<void> {
+  let entries: string[];
+  try {
+    entries = await readdir(SOURCES_DIR);
+  } catch {
+    return;
+  }
+  const prefix = `${sourceId}.staging-`;
+  await Promise.allSettled(
+    entries.filter((entry) => entry.startsWith(prefix)).map((entry) =>
+      rm(resolve(SOURCES_DIR, entry), { recursive: true, force: true }),
+    ),
+  );
+}
+
+async function collectSourceGarbage(sourceId: string, registry: Registry): Promise<void> {
+  const keep = await liveGenerationLeaseRoots();
+  for (const skill of Object.values(registry.skills)) {
+    const root = generationRootForInstalledSkill(skill);
+    if (root) keep.add(resolve(root));
+  }
+  let entries: string[];
+  try {
+    entries = await readdir(SOURCES_DIR);
+  } catch {
+    return;
+  }
+  const generationPrefix = immutableGenerationPrefix(sourceId);
+  await Promise.allSettled(entries.flatMap((entry) => {
+    const path = resolve(SOURCES_DIR, entry);
+    return entry.startsWith(generationPrefix) && !keep.has(path)
+      ? [rm(path, { recursive: true, force: true })]
+      : [];
+  }));
+  await removeSourceStaging(sourceId);
+}
+
+async function assertRealDirectory(path: string, label: string): Promise<void> {
+  const pathStat = await lstat(path);
+  if (!pathStat.isDirectory() || pathStat.isSymbolicLink()) {
+    throw new Error(`${label} must be a real directory, not a symlink: ${path}`);
+  }
+}
+
 async function assertSafeSkillTree(root: string, confinementRoot = root): Promise<string> {
-  const rootStat = await lstat(root);
-  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
-    throw new Error(`Skill directory must be a real directory, not a symlink: ${root}`);
+  await assertRealDirectory(root, "Skill directory");
+  if (resolve(confinementRoot) !== resolve(root)) {
+    await assertRealDirectory(confinementRoot, "Skill checkout root");
   }
 
   const realConfinementRoot = await realpath(confinementRoot);
@@ -350,6 +547,9 @@ async function assertSafeSkillTree(root: string, confinementRoot = root): Promis
 
   const visit = async (dir: string): Promise<void> => {
     for (const entry of await readdir(dir)) {
+      // Git internals are not skill content and can be very large. Validate the
+      // checkout root itself, but do not recursively scan its private database.
+      if (entry === ".git" && resolve(dir) === resolve(realConfinementRoot)) continue;
       const path = join(dir, entry);
       const entryStat = await lstat(path);
       if (entryStat.isSymbolicLink()) {
@@ -368,6 +568,7 @@ async function assertSafeSkillTree(root: string, confinementRoot = root): Promis
 
 async function cloneOrUpdateUnlocked(spec: GitHubSpec, sourcesDir: string): Promise<string> {
   await mkdir(sourcesDir, { recursive: true });
+  await assertRealDirectory(sourcesDir, "Skill sources directory");
   const target = sourcePathFor(sourcesDir, spec.sourceId);
   const existingTarget = await lstatIfExists(target);
   if (existingTarget?.isSymbolicLink()) {
@@ -406,12 +607,61 @@ export async function cloneOrUpdate(spec: GitHubSpec, sourcesDir = SOURCES_DIR):
   return withDirectoryLock(sourceLockPathFor(sourcesDir, spec.sourceId), () => cloneOrUpdateUnlocked(spec, sourcesDir));
 }
 
+type ImmutableCheckout = { root: string; checkoutRoot: string };
+
+async function cloneImmutableGenerationUnlocked(spec: GitHubSpec, sourcesDir: string): Promise<ImmutableCheckout> {
+  const stagingId = `${spec.sourceId}.staging-${process.pid}-${randomUUID()}`;
+  const stagingRoot = sourcePathFor(sourcesDir, stagingId);
+  let publishedRoot: string | undefined;
+  let ownsPublishedRoot = false;
+  try {
+    const skillRoot = await cloneOrUpdateUnlocked({ ...spec, sourceId: stagingId }, sourcesDir);
+    const skillRelativePath = relative(stagingRoot, skillRoot);
+    // Published generations are content snapshots, not mutable Git worktrees.
+    await rm(join(stagingRoot, ".git"), { recursive: true, force: true });
+    const generationId = `${immutableGenerationPrefix(spec.sourceId)}${Date.now()}-${randomUUID()}`;
+    publishedRoot = sourcePathFor(sourcesDir, generationId);
+    await rename(stagingRoot, publishedRoot);
+    ownsPublishedRoot = true;
+    const publishedSkillRoot = resolve(publishedRoot, skillRelativePath);
+    await assertSafeSkillTree(publishedSkillRoot, publishedRoot);
+    return { root: publishedSkillRoot, checkoutRoot: publishedRoot };
+  } catch (error) {
+    await Promise.allSettled([
+      rm(stagingRoot, { recursive: true, force: true }),
+      ...(publishedRoot && ownsPublishedRoot ? [rm(publishedRoot, { recursive: true, force: true })] : []),
+    ]);
+    throw error;
+  }
+}
+
+/**
+ * Publish a refresh as a new immutable generation. Existing Pi sessions keep
+ * reading their previous generation while the registry atomically switches new
+ * sessions to the fully validated checkout.
+ */
+export async function cloneImmutableGeneration(spec: GitHubSpec, sourcesDir = SOURCES_DIR): Promise<string> {
+  return withDirectoryLock(sourceLockPathFor(sourcesDir, spec.sourceId), async () =>
+    (await cloneImmutableGenerationUnlocked(spec, sourcesDir)).root,
+  );
+}
+
 /** Use Pi's own skill loader so YAML, validation, ignores, and discovery match normal skill loading. */
 export async function discoverSkills(root: string): Promise<DiscoveredSkill[]> {
   const safeRoot = await assertSafeSkillTree(root);
   const { skills } = loadSkillsFromDir({ dir: safeRoot, source: "skill-loader" });
-  return skills
-    .filter((skill) => basename(skill.filePath) === "SKILL.md")
+  const discovered = skills.filter((skill) => basename(skill.filePath) === "SKILL.md");
+  const seen = new Set<string>();
+  for (const skill of discovered) {
+    if (!isValidSkillName(skill.name)) {
+      throw new Error(`Invalid downloaded skill name: ${skill.name}`);
+    }
+    if (seen.has(skill.name)) {
+      throw new Error(`Duplicate downloaded skill name: ${skill.name}`);
+    }
+    seen.add(skill.name);
+  }
+  return discovered
     .map((skill) => ({ name: skill.name, description: skill.description, path: skill.baseDir }))
     .sort((a, b) => a.name.localeCompare(b.name));
 }
@@ -480,7 +730,7 @@ function skillCommands(pi: Pick<ExtensionAPI, "getCommands">): InlineSkill[] {
   return pi.getCommands().flatMap((command) => {
     if (command.source !== "skill" || !command.name.startsWith(SKILL_COMMAND_PREFIX)) return [];
     const name = command.name.slice(SKILL_COMMAND_PREFIX.length);
-    if (!name) return [];
+    if (!isValidSkillName(name)) return [];
     return [{
       name,
       description: command.description,
@@ -499,71 +749,194 @@ type ParsedInlineTags = {
   text: string;
 };
 
+function mergeRanges(ranges: TextRange[]): TextRange[] {
+  const sorted = [...ranges].sort((a, b) => a.start - b.start || a.end - b.end);
+  const merged: TextRange[] = [];
+  for (const range of sorted) {
+    const previous = merged.at(-1);
+    if (previous && range.start <= previous.end) {
+      previous.end = Math.max(previous.end, range.end);
+    } else {
+      merged.push({ ...range });
+    }
+  }
+  return merged;
+}
+
+/** Ranges are sorted and non-overlapping, so membership stays O(log n). */
 function rangeContains(ranges: TextRange[], index: number): boolean {
-  return ranges.some((range) => index >= range.start && index < range.end);
+  let low = 0;
+  let high = ranges.length - 1;
+  while (low <= high) {
+    const middle = (low + high) >>> 1;
+    const range = ranges[middle]!;
+    if (index < range.start) high = middle - 1;
+    else if (index >= range.end) low = middle + 1;
+    else return true;
+  }
+  return false;
+}
+
+function markdownContainerInfo(line: string): { content: string; blockquoteDepth: number } {
+  const content = line.endsWith("\r") ? line.slice(0, -1) : line;
+  // Consume mixed nested blockquote/list prefixes in one linear match. Fence
+  // closure additionally requires the opener's blockquote depth, preventing a
+  // literal `> ``` ` inside a top-level fence from ending it.
+  const containers = content.match(/^(?:(?: {0,3}>[ \t]?)|(?: {0,3}(?:[-+*]|\d{1,9}[.)])[ \t]+))+/)?.[0] ?? "";
+  return {
+    content: content.slice(containers.length),
+    blockquoteDepth: containers.match(/>/g)?.length ?? 0,
+  };
+}
+
+type BacktickRun = { start: number; length: number };
+
+function isEscapedAt(text: string, index: number): boolean {
+  let slashes = 0;
+  for (let cursor = index - 1; cursor >= 0 && text[cursor] === "\\"; cursor--) slashes++;
+  return slashes % 2 === 1;
+}
+
+function collectBacktickRuns(text: string, blockRanges: TextRange[]): BacktickRun[] {
+  const runs: BacktickRun[] = [];
+  for (let index = 0; index < text.length;) {
+    if (text[index] !== "`" || isEscapedAt(text, index) || rangeContains(blockRanges, index)) {
+      index++;
+      continue;
+    }
+    let end = index + 1;
+    while (text[end] === "`") end++;
+    runs.push({ start: index, length: end - index });
+    index = end;
+  }
+  return runs;
 }
 
 /** Markdown code and URLs are literal text, not invocation syntax. */
 function protectedTagRanges(text: string): TextRange[] {
-  const ranges: TextRange[] = [];
-  let fence: { marker: "`" | "~"; length: number; start: number } | undefined;
+  const blocks: TextRange[] = [];
+  let fence: { marker: "`" | "~"; length: number; start: number; blockquoteDepth: number } | undefined;
   let lineStart = 0;
 
   while (lineStart < text.length) {
     const newline = text.indexOf("\n", lineStart);
     const lineEnd = newline === -1 ? text.length : newline + 1;
-    const line = text.slice(lineStart, newline === -1 ? text.length : newline);
+    const rawLine = text.slice(lineStart, newline === -1 ? text.length : newline);
+    const container = markdownContainerInfo(rawLine);
+    const line = container.content;
     if (!fence) {
       const opening = line.match(/^ {0,3}(`{3,}|~{3,})/);
       if (opening) {
         const run = opening[1]!;
-        fence = { marker: run[0] as "`" | "~", length: run.length, start: lineStart };
+        fence = {
+          marker: run[0] as "`" | "~",
+          length: run.length,
+          start: lineStart,
+          blockquoteDepth: container.blockquoteDepth,
+        };
       } else if (/^(?: {4}|\t)/.test(line)) {
-        // Treat Markdown indented-code lines as literal input too.
-        ranges.push({ start: lineStart, end: lineEnd });
+        blocks.push({ start: lineStart, end: lineEnd });
       }
     } else {
       const closing = line.match(/^ {0,3}(`+|~+)[ \t]*$/);
       const run = closing?.[1];
-      if (run && run[0] === fence.marker && run.length >= fence.length) {
-        ranges.push({ start: fence.start, end: lineEnd });
+      if (
+        run &&
+        container.blockquoteDepth === fence.blockquoteDepth &&
+        run[0] === fence.marker &&
+        run.length >= fence.length
+      ) {
+        blocks.push({ start: fence.start, end: lineEnd });
         fence = undefined;
       }
     }
     lineStart = lineEnd;
   }
-  if (fence) ranges.push({ start: fence.start, end: text.length });
+  if (fence) blocks.push({ start: fence.start, end: text.length });
+  const blockRanges = mergeRanges(blocks);
+  const ranges = [...blockRanges];
 
-  // Protect inline code spans outside fenced blocks. Matching the same backtick
-  // run follows Markdown's delimiter rule closely enough for prompt syntax.
-  for (let index = 0; index < text.length;) {
-    if (text[index] !== "`" || rangeContains(ranges, index)) {
+  const runs = collectBacktickRuns(text, blockRanges);
+  const nextSameLength = new Array<number | undefined>(runs.length);
+  const nextByLength = new Map<number, number>();
+  for (let index = runs.length - 1; index >= 0; index--) {
+    const run = runs[index]!;
+    nextSameLength[index] = nextByLength.get(run.length);
+    nextByLength.set(run.length, index);
+  }
+  for (let index = 0; index < runs.length;) {
+    const closeIndex = nextSameLength[index];
+    if (closeIndex === undefined) {
       index++;
       continue;
     }
-    let endOfRun = index + 1;
-    while (text[endOfRun] === "`") endOfRun++;
-    const delimiter = text.slice(index, endOfRun);
-    const close = text.indexOf(delimiter, endOfRun);
-    if (close === -1) {
-      index = endOfRun;
-      continue;
-    }
-    ranges.push({ start: index, end: close + delimiter.length });
-    index = close + delimiter.length;
+    const opening = runs[index]!;
+    const closing = runs[closeIndex]!;
+    ranges.push({ start: opening.start, end: closing.start + closing.length });
+    index = closeIndex + 1;
   }
 
   for (const match of text.matchAll(/(?:https?:\/\/|www\.)[^\s<>]+/gi)) {
     ranges.push({ start: match.index, end: match.index + match[0].length });
   }
-  return ranges;
+
+  // Relative Markdown link destinations can look exactly like @skill tags.
+  // Protect balanced inline destinations and reference-definition lines.
+  for (let index = 0; index < text.length;) {
+    if (text[index] !== "]" || text[index + 1] !== "(" || isEscapedAt(text, index)) {
+      index++;
+      continue;
+    }
+    let depth = 1;
+    let cursor = index + 2;
+    while (cursor < text.length && depth > 0 && text[cursor] !== "\n") {
+      if (!isEscapedAt(text, cursor)) {
+        if (text[cursor] === "(") depth++;
+        else if (text[cursor] === ")") depth--;
+      }
+      cursor++;
+    }
+    if (depth === 0) ranges.push({ start: index + 2, end: cursor - 1 });
+    // Whether closed or malformed, the scan has consumed the rest of this
+    // destination/line; do not rescan overlapping suffixes quadratically.
+    index = Math.max(index + 2, cursor);
+  }
+  for (const match of text.matchAll(/^ {0,3}\[[^\]\n]+\]:[^\n]*$/gm)) {
+    ranges.push({ start: match.index, end: match.index + match[0].length });
+  }
+  return mergeRanges(ranges);
+}
+
+function codePointBefore(text: string, index: number): string | undefined {
+  if (index <= 0) return undefined;
+  const previous = text.charCodeAt(index - 1);
+  const start = previous >= 0xdc00 && previous <= 0xdfff ? index - 2 : index - 1;
+  return text.slice(Math.max(0, start), index);
+}
+
+function codePointAt(text: string, index: number): string | undefined {
+  if (index >= text.length) return undefined;
+  const point = text.codePointAt(index);
+  return point === undefined ? undefined : String.fromCodePoint(point);
+}
+
+function isWordCodePoint(value: string | undefined): boolean {
+  return value !== undefined && /[\p{L}\p{N}\p{M}\p{Pc}]/u.test(value);
 }
 
 function isTagBoundary(text: string, atIndex: number, slashCount = 0): boolean {
-  const precedingIndex = atIndex - slashCount - 1;
-  if (precedingIndex < 0) return true;
-  // Reject email addresses, paths, URLs, identifiers, and chained @ syntax.
-  return !/[a-zA-Z0-9_@./:=?&%#+-]/.test(text[precedingIndex]!);
+  const precedingIndex = atIndex - slashCount;
+  const preceding = codePointBefore(text, precedingIndex);
+  if (preceding === undefined) return true;
+  // Reject email addresses, paths (POSIX and Windows), URLs, identifiers, and
+  // chained @ syntax while allowing normal sentence punctuation.
+  return !isWordCodePoint(preceding) && !/[@./\\:=?&%#+-]/.test(preceding);
+}
+
+function hasInvalidTagSuffix(text: string, end: number): boolean {
+  const next = codePointAt(text, end);
+  if (isWordCodePoint(next) || next === "@" || next === "/" || next === "\\") return true;
+  return next === "." && isWordCodePoint(codePointAt(text, end + 1));
 }
 
 function parseInlineSkillTags(text: string, available: InlineSkill[]): ParsedInlineTags {
@@ -583,22 +956,17 @@ function parseInlineSkillTags(text: string, available: InlineSkill[]): ParsedInl
     let end = index + 1;
     while (end < text.length && /[a-z0-9-]/.test(text[end]!)) end++;
     if (end === index + 1) continue;
-    // Do not partially interpret @skill in @skill.ext, @skill/path, or an
-    // invalid mixed-case token. A terminal period remains normal punctuation.
-    const next = text[end];
-    if (
-      next !== undefined && (
-        /[a-zA-Z0-9_@/]/.test(next) ||
-        (next === "." && /[a-zA-Z0-9]/.test(text[end + 1] ?? ""))
-      )
-    ) continue;
+    if (hasInvalidTagSuffix(text, end)) continue;
 
-    if (slashCount % 2 === 1) {
-      escapesToRemove.add(index - 1);
+    const skill = byName.get(text.slice(index + 1, end));
+    // Escaping is syntax only for a real skill. Unknown text remains byte-for-
+    // byte unchanged rather than unexpectedly losing a backslash.
+    if (slashCount > 1) continue; // Windows root/UNC-like path, not invocation syntax.
+    if (slashCount === 1) {
+      if (skill) escapesToRemove.add(index - 1);
       continue;
     }
 
-    const skill = byName.get(text.slice(index + 1, end));
     if (skill && !seen.has(skill.name)) {
       seen.add(skill.name);
       found.push(skill);
@@ -641,27 +1009,45 @@ export async function expandInlineSkillTags(
     return parsed.text === text ? undefined : { text: parsed.text, failed: [] };
   }
 
-  const [first, ...additional] = parsed.skills;
-  const blocks: string[] = [];
-  const failed: InlineSkill[] = [];
-  for (const skill of additional) {
-    try {
-      blocks.push(nativeSkillBlock(skill, await readSkill(skill.filePath)));
-    } catch {
-      failed.push(skill);
-    }
+  const reads = await Promise.allSettled(parsed.skills.map((skill) => readSkill(skill.filePath)));
+  const failed = parsed.skills.filter((_skill, index) => reads[index]?.status === "rejected");
+  if (failed.length > 0) {
+    // Explicit invocation is all-or-nothing: never proceed after silently
+    // dropping a requested policy/review skill.
+    return { text: parsed.text, failed };
   }
 
+  const [first, ...additional] = parsed.skills;
+  const blocks = additional.map((skill, index) => {
+    const result = reads[index + 1] as PromiseFulfilledResult<string>;
+    return nativeSkillBlock(skill, result.value);
+  });
   const argumentsText = [...blocks, parsed.text].filter(Boolean).join("\n\n");
-  return {
-    text: `/skill:${first!.name}${argumentsText ? ` ${argumentsText}` : ""}`,
-    failed,
-  };
+  return { text: `/skill:${first!.name}${argumentsText ? ` ${argumentsText}` : ""}`, failed: [] };
 }
 
-function completionQuery(textBeforeCursor: string): string | undefined {
-  const match = textBeforeCursor.match(/(?:^|[\s([{,'"“‘;])@([a-z0-9-]*)$/);
-  return match?.[1];
+function completionQuery(
+  lines: string[],
+  cursorLine: number,
+  cursorCol: number,
+): { query: string; prefix: string } | undefined {
+  const text = lines.join("\n");
+  const cursorOffset = lines.slice(0, cursorLine).reduce((length, line) => length + line.length + 1, 0) + cursorCol;
+  const beforeCursor = text.slice(0, cursorOffset);
+  const match = beforeCursor.match(/@([a-z0-9-]*)$/);
+  if (!match) return undefined;
+  const atIndex = cursorOffset - match[0].length;
+  let slashCount = 0;
+  for (let cursor = atIndex - 1; cursor >= 0 && text[cursor] === "\\"; cursor--) slashCount++;
+  if (
+    slashCount > 0 ||
+    !isTagBoundary(text, atIndex) ||
+    hasInvalidTagSuffix(text, cursorOffset) ||
+    rangeContains(protectedTagRanges(text), atIndex)
+  ) {
+    return undefined;
+  }
+  return { query: match[1]!, prefix: match[0] };
 }
 
 function skillCompletionItems(skills: InlineSkill[], query: string): AutocompleteItem[] {
@@ -690,32 +1076,45 @@ export function createSkillAutocompleteProvider(
   return {
     triggerCharacters: [...new Set([...(current.triggerCharacters ?? []), "@"])],
     async getSuggestions(lines, cursorLine, cursorCol, options) {
-      const beforeCursor = (lines[cursorLine] ?? "").slice(0, cursorCol);
-      const query = completionQuery(beforeCursor);
-      if (query === undefined) return current.getSuggestions(lines, cursorLine, cursorCol, options);
+      if (options.signal.aborted) return null;
+      const completion = completionQuery(lines, cursorLine, cursorCol);
+      if (!completion) return current.getSuggestions(lines, cursorLine, cursorCol, options);
 
-      const skillItems = skillCompletionItems(getSkills(), query);
+      const allSkills = getSkills();
+      if (options.signal.aborted) return null;
+      const skillItems = skillCompletionItems(allSkills, completion.query);
       if (skillItems.length === 0) return current.getSuggestions(lines, cursorLine, cursorCol, options);
 
-      // Keep Pi's existing @file suggestions after skills, rather than stealing
-      // the native path-reference syntax.
       const native = await current.getSuggestions(lines, cursorLine, cursorCol, options);
       if (options.signal.aborted) return null;
-      const values = new Set(skillItems.map((item) => item.value));
+      // Collision safety must use the complete catalog, not the displayed top
+      // 20, or a hidden matching skill could consume a selected @file.
+      const skillValues = new Set(allSkills.map((skill) => `@${skill.name}`));
       const nativeItems = (native?.items ?? []).map((item) => {
-        if (!values.has(item.value)) return item;
-        // A bare exact match intentionally invokes the skill. Preserve access
-        // to a same-named @file by completing it with the documented escape;
-        // the input hook removes that escape without loading the skill.
+        if (!skillValues.has(item.value)) return item;
         return {
           ...item,
           value: `\\${item.value}`,
           description: item.description ? `File · ${item.description}` : "File · literal @ reference",
         };
       });
+
+      const exactValue = `@${completion.query}`;
+      const exactSkills = skillItems.filter((item) => item.value === exactValue);
+      const nonExactSkills = skillItems.filter((item) => item.value !== exactValue);
+      const prefixSkills = nonExactSkills.filter((item) => item.value.slice(1).startsWith(completion.query));
+      const fuzzySkills = nonExactSkills.filter((item) => !item.value.slice(1).startsWith(completion.query));
+      const exactNative = nativeItems.filter((item) => item.value.replace(/^\\/, "") === exactValue);
+      const remainingNative = nativeItems.filter((item) => item.value.replace(/^\\/, "") !== exactValue);
+      const interleaved: AutocompleteItem[] = [];
+      const length = Math.max(prefixSkills.length, remainingNative.length);
+      for (let index = 0; index < length; index++) {
+        if (prefixSkills[index]) interleaved.push(prefixSkills[index]!);
+        if (remainingNative[index]) interleaved.push(remainingNative[index]!);
+      }
       return {
-        prefix: `@${query}`,
-        items: [...skillItems, ...nativeItems],
+        prefix: completion.prefix,
+        items: [...exactSkills, ...exactNative, ...interleaved, ...fuzzySkills],
       };
     },
     applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
@@ -734,6 +1133,17 @@ export function reconcileSourceSkills(
   options: { enabled: boolean; now: string },
 ): InstalledSkill[] {
   const discoveredNames = new Set(discovered.map((skill) => skill.name));
+  // Preflight collisions before mutating so a rejected refresh is atomic even
+  // for direct callers outside mutateRegistry().
+  for (const skill of discovered) {
+    const previous = ownValue(registry.skills, skill.name);
+    if (previous && previous.sourceId !== source.sourceId) {
+      throw new Error(
+        `Skill name collision: ${skill.name} is already installed from ${previous.sourceUrl}; refusing to replace it from ${source.sourceUrl}`,
+      );
+    }
+  }
+
   // A refresh replaces the complete set for this source. Leave records that
   // have since been claimed by another source alone.
   for (const [name, skill] of Object.entries(registry.skills)) {
@@ -743,7 +1153,7 @@ export function reconcileSourceSkills(
   }
 
   for (const skill of discovered) {
-    const previous = registry.skills[skill.name];
+    const previous = ownValue(registry.skills, skill.name);
     registry.skills[skill.name] = {
       name: skill.name,
       description: skill.description,
@@ -760,20 +1170,30 @@ export function reconcileSourceSkills(
 
 async function installFromGitHub(url: string, options: { enabled: boolean }): Promise<InstalledSkill[]> {
   const spec = parseGitHubUrl(url);
-  // Keep the source lock through discovery and reconciliation. Otherwise a
-  // second process could replace the checkout while this process is scanning it
-  // (or overwrite its newer registry result with stale discovery output).
+  // Keep the logical source lock through immutable publication, discovery, and
+  // registry reconciliation so concurrent installers cannot publish stale data.
   return withDirectoryLock(sourceLockPathFor(SOURCES_DIR, spec.sourceId), async () => {
-    const root = await cloneOrUpdateUnlocked(spec, SOURCES_DIR);
-    const discovered = await discoverSkills(root);
-    const installed = await mutateRegistry((registry) =>
-      reconcileSourceSkills(registry, { sourceId: spec.sourceId, sourceUrl: url }, discovered, {
-        enabled: options.enabled,
-        now: new Date().toISOString(),
-      }),
-    );
-    if (installed.length === 0) throw new Error(`No SKILL.md files with valid frontmatter found in ${url}`);
-    return installed;
+    await removeSourceStaging(spec.sourceId);
+    const checkout = await cloneImmutableGenerationUnlocked(spec, SOURCES_DIR);
+    let published = false;
+    try {
+      const discovered = await discoverSkills(checkout.root);
+      if (discovered.length === 0) throw new Error(`No SKILL.md files with valid frontmatter found in ${url}`);
+      const installed = await mutateRegistry((registry) =>
+        reconcileSourceSkills(registry, { sourceId: spec.sourceId, sourceUrl: url }, discovered, {
+          enabled: options.enabled,
+          now: new Date().toISOString(),
+        }),
+      );
+      published = true;
+      const currentRegistry = await withRegistryLock(() => loadRegistry());
+      await collectSourceGarbage(spec.sourceId, currentRegistry).catch(() => undefined);
+      return installed;
+    } finally {
+      // Preserve the primary validation/collision error if best-effort cleanup
+      // itself fails; stale artifacts are scavenged by later maintenance.
+      if (!published) await rm(checkout.checkoutRoot, { recursive: true, force: true }).catch(() => undefined);
+    }
   });
 }
 
@@ -824,7 +1244,7 @@ async function setSkillEnabled(target: SkillToggleTarget, enabled: boolean): Pro
   return mutateRegistry((registry) => {
     const now = new Date().toISOString();
     if (target.origin === "downloaded") {
-      const skill = registry.skills[target.key];
+      const skill = ownValue(registry.skills, target.key);
       if (!skill) return false;
       if (skill.enabled !== enabled) {
         skill.enabled = enabled;
@@ -843,6 +1263,12 @@ async function setSkillEnabled(target: SkillToggleTarget, enabled: boolean): Pro
 }
 
 async function openSkillsUi(ctx: ExtensionCommandContext): Promise<void> {
+  if (ctx.mode !== "tui") {
+    const message = "/skills-ui is available only in interactive TUI mode.";
+    if (ctx.hasUI) ctx.ui.notify(message, "warning");
+    else process.stderr.write(`${message}\n`);
+    return;
+  }
   const targets = await skillToggleTargets();
   if (targets.length === 0) {
     ctx.ui.notify(`No skills found in ${USER_SKILLS_DIR} or installed with --install-skill.`, "info");
@@ -925,6 +1351,12 @@ async function openSkillsUi(ctx: ExtensionCommandContext): Promise<void> {
 }
 
 export default function skillLoader(pi: ExtensionAPI) {
+  // Keep visibility preferences aligned with the exact registry generation used
+  // by this runtime's resource discovery. Another Pi process may publish a new
+  // generation, but it must not change model visibility until this one reloads.
+  let resourceRegistry: Registry | undefined;
+  const generationLeasePath = join(LEASES_DIR, `${process.pid}-${randomUUID()}.json`);
+
   pi.registerFlag("install-skill", {
     description: "Install Agent Skills from a GitHub repo URL. Example: --install-skill https://github.com/daytona/skills",
     type: "string",
@@ -942,18 +1374,40 @@ export default function skillLoader(pi: ExtensionAPI) {
     default: false,
   });
 
-  pi.on("resources_discover", async () => {
-    const registry = await loadRegistry();
-    // Discover every downloaded skill so Pi owns /skill:name expansion. Prompt
-    // visibility is filtered separately and defaults to user-only.
-    const skillPaths = await Promise.all(
-      Object.values(registry.skills)
-        .map((skill) => assertSafeSkillTree(skill.path, sourcePathFor(SOURCES_DIR, skill.sourceId))),
+  pi.on("resources_discover", async (_event, ctx) => {
+    const registry = await withRegistryLock(async () => {
+      const loaded = await loadRegistry();
+      const generationRoots = Object.values(loaded.skills).flatMap((skill) => {
+        try {
+          const root = generationRootForInstalledSkill(skill);
+          return root ? [root] : [];
+        } catch {
+          return [];
+        }
+      });
+      await writeGenerationLease(generationLeasePath, generationRoots);
+      return loaded;
+    });
+    resourceRegistry = registry;
+    // A stale/corrupt checkout must not hide every unrelated downloaded skill.
+    const skills = Object.values(registry.skills);
+    if (skills.length > 0) await assertRealDirectory(SOURCES_DIR, "Skill sources directory");
+    const results = await Promise.allSettled(
+      skills.map(async (skill) => assertSafeSkillTree(skill.path, checkoutRootForInstalledSkill(skill))),
     );
+    const skillPaths = results.flatMap((result, index) => {
+      if (result.status === "fulfilled") return [result.value];
+      ctx.ui.notify(`Skipping unavailable skill ${skills[index]!.name}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`, "warning");
+      return [];
+    });
     return { skillPaths };
   });
 
   pi.on("input", async (event, ctx) => {
+    // Installation is a one-shot CLI action. In print mode shutdown() is a
+    // no-op, so consume any supplied prompt rather than starting an LLM turn.
+    const installUrl = pi.getFlag("install-skill");
+    if (typeof installUrl === "string" && installUrl.trim()) return { action: "handled" };
     // pi.sendUserMessage() deliberately disables command expansion. Turning an
     // extension-owned @tag into /skill:name there would send the slash command
     // literally, so only transform direct interactive/RPC user prompts.
@@ -964,18 +1418,23 @@ export default function skillLoader(pi: ExtensionAPI) {
     if (!expanded) return { action: "continue" };
     if (expanded.failed.length > 0) {
       ctx.ui.notify(
-        `Could not load inline skill(s): ${expanded.failed.map((skill) => skill.name).join(", ")}`,
-        "warning",
+        `Inline skill invocation cancelled; could not load: ${expanded.failed.map((skill) => skill.name).join(", ")}`,
+        "error",
       );
+      return { action: "handled" };
     }
     return { action: "transform", text: expanded.text, images: event.images };
+  });
+
+  pi.on("session_shutdown", async () => {
+    await rm(generationLeasePath, { force: true }).catch(() => undefined);
   });
 
   pi.on("before_agent_start", async (event) => {
     const allSkills = event.systemPromptOptions.skills ?? [];
     const selectedTools = event.systemPromptOptions.selectedTools;
     if (selectedTools && !selectedTools.includes("read")) return;
-    const registry = await loadRegistry();
+    const registry = resourceRegistry ?? await loadRegistry();
     const selectedSkills = selectSkillsForPrompt(allSkills, registry);
     event.systemPromptOptions.skills = selectedSkills;
     return { systemPrompt: rewriteSkillsInPrompt(event.systemPrompt, allSkills, selectedSkills) };
@@ -989,12 +1448,14 @@ export default function skillLoader(pi: ExtensionAPI) {
     try {
       const enabled = pi.getFlag("install-skill-enabled") === true && pi.getFlag("install-skill-disabled") !== true;
       const installed = await installFromGitHub(url, { enabled });
-      ctx.ui.notify(
-        `Installed ${installed.length} skill(s): ${installed.map((s) => s.name).join(", ")}${enabled ? " (enabled)" : " (user-only)"}`,
-        "info",
-      );
+      const message = `Installed ${installed.length} skill(s): ${installed.map((s) => s.name).join(", ")}${enabled ? " (enabled)" : " (user-only)"}`;
+      if (ctx.hasUI) ctx.ui.notify(message, "info");
+      else process.stderr.write(`${message}\n`);
     } catch (error) {
-      ctx.ui.notify(`Skill install failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+      const message = `Skill install failed: ${error instanceof Error ? error.message : String(error)}`;
+      process.exitCode = 1;
+      if (ctx.hasUI) ctx.ui.notify(message, "error");
+      else process.stderr.write(`${message}\n`);
     } finally {
       ctx.shutdown();
     }

@@ -7,10 +7,12 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
 import skillLoader, {
+  cloneImmutableGeneration,
   cloneOrUpdate,
   createSkillAutocompleteProvider,
   discoverSkills,
   expandInlineSkillTags,
+  parseRegistry,
   reconcileSourceSkills,
   reconcileUserSkillPreferences,
   rewriteSkillsInPrompt,
@@ -67,6 +69,19 @@ const readInlineSkill = async (path: string): Promise<string> => {
   return content;
 };
 
+test("strictly parses registry v1 while migrating missing user preferences", () => {
+  const migrated = parseRegistry('{"version":1,"skills":{}}');
+  assert.equal(migrated.version, 1);
+  assert.deepEqual(Object.keys(migrated.skills), []);
+  assert.deepEqual(Object.keys(migrated.userSkills), []);
+  assert.throws(() => parseRegistry("not json"), /Invalid skill-loader registry JSON/);
+  assert.throws(() => parseRegistry('{"version":1,"skills":[]}'), /expected version 1/);
+  assert.throws(
+    () => parseRegistry('{"version":1,"skills":{"bad":{"name":"bad"}}}'),
+    /Invalid skill-loader registry skill record/,
+  );
+});
+
 test("expands a known @skill at the beginning, middle, or end through Pi's native command", async () => {
   for (const prompt of [
     "@alpha-skill review this",
@@ -96,27 +111,46 @@ test("ignores unknown, email, URL, path-like, and Markdown code @tokens", async 
   const prompt = [
     "unknown @missing-skill",
     "email dev@alpha-skill.com",
+    "unicode email δοκιμή@alpha-skill.例",
     "url https://example.test/@alpha-skill",
     "parenthesized URL https://example.test/path(@alpha-skill)",
     "path ./@alpha-skill/file",
+    "windows path @alpha-skill\\docs",
+    "windows root \\\\@alpha-skill",
+    "connector foo‿@alpha-skill",
+    "relative link [docs](@alpha-skill)",
+    "[docs]: @alpha-skill",
     "inline `@alpha-skill`",
     "    @alpha-skill",
-    "```text\n@alpha-skill\n```",
+    ">     @alpha-skill",
+    "- ```text\n  @alpha-skill\n  ```",
+    "```text\r\n@alpha-skill\r\n```\r\nafter fence",
+    "```text\n> ```\n@alpha-skill\n```",
     "```text\n```not-a-close\n@alpha-skill\n```",
   ].join("\n");
 
   assert.equal(await expandInlineSkillTags(prompt, inlineSkills, readInlineSkill), undefined);
+  for (const ordinary of [
+    "Mismatched `@alpha-skill`` delimiters",
+    "Escaped \\` @alpha-skill \\` delimiters",
+  ]) {
+    assert.equal(
+      (await expandInlineSkillTags(ordinary, inlineSkills, readInlineSkill))?.text,
+      `/skill:alpha-skill ${ordinary}`,
+    );
+  }
 });
 
-test("supports escaping a literal skill tag and leaves native slash commands unchanged", async () => {
+test("supports escaping a literal known skill without mutating unknown tags", async () => {
   assert.deepEqual(
     await expandInlineSkillTags("Use 😀 \\@alpha-skill literally", inlineSkills, readInlineSkill),
     { text: "Use 😀 @alpha-skill literally", failed: [] },
   );
+  assert.equal(await expandInlineSkillTags("Keep \\@missing-skill unchanged", inlineSkills, readInlineSkill), undefined);
   assert.equal(await expandInlineSkillTags("/skill:alpha-skill arguments", inlineSkills, readInlineSkill), undefined);
 });
 
-test("reports an unreadable additional inline skill without replacing the native first skill", async () => {
+test("cancels all inline expansion when any requested skill is unreadable", async () => {
   const expanded = await expandInlineSkillTags(
     "Use @alpha-skill and @beta-skill",
     inlineSkills,
@@ -125,7 +159,7 @@ test("reports an unreadable additional inline skill without replacing the native
       return readInlineSkill(path);
     },
   );
-  assert.equal(expanded?.text, "/skill:alpha-skill Use @alpha-skill and @beta-skill");
+  assert.equal(expanded?.text, "Use @alpha-skill and @beta-skill");
   assert.deepEqual(expanded?.failed.map((skill) => skill.name), ["beta-skill"]);
 });
 
@@ -166,6 +200,54 @@ test("does not rewrite extension-injected messages whose command expansion Pi di
   assert.deepEqual(result, { action: "continue" });
 });
 
+test("wires positive interactive and RPC prompts through canonical skill commands", async () => {
+  const root = await tempDir("pi-skill-loader-input-");
+  try {
+    const skillPath = join(root, "SKILL.md");
+    await writeFile(skillPath, inlineSkillFiles["/skills/alpha/SKILL.md"]!);
+    type InputHandler = (
+      event: InputEvent,
+      ctx: ExtensionContext,
+    ) => InputEventResult | void | Promise<InputEventResult | void>;
+    let inputHandler: InputHandler | undefined;
+    const pi = {
+      registerFlag() {},
+      registerCommand() {},
+      getFlag() { return undefined; },
+      getCommands() {
+        return [{
+          name: "skill:alpha-skill",
+          source: "skill" as const,
+          description: "Alpha instructions",
+          sourceInfo: {
+            path: skillPath,
+            source: "local",
+            scope: "user" as const,
+            origin: "top-level" as const,
+          },
+        }];
+      },
+      on(event: string, handler: InputHandler) {
+        if (event === "input") inputHandler = handler;
+      },
+    } as unknown as ExtensionAPI;
+    skillLoader(pi);
+    assert.ok(inputHandler);
+    const ctx = { ui: { notify() {} } } as unknown as ExtensionContext;
+
+    for (const source of ["interactive", "rpc"] as const) {
+      const result = await inputHandler({ type: "input", text: "Use @alpha-skill", source }, ctx);
+      assert.deepEqual(result, {
+        action: "transform",
+        text: "/skill:alpha-skill Use @alpha-skill",
+        images: undefined,
+      });
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("offers @skill completion without discarding Pi's native @file suggestions", async () => {
   const native: AutocompleteProvider = {
     triggerCharacters: ["/"],
@@ -204,6 +286,44 @@ test("offers @skill completion without discarding Pi's native @file suggestions"
   );
   assert.match(suggestions?.items[0]?.description ?? "", /^Skill/);
   assert.match(suggestions?.items[1]?.description ?? "", /^File/);
+});
+
+test("autocomplete uses invocation context rules and all skill names for file collisions", async () => {
+  const manySkills = Array.from({ length: 25 }, (_value, index): InlineSkill => ({
+    name: `skill-${String(index).padStart(2, "0")}`,
+    filePath: `/skills/${index}/SKILL.md`,
+    baseDir: `/skills/${index}`,
+  }));
+  const native: AutocompleteProvider = {
+    async getSuggestions(_lines, _line, _col) {
+      return { prefix: "@skill", items: [{ value: "@skill-24", label: "@skill-24", description: "File" }] };
+    },
+    applyCompletion(lines, cursorLine, cursorCol) {
+      return { lines, cursorLine, cursorCol };
+    },
+  };
+  const provider = createSkillAutocompleteProvider(native, () => manySkills);
+  const visible = await provider.getSuggestions(
+    ["Use @skill"], 0, "Use @skill".length, { signal: new AbortController().signal },
+  );
+  assert.ok(visible?.items.some((item) => item.value === "\\@skill-24"));
+
+  const code = "Use `@skill`";
+  const inCode = await provider.getSuggestions(
+    [code], 0, "Use `@skill".length, { signal: new AbortController().signal },
+  );
+  assert.deepEqual(inCode?.items.map((item) => item.value), ["@skill-24"]);
+
+  const url = "https://example.test/@skill";
+  const inUrl = await provider.getSuggestions([url], 0, url.length, { signal: new AbortController().signal });
+  assert.deepEqual(inUrl?.items.map((item) => item.value), ["@skill-24"]);
+
+  const pathSuffix = "Use @skill-24/docs";
+  const beforeSlash = "Use @skill-24".length;
+  const inPath = await provider.getSuggestions(
+    [pathSuffix], 0, beforeSlash, { signal: new AbortController().signal },
+  );
+  assert.deepEqual(inPath?.items.map((item) => item.value), ["@skill-24"]);
 });
 
 test("discovers skills with Pi's YAML parser and reconciles removed source skills", async () => {
@@ -260,6 +380,18 @@ test("discovers skills with Pi's YAML parser and reconciles removed source skill
     assert.equal(installed[0]?.name, "yaml-skill");
     assert.equal(installed[0]?.enabled, false);
 
+    assert.throws(
+      () => reconcileSourceSkills(
+        registry,
+        { sourceId: "acme", sourceUrl: "https://github.com/acme/skills" },
+        [{ name: "retained", description: "collision", path: "/replacement" }],
+        { enabled: false, now: "collision" },
+      ),
+      /Skill name collision/,
+    );
+    assert.equal(registry.skills.retained?.sourceId, "other");
+    assert.equal(registry.skills["yaml-skill"]?.sourceId, "acme", "collision rejection is atomic");
+
     // An empty refresh must remove the last skill from the source too.
     reconcileSourceSkills(
       registry,
@@ -268,8 +400,46 @@ test("discovers skills with Pi's YAML parser and reconciles removed source skill
       { enabled: false, now: "later" },
     );
     assert.equal(registry.skills["yaml-skill"], undefined);
+
+    const constructorRegistry: Registry = { version: 1, skills: {}, userSkills: {} };
+    const constructorSkill = reconcileSourceSkills(
+      constructorRegistry,
+      { sourceId: "safe", sourceUrl: "https://github.com/acme/safe" },
+      [{ name: "constructor", description: "valid lowercase skill", path: "/constructor" }],
+      { enabled: false, now: "now" },
+    );
+    assert.equal(constructorSkill[0]?.name, "constructor");
+    assert.equal(constructorSkill[0]?.sourceId, "safe");
+    assert.equal(Object.hasOwn(constructorRegistry.skills, "constructor"), true);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects invalid or duplicate downloaded skill names", async () => {
+  const invalidRoot = await tempDir("pi-skill-loader-invalid-name-");
+  const duplicateRoot = await tempDir("pi-skill-loader-duplicate-name-");
+  try {
+    await mkdir(join(invalidRoot, "invalid"));
+    await writeFile(
+      join(invalidRoot, "invalid", "SKILL.md"),
+      "---\nname: Invalid_Name\ndescription: invalid\n---\n",
+    );
+    await assert.rejects(discoverSkills(invalidRoot), /Invalid downloaded skill name/);
+
+    for (const dir of ["one", "two"]) {
+      await mkdir(join(duplicateRoot, dir));
+      await writeFile(
+        join(duplicateRoot, dir, "SKILL.md"),
+        "---\nname: duplicate-skill\ndescription: duplicate\n---\n",
+      );
+    }
+    await assert.rejects(discoverSkills(duplicateRoot), /Duplicate downloaded skill name/);
+  } finally {
+    await Promise.all([
+      rm(invalidRoot, { recursive: true, force: true }),
+      rm(duplicateRoot, { recursive: true, force: true }),
+    ]);
   }
 });
 
@@ -435,6 +605,24 @@ test("refresh checks out the fetched slash-containing branch and its skill subdi
     const refreshedRoot = await cloneOrUpdate(spec, sources);
     assert.equal(refreshedRoot, firstRoot);
     assert.match(await readFile(join(refreshedRoot, "SKILL.md"), "utf8"), /second branch revision/);
+
+    const immutableFirst = await cloneImmutableGeneration(spec, sources);
+    assert.match(await readFile(join(immutableFirst, "SKILL.md"), "utf8"), /second branch revision/);
+    await assert.rejects(readFile(join(immutableFirst, "..", ".git", "HEAD"), "utf8"));
+
+    await writeFile(join(work, "skills", "SKILL.md"), "---\nname: refresh-skill\ndescription: third branch revision\n---\n");
+    await git(work, "add", ".");
+    await git(work, "commit", "-m", "branch revision three");
+    await git(work, "push");
+
+    const immutableSecond = await cloneImmutableGeneration(spec, sources);
+    assert.notEqual(immutableSecond, immutableFirst);
+    assert.match(await readFile(join(immutableSecond, "SKILL.md"), "utf8"), /third branch revision/);
+    assert.match(
+      await readFile(join(immutableFirst, "SKILL.md"), "utf8"),
+      /second branch revision/,
+      "publishing a refresh must not mutate paths held by existing sessions",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
