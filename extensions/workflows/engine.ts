@@ -126,7 +126,7 @@ export class WorkflowEngine {
     const runId = randomUUID();
     const owner = this.owners.bind(ctx);
     const args = input.args === undefined ? null : cloneCanonicalJson(input.args);
-    const timeoutMs = input.timeoutMs ?? 30 * 60 * 1_000;
+    const timeoutMs = input.timeoutMs ?? 2 * 60 * 60 * 1_000;
     const deadlineAt = Date.now() + timeoutMs;
     const paths = this.store.paths(runId, parsed.metadata.resumable);
     const argsSha256 = hashCanonical(args);

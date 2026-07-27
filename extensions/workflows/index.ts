@@ -27,7 +27,7 @@ export interface WorkflowSnapshot {
 }
 
 const WORKFLOW_NOTIFICATION_TYPE = "workflow-notification";
-const DEFAULT_TIMEOUT_MS = 30 * 60 * 1_000;
+const DEFAULT_TIMEOUT_MS = 2 * 60 * 60 * 1_000;
 const MAX_STATUS_LIMIT = 100;
 type ToolViewMode = "minimized" | "medium" | "verbose";
 

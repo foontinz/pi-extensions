@@ -11,9 +11,9 @@ export const MAX_WORKFLOW_AGENTS = 100;
 export const MAX_WORKFLOW_NESTING_DEPTH = 4;
 export const MAX_WORKFLOW_GLOBAL_CONCURRENCY = 64;
 export const MAX_WORKFLOW_RUN_CONCURRENCY = 32;
-export const MAX_WORKFLOW_TIMEOUT_MS = 30 * 60 * 1_000;
+export const MAX_WORKFLOW_TIMEOUT_MS = 2 * 60 * 60 * 1_000;
 export const MAX_WORKFLOW_CLEANUP_GRACE_MS = 5 * 60 * 1_000;
-export const MAX_AGENT_TIMEOUT_MS = 30 * 60 * 1_000;
+export const MAX_AGENT_TIMEOUT_MS = 2 * 60 * 60 * 1_000;
 
 export const MAX_SCHEMA_BYTES = 256 * 1024;
 export const MAX_SCHEMA_NODES = 10_000;
