@@ -37,8 +37,8 @@ export default function workflowsExtension(pi: ExtensionAPI) {
     workspaceRoot: path.join(getAgentDir(), "workflows", "workspace-v1"),
   });
 
-  pi.registerMessageRenderer<WorkflowNotificationDetails>(WORKFLOW_NOTIFICATION_TYPE, (message, { expanded }, theme) => {
-    return renderWorkflowNotification(message.details, typeof message.content === "string" ? message.content : "", expanded || readToolViewMode() === "verbose", theme);
+  pi.registerMessageRenderer<WorkflowNotificationDetails>(WORKFLOW_NOTIFICATION_TYPE, (message, { expanded, outputPad }, theme) => {
+    return renderWorkflowNotification(message.details, typeof message.content === "string" ? message.content : "", expanded || readToolViewMode() === "verbose", theme, outputPad);
   });
 
   pi.on("session_start", async (_event, ctx) => {

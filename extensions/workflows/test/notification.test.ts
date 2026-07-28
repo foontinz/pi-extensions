@@ -36,6 +36,14 @@ test("expanded notification includes the body", () => {
   assert.doesNotMatch(text, /<workflow-notification>/);
 });
 
+test("notification respects the configured message output padding", () => {
+  const details: WorkflowNotificationDetails = { runId: "97e85be8", status: "completed" };
+  const padded = lines(renderWorkflowNotification(details, content, false, theme));
+  const unpadded = lines(renderWorkflowNotification(details, content, false, theme, 0));
+  assert.match(padded, /^ /);
+  assert.match(unpadded, /^✓/);
+});
+
 test("paused runs are notification-eligible and unknown cost is not fabricated as zero", () => {
   assert.equal(isNotifiableWorkflowStatus("paused"), true);
   assert.equal(isNotifiableWorkflowStatus("running"), false);

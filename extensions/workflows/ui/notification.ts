@@ -32,6 +32,7 @@ export function renderWorkflowNotification(
   content: string,
   full: boolean,
   theme: NotificationTheme,
+  outputPad = 1,
 ): Component {
   const status = details?.status ?? "completed";
   const glyph = status === "failed"
@@ -56,7 +57,7 @@ export function renderWorkflowNotification(
   }
   const summary = bits.length > 0 ? theme.fg("dim", " · ") + bits.join(theme.fg("dim", " · ")) : "";
 
-  const box = new Box(1, 0, (t) => theme.bg("customMessageBg", t));
+  const box = new Box(outputPad, 0, (t) => theme.bg("customMessageBg", t));
   if (!full) {
     box.addChild(new Text(head + summary, 0, 0));
     return box;

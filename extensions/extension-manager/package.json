@@ -15,12 +15,12 @@
     ]
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.81.1",
-    "@earendil-works/pi-tui": "^0.81.1",
+    "@earendil-works/pi-coding-agent": "^0.82.1",
+    "@earendil-works/pi-tui": "^0.82.1",
     "proper-lockfile": "^4.1.2"
   },
   "devDependencies": {
-    "@types/node": "^26.1.1",
+    "@types/node": "^26.1.2",
     "@types/proper-lockfile": "^4.1.4",
     "typescript": "^7.0.2"
   },

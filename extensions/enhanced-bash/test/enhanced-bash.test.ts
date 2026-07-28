@@ -37,6 +37,10 @@ function createHarness(
     hasUI: options.hasUI ?? true,
     mode: options.mode ?? "tui",
     isIdle: () => idle,
+    sessionManager: {
+      getSessionId: () => "test-session",
+      getSessionFile: () => undefined,
+    },
     ui: { notify(message: string) { notifications.push(message); } },
   } as unknown as ExtensionContext;
   enhancedBash(pi);
@@ -267,8 +271,9 @@ test("foreground and background commands use invocation cwd and completion wakes
   try {
     await startHarness(harness);
     const bash = harness.tools.get("bash");
-    const foreground = await bash.execute("fg", { command: "pwd", timeout: 5 }, undefined, undefined, harness.ctx);
+    const foreground = await bash.execute("fg", { command: "pwd; printf 'session=%s\\n' \"$PI_SESSION_ID\"", timeout: 5 }, undefined, undefined, harness.ctx);
     assert.match(foreground.content[0].text, new RegExp(cwd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(foreground.content[0].text, /session=test-session/);
 
     const started = await bash.execute("bg", { command: "pwd; command -v rm", background: true }, undefined, undefined, harness.ctx);
     const logPath = started.details.logFile;
