@@ -101,6 +101,16 @@ test("real branched transcript preserves parent relations and following correcti
   assert.equal(allIds.size, entries.length, "all branch entries are covered");
 });
 
+test("lock inspection treats a concurrently released lock as normal contention", async () => {
+  const root = await mkdtemp(join(tmpdir(), "forge-lock-race-"));
+  try {
+    const lockPath = join(root, ".state.lock");
+    assert.equal(await storageTesting.inspectLock(lockPath), "missing");
+    await mkdir(lockPath);
+    assert.equal(await storageTesting.inspectLock(lockPath), "active");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("strict state validation quarantines malformed/incompatible bytes before creating a diagnostic", async () => {
   const root = await mkdtemp(join(tmpdir(), "forge-state-")); const cwd = join(root, "project"); const agent = join(root, "agent");
   try {

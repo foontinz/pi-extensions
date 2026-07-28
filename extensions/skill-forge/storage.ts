@@ -142,10 +142,27 @@ async function writeAtomicJson(path: string, value: unknown): Promise<void> {
 }
 
 interface LockOwner { pid: number; token: string; createdAt: number }
+type LockState = "active" | "stale" | "missing";
 
 function processAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+}
+
+async function inspectLock(lockPath: string): Promise<LockState> {
+  try {
+    const owner = JSON.parse(await readFile(join(lockPath, "owner.json"), "utf8")) as Partial<LockOwner>;
+    return typeof owner.pid !== "number" || (!processAlive(owner.pid) && Date.now() - (owner.createdAt ?? 0) > 2_000) ? "stale" : "active";
+  } catch {
+    try {
+      return Date.now() - (await stat(lockPath)).mtimeMs > 30_000 ? "stale" : "active";
+    } catch (error) {
+      // The owner can release the lock after owner.json is read but before the
+      // fallback stat. That is normal contention, not a background failure.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return "missing";
+      throw error;
+    }
+  }
 }
 
 export class ProjectStore {
@@ -210,15 +227,9 @@ export class ProjectStore {
         };
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        let stale = false;
-        try {
-          const owner = JSON.parse(await readFile(join(this.lockPath, "owner.json"), "utf8")) as Partial<LockOwner>;
-          stale = typeof owner.pid !== "number" || (!processAlive(owner.pid) && Date.now() - (owner.createdAt ?? 0) > 2_000);
-        } catch {
-          const age = Date.now() - (await stat(this.lockPath)).mtimeMs;
-          stale = age > 30_000;
-        }
-        if (stale && await this.reapStaleLock()) continue;
+        const lockState = await inspectLock(this.lockPath);
+        if (lockState === "missing") continue;
+        if (lockState === "stale" && await this.reapStaleLock()) continue;
         await new Promise((resolveDelay) => setTimeout(resolveDelay, Math.min(20 + attempt * 5, 200)));
       }
     }
@@ -286,4 +297,4 @@ export async function assertRegularNotSymlink(path: string, allowMissing = false
   }
 }
 
-export const __testing = { initialState, hydrateState, validateState, writeAtomicJson, processAlive };
+export const __testing = { initialState, hydrateState, validateState, writeAtomicJson, processAlive, inspectLock };
