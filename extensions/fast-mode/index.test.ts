@@ -109,7 +109,18 @@ test("serializes concurrent toggles and preserves valid preference fields", asyn
 	}
 });
 
-test("preserves tier payload behavior and documents the Codex accounting limit", async () => {
+test("supports OpenAI's documented Fast mode model sets", () => {
+	for (const id of ["gpt-5.6-sol", "gpt-5.5", "gpt-5.4-mini", "gpt-5.2", "gpt-4.1", "gpt-4o-mini", "o3", "o4-mini"]) {
+		assert.equal(__testing.getSupportedMode(supportedModel("openai", id))?.enabledTier, "fast", id);
+	}
+	for (const id of ["gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+		assert.equal(__testing.getSupportedMode(supportedModel("openai-codex", id))?.enabledTier, "priority", id);
+	}
+	assert.equal(__testing.getSupportedMode(supportedModel("openai", "gpt-5.5-pro")), undefined);
+	assert.equal(__testing.getSupportedMode(supportedModel("openai-codex", "gpt-5.3-codex-spark")), undefined);
+});
+
+test("sends API Fast and Codex Fast wire tiers and documents the accounting limit", async () => {
 	const previousAgentDir = process.env[AGENT_DIR_ENV];
 	const root = await mkdtemp(join(tmpdir(), "pi-fast-mode-payload-"));
 	const agentDir = join(root, "alternate-agent");
@@ -118,7 +129,7 @@ test("preserves tier payload behavior and documents the Codex accounting limit",
 		await mkdir(agentDir, { recursive: true });
 		await writeFile(
 			join(agentDir, "fast-mode.json"),
-			JSON.stringify({ version: 1, perModel: { "openai-codex/gpt-5.6": true } }),
+			JSON.stringify({ version: 1, perModel: { "openai-codex/gpt-5.6": true, "openai/gpt-4.1": true } }),
 		);
 		const { events } = createRegistration();
 		await events.get("session_start")!({}, commandContext(undefined, []));
@@ -129,14 +140,14 @@ test("preserves tier payload behavior and documents the Codex accounting limit",
 			{ keep: "value", service_tier: "priority" },
 		);
 		assert.deepEqual(
-			beforeRequest({ payload: { keep: "value", service_tier: "old" } }, { model: supportedModel("openai", "gpt-5.6") }),
-			{ keep: "value" },
+			beforeRequest({ payload: { keep: "value", service_tier: "old" } }, { model: supportedModel("openai", "gpt-4.1") }),
+			{ keep: "value", service_tier: "fast" },
 		);
 		assert.deepEqual(
 			beforeRequest({ payload: { keep: "value" } }, { model: supportedModel("anthropic", "claude-opus-4-8") }),
 			{ keep: "value", service_tier: "standard_only" },
 		);
-		assert.match(CODEX_SERVICE_TIER_ACCOUNTING_LIMITATION, /cannot alter Codex internal serviceTier accounting/);
+		assert.match(CODEX_SERVICE_TIER_ACCOUNTING_LIMITATION, /service_tier=priority.*cannot alter Pi's internal serviceTier accounting/);
 		assert.equal(__testing.CODEX_SERVICE_TIER_ACCOUNTING_LIMITATION, CODEX_SERVICE_TIER_ACCOUNTING_LIMITATION);
 	} finally {
 		if (previousAgentDir === undefined) delete process.env[AGENT_DIR_ENV];

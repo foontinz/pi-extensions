@@ -19,8 +19,14 @@ type SupportedMode =
 		disabledTier: "standard_only";
 	}
 	| {
-		provider: "openai" | "openai-codex";
-		id: "gpt-5.4" | "gpt-5.5" | "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna";
+		provider: "openai";
+		id: string;
+		enabledTier: "fast";
+		disabledTier?: undefined;
+	}
+	| {
+		provider: "openai-codex";
+		id: string;
 		enabledTier: "priority";
 		disabledTier?: undefined;
 	};
@@ -46,31 +52,63 @@ const DEFAULT_PREFS: FastModePrefs = {
 	perModel: {},
 };
 
+// OpenAI API Fast mode support and pricing:
+// https://developers.openai.com/api/docs/guides/fast-mode
+const OPENAI_FAST_MODE_MODEL_IDS = [
+	"gpt-5.6-sol",
+	"gpt-5.6-terra",
+	"gpt-5.6-luna",
+	"gpt-5.6", // Compatibility alias used by earlier Pi model catalogs.
+	"gpt-5.5",
+	"gpt-5.4",
+	"gpt-5.4-mini",
+	"gpt-5.2",
+	"gpt-5.1",
+	"gpt-5",
+	"gpt-5-mini",
+	"gpt-5.1-codex",
+	"gpt-5-codex",
+	"gpt-4.1",
+	"gpt-4.1-mini",
+	"gpt-4.1-nano",
+	"gpt-4o",
+	"gpt-4o-2024-05-13",
+	"gpt-4o-2024-08-06",
+	"gpt-4o-2024-11-20",
+	"gpt-4o-mini",
+	"o3",
+	"o4-mini",
+] as const;
+
+// ChatGPT-authenticated Codex Fast mode currently supports GPT-5.4–5.6:
+// https://developers.openai.com/codex/speed
+const OPENAI_CODEX_FAST_MODE_MODEL_IDS = [
+	"gpt-5.4",
+	"gpt-5.4-mini",
+	"gpt-5.5",
+	"gpt-5.6",
+	"gpt-5.6-sol",
+	"gpt-5.6-terra",
+	"gpt-5.6-luna",
+] as const;
+
 const SUPPORTED_MODELS: SupportedMode[] = [
 	{ provider: "anthropic", id: "claude-opus-4-6", enabledTier: "auto", disabledTier: "standard_only" },
 	{ provider: "anthropic", id: "claude-opus-4-7", enabledTier: "auto", disabledTier: "standard_only" },
 	{ provider: "anthropic", id: "claude-opus-4-8", enabledTier: "auto", disabledTier: "standard_only" },
-	{ provider: "openai", id: "gpt-5.4", enabledTier: "priority" },
-	{ provider: "openai", id: "gpt-5.5", enabledTier: "priority" },
-	{ provider: "openai", id: "gpt-5.6", enabledTier: "priority" },
-	{ provider: "openai", id: "gpt-5.6-sol", enabledTier: "priority" },
-	{ provider: "openai", id: "gpt-5.6-terra", enabledTier: "priority" },
-	{ provider: "openai", id: "gpt-5.6-luna", enabledTier: "priority" },
-	{ provider: "openai-codex", id: "gpt-5.4", enabledTier: "priority" },
-	{ provider: "openai-codex", id: "gpt-5.5", enabledTier: "priority" },
-	{ provider: "openai-codex", id: "gpt-5.6", enabledTier: "priority" },
-	{ provider: "openai-codex", id: "gpt-5.6-sol", enabledTier: "priority" },
-	{ provider: "openai-codex", id: "gpt-5.6-terra", enabledTier: "priority" },
-	{ provider: "openai-codex", id: "gpt-5.6-luna", enabledTier: "priority" },
+	...OPENAI_FAST_MODE_MODEL_IDS.map((id): SupportedMode => ({ provider: "openai", id, enabledTier: "fast" })),
+	// The ChatGPT Codex backend rejects raw service_tier=fast. Codex's Fast
+	// setting is represented by the priority wire tier and routed server-side.
+	...OPENAI_CODEX_FAST_MODE_MODEL_IDS.map((id): SupportedMode => ({ provider: "openai-codex", id, enabledTier: "priority" })),
 ];
 
 /**
- * Pi 0.80.5 exposes the outbound provider payload, not Codex's internal usage
- * accounting. Fast mode therefore changes the request tier only; an extension
- * cannot safely synthesize or mutate Codex's internal `serviceTier` cost data.
+ * ChatGPT Codex Fast mode uses `priority` as its wire-tier ID and subscription
+ * credits are accounted provider-side. Pi extensions cannot alter that internal
+ * accounting or infer the actual credit multiplier from the response.
  */
 export const CODEX_SERVICE_TIER_ACCOUNTING_LIMITATION =
-	"Pi 0.80.5 public extensions can set the outbound Codex service_tier but cannot alter Codex internal serviceTier accounting.";
+	"Codex Fast mode uses wire service_tier=priority; extensions cannot alter Pi's internal serviceTier accounting or ChatGPT credit usage.";
 
 const stores = new Map<string, PrefsStore>();
 const updateQueues = new Map<string, Promise<void>>();
@@ -111,18 +149,18 @@ export default function fastMode(pi: ExtensionAPI) {
 				payload.service_tier = supported.disabledTier;
 			}
 		}
-		// For openai-codex this deliberately stops at the wire payload. See
-		// CODEX_SERVICE_TIER_ACCOUNTING_LIMITATION above.
+		// For openai-codex this deliberately stops at the wire payload. Codex
+		// handles ChatGPT Fast routing server-side; see the accounting limitation.
 		return payload;
 	});
 
 	pi.registerCommand("fast", {
-		description: "Toggle fast mode for supported Anthropic Opus and OpenAI GPT-5.4/5.5/5.6 models",
+		description: "Toggle fast mode for supported Anthropic Opus, OpenAI API, and OpenAI Codex models",
 		handler: async (_args, ctx) => {
 			const supported = getSupportedMode(ctx.model);
 			if (!ctx.model || !supported) {
 				ctx.ui.notify(
-					"Fast mode is only available for Anthropic Opus 4.6/4.7/4.8 and OpenAI/OpenAI Codex GPT-5.4, GPT-5.5, and GPT-5.6 variants.",
+					"Fast mode is unavailable for this model. OpenAI API and Codex support different model sets; see OpenAI's Fast mode documentation.",
 					"info",
 				);
 				refreshStatus(ctx);
@@ -147,13 +185,16 @@ export default function fastMode(pi: ExtensionAPI) {
 
 			refreshStatus(ctx);
 			tpsStatus.refresh(ctx);
+			const enabledMessage = supported.provider === "openai-codex"
+				? "Codex Fast mode (wire service_tier=priority)"
+				: `service_tier=${supported.enabledTier}`;
 			const disabledMessage =
 				supported.disabledTier !== undefined
 					? `service_tier=${supported.disabledTier}`
 					: "the provider default service tier (field omitted)";
 			ctx.ui.notify(
 				enabled
-					? `Fast mode ON for ${key}. Requests will use service_tier=${supported.enabledTier}.`
+					? `Fast mode ON for ${key}. Requests will use ${enabledMessage}.`
 					: `Fast mode OFF for ${key}. Requests will use ${disabledMessage}.`,
 				"info",
 			);
