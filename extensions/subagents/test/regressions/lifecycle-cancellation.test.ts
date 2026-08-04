@@ -711,6 +711,9 @@ test("dead stable-owner metadata is claimed durably without duplicate callbacks"
     const adopted = hydrateJobRecord(fs.readFileSync(statePath, "utf-8"));
     assert.deepEqual(adopted.owner, current);
     assert.equal(sent.length, 1);
+    // The marker is cleared only once the main loop consumes the callback message.
+    assert.equal(__subagentsTest.readCallbackMarker(id)?.state, "pending");
+    __subagentsTest.handleMainLoopUserMessage(sent[0]!);
     assert.equal(__subagentsTest.readCallbackMarker(id)?.state, "delivered");
   } finally {
     __subagentsTest.setCallbackHarness(undefined, undefined);

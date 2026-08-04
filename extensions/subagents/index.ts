@@ -214,9 +214,20 @@ let statusContext: ExtensionContext | undefined;
 let statusRefreshTimer: NodeJS.Timeout | undefined;
 const pendingFinishedCallbacks = new Map<string, AgentJob>();
 let callbackFlushTimer: NodeJS.Timeout | undefined;
+let callbackDeferStartedAt: number | undefined;
+/** A callback message we handed to the main loop that has not been consumed (delivered) yet. */
+let inFlightCallback: { text: string; jobs: AgentJob[] } | undefined;
 const storeWarnings: StoreDiagnosticWarning[] = [];
 const MAX_STORE_WARNINGS = 50;
 const CALLBACK_STACK_DELAY_MS = 250;
+// While a callback we already sent has not been consumed by the main loop, new finished jobs are
+// stacked into the next single callback instead of waking the loop again. Release is event-driven
+// (message_start / agent_settled); this watchdog only covers paths that emit no extension event
+// (queue cleared with Esc, rpc/json modes, extension reload).
+const CALLBACK_DEFER_WATCHDOG_MS = 30_000;
+// Re-arm delay used when the batch cannot be delivered yet (no UI context bound right now).
+const CALLBACK_REARM_DELAY_MS = 250;
+const CALLBACK_MAX_DELIVERY_ATTEMPTS = 3;
 
 const ThinkingSchema = StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, {
   description: "Optional Pi thinking level for the subagent process.",
@@ -368,7 +379,7 @@ function clearInMemoryJobs(): void {
   launchReservations.length = 0;
   storeWarnings.length = 0;
   pendingFinishedCallbacks.clear();
-  clearCallbackFlushTimer();
+  resetCallbackDeferState();
   clearStatusRefreshTimer();
 }
 
@@ -704,7 +715,7 @@ async function handleSubagentsSessionShutdown(ctx: ExtensionContext): Promise<vo
 
   await disposeSharedMcpGateway().catch(() => {});
   storeWarnings.length = 0;
-  clearCallbackFlushTimer();
+  resetCallbackDeferState();
   clearStatusRefreshTimer();
   currentOwner = undefined;
   currentStorePaths = undefined;
@@ -719,6 +730,25 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     await handleSubagentsSessionStart(ctx);
+  });
+
+  // Delivery of a queued user message is spliced out of the steering/follow-up queue before this
+  // event fires, so it is the exact "our callback was consumed" signal for the stacking window.
+  pi.on("message_start", (event) => {
+    try {
+      if (event.message.role !== "user") return;
+      handleMainLoopUserMessage(event.message.content);
+    } catch {
+      // Callback bookkeeping must never destabilize the main loop.
+    }
+  });
+
+  pi.on("agent_settled", () => {
+    try {
+      handleMainLoopSettled();
+    } catch {
+      // ignore
+    }
   });
 
   pi.registerTool({
@@ -2483,34 +2513,127 @@ function notifyMainAgentOfFinishedJob(job: AgentJob): void {
   }
 }
 
-function scheduleFinishedCallbackFlush(): void {
+function scheduleFinishedCallbackFlush(delayMs = CALLBACK_STACK_DELAY_MS): void {
   if (callbackFlushTimer) return;
-  callbackFlushTimer = setTimeout(flushPendingFinishedCallbacks, CALLBACK_STACK_DELAY_MS);
+  callbackFlushTimer = setTimeout(flushPendingFinishedCallbacks, delayMs);
   callbackFlushTimer.unref?.();
 }
 
+/** Clears only the flush timer. Defer state is reset via resetCallbackDeferState(). */
 function clearCallbackFlushTimer(): void {
   if (!callbackFlushTimer) return;
   clearTimeout(callbackFlushTimer);
   callbackFlushTimer = undefined;
 }
 
+function resetCallbackDeferState(): void {
+  clearCallbackFlushTimer();
+  callbackDeferStartedAt = undefined;
+  inFlightCallback = undefined;
+}
+
+function userMessageText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((part): part is { type: "text"; text: string } => (part as { type?: string })?.type === "text")
+    .map((part) => part.text)
+    .join("");
+}
+
+/**
+ * The main loop consumed a user message. If it was our queued callback, the stacking window closes
+ * and the batch that accumulated meanwhile is delivered as one further wake-up.
+ */
+function handleMainLoopUserMessage(content: unknown): void {
+  if (!inFlightCallback) return;
+  const text = userMessageText(content);
+  if (!text || text !== inFlightCallback.text) return;
+  for (const job of inFlightCallback.jobs) markCallbackDelivered(job.id);
+  inFlightCallback = undefined;
+  callbackDeferStartedAt = undefined;
+  // Drop the deferral watchdog: the window closed now, so the next batch uses a fresh stack window.
+  clearCallbackFlushTimer();
+  pruneFinishedJobs();
+  if (pendingFinishedCallbacks.size > 0) scheduleFinishedCallbackFlush();
+}
+
+/**
+ * The run settled without our queued callback ever being delivered (queue cleared with Esc, abort,
+ * ...). Re-stack its jobs so results are not silently lost.
+ */
+function handleMainLoopSettled(): void {
+  if (!inFlightCallback) return;
+  requeueUndeliveredCallback("main agent settled without delivering the queued callback");
+  clearCallbackFlushTimer();
+  if (pendingFinishedCallbacks.size > 0) scheduleFinishedCallbackFlush();
+}
+
+function requeueUndeliveredCallback(reason: string): void {
+  const undelivered = inFlightCallback;
+  inFlightCallback = undefined;
+  callbackDeferStartedAt = undefined;
+  if (!undelivered) return;
+  for (const job of undelivered.jobs) {
+    if (!jobBelongsToCurrentOwner(job)) continue;
+    markCallbackDeliveryFailed(job.id, new Error(reason));
+    if ((readCallbackMarker(job.id)?.attempts ?? 0) >= CALLBACK_MAX_DELIVERY_ATTEMPTS) {
+      markCallbackDelivered(job.id);
+      const ctx = statusContext;
+      if (ctx) tryNotify(ctx, `Subagent ${job.id} callback dropped after ${CALLBACK_MAX_DELIVERY_ATTEMPTS} undelivered attempts (${reason}).`, "error");
+      continue;
+    }
+    pendingFinishedCallbacks.set(job.id, job);
+  }
+}
+
 function flushPendingFinishedCallbacks(): void {
   clearCallbackFlushTimer();
   const api = extensionApi;
   const ctx = statusContext;
-  if (!api || !ctx?.hasUI || pendingFinishedCallbacks.size === 0) return;
+  if (pendingFinishedCallbacks.size === 0) {
+    callbackDeferStartedAt = undefined;
+    return;
+  }
+  if (!api || !ctx?.hasUI) {
+    // No UI context bound right now (e.g. mid stop/reload). Keep the batch armed instead of
+    // dropping it: clearing the timer without rescheduling would strand these callbacks.
+    if (currentOwner) scheduleFinishedCallbackFlush(CALLBACK_REARM_DELAY_MS);
+    return;
+  }
 
-  const callbackJobs = [...pendingFinishedCallbacks.values()]
-    .filter(jobBelongsToCurrentOwner)
-    .sort((a, b) => (a.finishedAt ?? a.updatedAt) - (b.finishedAt ?? b.updatedAt));
+  // Stacking: a callback we already sent is still unconsumed, so let newly finished jobs
+  // accumulate and wake the main loop only once, when that message is consumed.
+  if (inFlightCallback) {
+    const now = Date.now();
+    callbackDeferStartedAt ??= now;
+    const waited = now - callbackDeferStartedAt;
+    if (waited < CALLBACK_DEFER_WATCHDOG_MS) {
+      scheduleFinishedCallbackFlush(CALLBACK_DEFER_WATCHDOG_MS - waited);
+      return;
+    }
+    // Watchdog: no delivery event ever arrived. Assume the queued message was dropped and
+    // re-stack its jobs into this batch rather than losing them.
+    requeueUndeliveredCallback(`no delivery observed within ${CALLBACK_DEFER_WATCHDOG_MS}ms`);
+  }
+  callbackDeferStartedAt = undefined;
+
+  const owned: AgentJob[] = [];
+  let dropped = 0;
+  for (const job of pendingFinishedCallbacks.values()) {
+    if (jobBelongsToCurrentOwner(job)) owned.push(job);
+    else dropped++;
+  }
   pendingFinishedCallbacks.clear();
+  if (dropped > 0) tryNotify(ctx, `Dropped ${dropped} subagent callback(s) belonging to a previous session owner.`, "warning");
+  const callbackJobs = owned.sort((a, b) => (a.finishedAt ?? a.updatedAt) - (b.finishedAt ?? b.updatedAt));
   if (callbackJobs.length === 0) return;
   const message = formatStackedSubagentFinishedCallback(callbackJobs);
   try {
     api.sendUserMessage(message, { deliverAs: ctx.isIdle() ? "followUp" : "steer" });
-    for (const job of callbackJobs) markCallbackDelivered(job.id);
-    pruneFinishedJobs();
+    // Markers stay pending until the main loop actually consumes the message, so a cleared/aborted
+    // queue retries instead of silently losing N stacked results.
+    inFlightCallback = { text: message, jobs: callbackJobs };
   } catch (error) {
     for (const job of callbackJobs) markCallbackDeliveryFailed(job.id, error);
     tryNotify(
@@ -2865,7 +2988,7 @@ export const __subagentsTest = {
     jobs.clear();
     storeWarnings.length = 0;
     pendingFinishedCallbacks.clear();
-    clearCallbackFlushTimer();
+    resetCallbackDeferState();
     clearStatusRefreshTimer();
   },
   setInProcessLauncher(launcher: typeof startInProcessAgent | undefined) {
@@ -2897,6 +3020,23 @@ export const __subagentsTest = {
   formatCompactPollResult,
   formatPollResult,
   flushPendingFinishedCallbacks,
+  handleMainLoopUserMessage,
+  handleMainLoopSettled,
+  callbackFlushArmed(): boolean {
+    return callbackFlushTimer !== undefined;
+  },
+  pendingFinishedCallbackIds(): string[] {
+    return [...pendingFinishedCallbacks.keys()];
+  },
+  inFlightCallbackJobIds(): string[] | undefined {
+    return inFlightCallback ? inFlightCallback.jobs.map((job) => job.id) : undefined;
+  },
+  callbackTimings: {
+    stackDelayMs: CALLBACK_STACK_DELAY_MS,
+    watchdogMs: CALLBACK_DEFER_WATCHDOG_MS,
+    rearmDelayMs: CALLBACK_REARM_DELAY_MS,
+    maxDeliveryAttempts: CALLBACK_MAX_DELIVERY_ATTEMPTS,
+  },
   bindOwnerToContext,
   handleSubagentsSessionStart,
   setSessionStartHook(hook: ((ctx: ExtensionContext) => void | Promise<void>) | undefined) {
@@ -2914,10 +3054,11 @@ export const __subagentsTest = {
   getCurrentOwner() {
     return currentOwner;
   },
-  setCallbackHarness(api: ExtensionAPI | undefined, ctx: ExtensionContext | undefined) {
+  setCallbackHarness(api: ExtensionAPI | undefined, ctx: ExtensionContext | undefined, options: { keepQueue?: boolean } = {}) {
     extensionApi = api;
     statusContext = ctx;
+    if (options.keepQueue) return;
     pendingFinishedCallbacks.clear();
-    clearCallbackFlushTimer();
+    resetCallbackDeferState();
   },
 };
