@@ -15,7 +15,7 @@
     ]
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.82.1",
+    "@earendil-works/pi-coding-agent": "^0.84.0",
     "exa-js": "^2.16.3",
     "pi-extension-envvars": "file:../envvars"
   },

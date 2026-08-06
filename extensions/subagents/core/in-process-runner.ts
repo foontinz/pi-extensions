@@ -154,7 +154,10 @@ export function createBareResourceLoader(systemPrompt?: string, appendSystemProm
     getThemes: () => ({ themes: [], diagnostics: [] }),
     getAgentsFiles: () => ({ agentsFiles: [] }),
     getSystemPrompt: () => systemPrompt,
+    // In-memory prompts have no file source (Pi >= 0.84 ResourceLoader API).
+    getSystemPromptSource: () => undefined,
     getAppendSystemPrompt: () => [...appendSystemPrompt],
+    getAppendSystemPromptSources: () => [],
     extendResources: () => {},
     reload: async () => {},
   };

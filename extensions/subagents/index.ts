@@ -167,6 +167,8 @@ interface AgentJob {
   logs: AgentLogEntry[];
   nextSeq: number;
   latestAssistantText: string;
+  /** Partial assistant text assembled from JSON-mode text_delta events (Pi >= 0.84 wire format). */
+  streamedAssistantText?: string;
   pendingAssistantDelta: string;
   lastAssistantDeltaLogAt: number;
   finalOutput?: string;
@@ -2041,15 +2043,31 @@ function processEvent(job: AgentJob, event: any): void {
       addLog(job, "info", "turn ended", event.type);
       break;
     }
+    case "message_start": {
+      // Pi >= 0.84 JSON mode removed the cumulative message from message_update;
+      // reset the delta accumulator at each assistant message boundary.
+      if (event.message?.role === "assistant") job.streamedAssistantText = "";
+      touchJob(job);
+      break;
+    }
     case "message_update": {
+      const msgEvent = event.assistantMessageEvent;
       if (event.message?.role === "assistant") {
+        // Pi < 0.84 JSON mode: cumulative message attached to every update.
         job.latestAssistantText = getAssistantText(event.message as AssistantMessage) || job.latestAssistantText;
-        const msgEvent = event.assistantMessageEvent;
         if (msgEvent?.type === "text_delta" && typeof msgEvent.delta === "string") {
           recordAssistantDelta(job, msgEvent.delta);
         } else {
           touchJob(job);
         }
+      } else if (msgEvent?.type === "text_delta" && typeof msgEvent.delta === "string") {
+        // Pi >= 0.84 JSON mode: delta-only updates. Assemble partial text here;
+        // message_end remains authoritative via updateFromAssistantMessage.
+        job.streamedAssistantText = (job.streamedAssistantText ?? "") + msgEvent.delta;
+        job.latestAssistantText = job.streamedAssistantText;
+        recordAssistantDelta(job, msgEvent.delta);
+      } else {
+        touchJob(job);
       }
       break;
     }
