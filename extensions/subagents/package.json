@@ -15,9 +15,9 @@
     ]
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "^0.84.0",
-    "@earendil-works/pi-coding-agent": "^0.84.0",
-    "@earendil-works/pi-tui": "^0.84.0",
+    "@earendil-works/pi-ai": "^0.84.1",
+    "@earendil-works/pi-coding-agent": "^0.84.1",
+    "@earendil-works/pi-tui": "^0.84.1",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
@@ -25,7 +25,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.1.2",
-    "tsx": "^4.23.1",
+    "tsx": "^4.23.11",
     "typescript": "^7.0.2"
   },
   "engines": {
