@@ -166,12 +166,18 @@ tool. Passing `mcp: true` to `run_agent` (or `agent({ mcp: true })` in a workflo
 injects a thin `mcp` gateway tool that forwards to a **process-wide** MCP connection
 pool (`mcp/`). Each configured MCP server is connected **once per process** and reused
 across every subagent / workflow agent, so a fan-out never reconnects an MCP adapter
-per child. Server definitions are read from `<agentDir>/mcp.json`, then project-local
-`.mcp.json` and `.pi/mcp.json` (project overrides global by server name).
+per child. It follows the adapter's standard source precedence:
+`~/.config/mcp/mcp.json`, `~/.agents/mcp.json`, `~/.agents/mcp/mcp.json`,
+`<agentDir>/mcp.json`, `.mcp.json`, then `.pi/mcp.json`. Partial overrides merge by
+field, URL changes discard inherited credentials, and higher-priority `disabled: true`
+entries remain disabled.
 
-The gateway tool modes: no args → list servers; `{ server }` → list its tools;
+The gateway tool modes are: no args → list servers; `{ server }` → list its tools;
 `{ search }` → find tools; `{ describe }` → show a tool's parameters; `{ tool, args }`
-→ call a tool (`args` is a JSON string). Only stdio (`command`) and HTTP (`url`, with
-optional `auth: "bearer"` + `bearerToken`) servers are supported; interactive-only
-concerns (OAuth login flows, elicitation UI) are out of scope. Connections are torn
-down on session shutdown.
+→ call a tool (`args` accepts an object or JSON string). The gateway uses the modular
+MCP SDK v2 client and honors `protocolVersion: "legacy" | "auto" | "2026-07-28"`,
+`httpTransport`, `requestTimeoutMs`, `includeTools`, and `excludeTools`. Tools matching
+`approveTools` fail closed because child sessions have no interactive approval UI. Only stdio
+(`command`) and HTTP (`url`, with optional bearer auth) are supported; OAuth login,
+Unix sockets, imports/Agent Plugins, prompts/resources, sampling, and elicitation UI
+remain adapter-only. Connections are torn down on session shutdown.

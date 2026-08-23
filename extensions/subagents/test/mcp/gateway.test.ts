@@ -11,8 +11,8 @@ import { createMcpProxyTool } from "../../mcp/proxy-tool.js";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const echoServer = path.resolve(here, "..", "fixtures", "mcp-echo-server.mjs");
 
-function writeConfig(dir: string): void {
-  const config = { mcpServers: { echo: { command: process.execPath, args: [echoServer] } } };
+function writeConfig(dir: string, extra: Record<string, unknown> = {}): void {
+  const config = { mcpServers: { echo: { command: process.execPath, args: [echoServer], ...extra } } };
   fs.writeFileSync(path.join(dir, "mcp.json"), JSON.stringify(config), "utf8");
 }
 
@@ -28,6 +28,43 @@ test("loadMcpServers merges global + project with project winning", () => {
     const b = servers.get("b") as { transport: string; headers?: Record<string, string> };
     assert.equal(b.transport, "http");
     assert.equal(b.headers?.Authorization, "Bearer t");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadMcpServers merges partial overrides, strips rebound credentials, and honors disabled", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-merge-"));
+  try {
+    fs.writeFileSync(path.join(dir, "mcp.json"), `{
+      // JSONC and trailing commas match the adapter's config parser.
+      "mcpServers": {
+        "rebound": { "url": "https://old.test", "headers": { "Authorization": "secret" }, "protocolVersion": "auto" },
+        "disabled": { "command": "old" },
+      },
+    }`);
+    fs.mkdirSync(path.join(dir, ".pi"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".pi", "mcp.json"), JSON.stringify({
+      mcpServers: {
+        rebound: { url: "https://new.test", requestTimeoutMs: 1234, includeTools: ["get_*"] },
+        disabled: { disabled: true },
+      },
+    }));
+
+    const servers = loadMcpServers(dir, dir);
+    const rebound = servers.get("rebound") as {
+      url: string;
+      headers?: Record<string, string>;
+      protocolVersion?: string;
+      requestTimeoutMs?: number;
+      includeTools?: string[];
+    };
+    assert.equal(rebound.url, "https://new.test");
+    assert.equal(rebound.headers, undefined);
+    assert.equal(rebound.protocolVersion, "auto");
+    assert.equal(rebound.requestTimeoutMs, 1234);
+    assert.deepEqual(rebound.includeTools, ["get_*"]);
+    assert.equal(servers.has("disabled"), false);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -54,9 +91,9 @@ test("loadMcpServers resolves bearerTokenEnv and bearer placeholders without per
   }
 });
 
-test("gateway connects to a stdio MCP server once and calls a tool", async () => {
+test("gateway negotiates MCP v2 over stdio once and calls a tool", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-gw-"));
-  writeConfig(dir);
+  writeConfig(dir, { protocolVersion: "auto" });
   const gateway = new SharedMcpGateway(dir, dir);
   try {
     assert.deepEqual(gateway.serverNames(), ["echo"]);
@@ -70,6 +107,32 @@ test("gateway connects to a stdio MCP server once and calls a tool", async () =>
     // Second call reuses the same connection (no throw, still works).
     const again = await gateway.callTool("echo", { message: "again" }, "echo");
     assert.match(again.text, /echo: again/);
+  } finally {
+    await gateway.disposeAll();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("gateway applies tool filters and rejects ambiguous unqualified tool names", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-filter-"));
+  fs.writeFileSync(path.join(dir, "mcp.json"), JSON.stringify({
+    mcpServers: {
+      hidden: { command: process.execPath, args: [echoServer], excludeTools: ["echo"] },
+      gated: { command: process.execPath, args: [echoServer], approveTools: ["echo"] },
+      first: { command: process.execPath, args: [echoServer] },
+      second: { command: process.execPath, args: [echoServer] },
+    },
+  }));
+  const gateway = new SharedMcpGateway(dir, dir);
+  try {
+    assert.deepEqual(await gateway.listServerTools("hidden"), []);
+    await assert.rejects(() => gateway.findTool("echo"), /multiple servers.*specify server/);
+    const result = await gateway.callTool("echo", { message: "targeted" }, "first");
+    assert.match(result.text, /echo: targeted/);
+    await assert.rejects(
+      () => gateway.callTool("echo", { message: "blocked" }, "gated"),
+      /requires interactive approval.*blocked in a subagent/,
+    );
   } finally {
     await gateway.disposeAll();
     fs.rmSync(dir, { recursive: true, force: true });
@@ -91,7 +154,8 @@ test("proxy tool exposes status/search/describe/call over the gateway", async ()
     assert.match(await run({ search: "echo" }), /echo \[echo\]/);
     assert.match(await run({ describe: "echo" }), /Parameters:/);
     assert.match(await run({ tool: "echo", args: JSON.stringify({ message: "yo" }) }), /echo: yo/);
-    assert.match(await run({ tool: "echo", args: "not json" }), /could not parse/);
+    assert.match(await run({ tool: "echo", args: { message: "object" } }), /echo: object/);
+    await assert.rejects(() => run({ tool: "echo", args: "not json" }), /JSON/);
   } finally {
     await gateway.disposeAll();
     fs.rmSync(dir, { recursive: true, force: true });
